@@ -21,16 +21,16 @@ impl MiddlewareClient {
 
     pub async fn get_work_units(
         &self,
-        client_id: &str,
+        client_id: i32,
         status: WorkUnitStatus,
-        page_size: usize,
+        fetch_size: i32,
     ) -> Result<Vec<WorkUnit>, Box<dyn Error>> {
         let url = format!("{}/work-units", self.base_url);
         // Assuming the Java API query params: ?assignedClientId=...&status=...&pageSize=...
         let params = [
-            ("assignedClientId", client_id),
+            ("assignedClientId", &client_id.to_string()),
             ("status", &format!("{:?}", status)), // Enum debug print might match Java string? CREATED, ASSIGNED
-            ("pageSize", &page_size.to_string()),
+            ("pageSize", &fetch_size.to_string()),
         ];
 
         let response = self.client.get(&url).query(&params).send().await?;
@@ -45,10 +45,23 @@ impl MiddlewareClient {
 
     pub async fn update_work_units(&self, work_units: &[WorkUnit]) -> Result<(), Box<dyn Error>> {
         let url = format!("{}/work-units", self.base_url); // PUT endpoint
-        let response = self.client.put(&url).json(work_units).send().await?;
+
+        let json_payload = serde_json::to_string(work_units)?;
+        println!("DEBUG: Sending update_work_units payload: {}", json_payload);
+
+        let response = self
+            .client
+            .put(&url)
+            .header("Content-Type", "application/json")
+            .body(json_payload)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
-            return Err(format!("Failed to update work units: {}", response.status()).into());
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eprintln!("DEBUG: Failed to update work units: {} - {}", status, text);
+            return Err(format!("Failed to update work units: {} - {}", status, text).into());
         }
         Ok(())
     }
@@ -79,14 +92,16 @@ impl MiddlewareClient {
 
     pub async fn create_client(&self, client: &Client) -> Result<Client, Box<dyn Error>> {
         let url = format!("{}/clients", self.base_url);
-        let created_client = self
-            .client
-            .post(&url)
-            .json(client)
-            .send()
-            .await?
-            .json::<Client>()
-            .await?;
+        let response = self.client.post(&url).json(client).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eprintln!("DEBUG: Server returned error: {} - {}", status, text);
+            return Err(format!("Server error: {} - {}", status, text).into());
+        }
+
+        let created_client = response.json::<Client>().await?;
         Ok(created_client)
     }
 

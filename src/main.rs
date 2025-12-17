@@ -7,7 +7,7 @@ async fn main() {
     dotenv().ok();
 
     let base_url =
-        env::var("RAMSEY_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        env::var("RAMSEY_API_URL").unwrap_or_else(|_| "http://localhost:4040 ".to_string());
 
     // Configurable via env or hardcoded/args for now
     let vertex_count = 288;
@@ -17,7 +17,36 @@ async fn main() {
         .unwrap_or_else(|_| "1".to_string())
         .parse()
         .expect("CAMPAIGN_ID must be a number");
-    let mut worker = Worker::new(base_url, vertex_count, clique_size, campaign_id);
+    let poll_interval_ms: u64 = env::var("WORK_UNIT_ROUTER_FREQ")
+        .unwrap_or_else(|_| "1000".to_string())
+        .parse()
+        .expect("WORK_UNIT_ROUTER_FREQ must be a number");
+
+    let heartbeat_interval_ms: u64 = env::var("CLIENT_PHONE_HOME_FREQ")
+        .unwrap_or_else(|_| "60000".to_string())
+        .parse()
+        .expect("CLIENT_PHONE_HOME_FREQ must be a number");
+
+    let fetch_size: i32 = env::var("WORK_UNIT_FETCH_COUNT")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse()
+        .expect("WORK_UNIT_FETCH_COUNT must be a number");
+
+    let publish_size: i32 = env::var("WORK_UNIT_PUBLISH_COUNT")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .expect("WORK_UNIT_PUBLISH_COUNT must be a number");
+
+    let mut worker = Worker::new(
+        base_url,
+        vertex_count,
+        clique_size,
+        campaign_id,
+        poll_interval_ms,
+        heartbeat_interval_ms,
+        fetch_size,
+        publish_size,
+    );
 
     worker.run().await;
 }

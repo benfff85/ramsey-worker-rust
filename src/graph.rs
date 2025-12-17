@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkUnitEdge {
+    #[serde(rename = "vertexOne")]
     pub vertex_one: u16,
+    #[serde(rename = "vertexTwo")]
     pub vertex_two: u16,
 }
 

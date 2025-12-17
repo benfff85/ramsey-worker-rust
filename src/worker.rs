@@ -10,11 +10,14 @@ use tokio::time::sleep;
 
 pub struct Worker {
     client: MiddlewareClient,
-    client_id: Option<String>,
+    client_id: Option<i32>,
     clique_size: usize,
     vertex_count: usize,
     graph_cache: HashMap<i32, Graph>,
     poll_interval: Duration,
+    heartbeat_interval: Duration,
+    fetch_size: i32,
+    publish_size: i32, // Note: batch logic logic in cycle needs update to use this? Currently cycle does fetch-process-publish all in one go for fetched amount
     campaign_id: i32,
 }
 
@@ -24,6 +27,10 @@ impl Worker {
         vertex_count: usize,
         clique_size: usize,
         campaign_id: i32,
+        poll_interval_ms: u64,
+        heartbeat_interval_ms: u64,
+        fetch_size: i32,
+        publish_size: i32,
     ) -> Self {
         Worker {
             client: MiddlewareClient::new(base_url),
@@ -31,7 +38,10 @@ impl Worker {
             vertex_count,
             clique_size,
             graph_cache: HashMap::new(),
-            poll_interval: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(poll_interval_ms),
+            heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
+            fetch_size,
+            publish_size,
             campaign_id,
         }
     }
@@ -44,8 +54,18 @@ impl Worker {
             campaign_id: self.campaign_id,
             type_: ClientType::CLIQUECHECKER,
             status: ClientStatus::ACTIVE,
-            created_date: Some(Utc::now().to_rfc3339()),
-            last_phone_home_date: Some(Utc::now().to_rfc3339()),
+            created_date: Some(
+                Utc::now()
+                    .naive_utc()
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            ),
+            last_phone_home_date: Some(
+                Utc::now()
+                    .naive_utc()
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            ),
         };
 
         // In Java it gets campaign info first, updates config, then creates client
@@ -58,7 +78,7 @@ impl Worker {
 
         let registered_client = self.client.create_client(&client_data).await?;
         if let Some(id) = registered_client.client_id {
-            self.client_id = Some(id.clone());
+            self.client_id = Some(id);
             println!("Registered with Client ID: {}", id);
         }
 
@@ -77,18 +97,23 @@ impl Worker {
         );
 
         let mut last_heartbeat = Instant::now();
-        let heartbeat_interval = Duration::from_secs(30);
+        // heartbeat_interval is now in self
 
         loop {
             // Heartbeat check
-            if last_heartbeat.elapsed() > heartbeat_interval {
+            if last_heartbeat.elapsed() > self.heartbeat_interval {
                 let hb_client = Client {
-                    client_id: self.client_id.clone(),
+                    client_id: self.client_id,
                     campaign_id: self.campaign_id,
                     type_: ClientType::CLIQUECHECKER,
                     status: ClientStatus::ACTIVE,
                     created_date: None,
-                    last_phone_home_date: Some(Utc::now().to_rfc3339()),
+                    last_phone_home_date: Some(
+                        Utc::now()
+                            .naive_utc()
+                            .format("%Y-%m-%dT%H:%M:%S")
+                            .to_string(),
+                    ),
                 };
                 if let Err(e) = self.client.update_client(&hb_client).await {
                     eprintln!("Heartbeat failed: {}", e);
@@ -115,16 +140,17 @@ impl Worker {
     }
 
     async fn cycle(&mut self) -> Result<usize, Box<dyn Error>> {
-        let client_id = self.client_id.as_ref().expect("Client ID not set").clone();
+        let client_id = self.client_id.expect("Client ID not set");
         let work_units = self
             .client
-            .get_work_units(&client_id, WorkUnitStatus::ASSIGNED, 100)
+            .get_work_units(client_id, WorkUnitStatus::ASSIGNED, self.fetch_size)
             .await?;
 
         if work_units.is_empty() {
             return Ok(0);
         }
 
+        let total_work = work_units.len();
         let mut processed_units = Vec::new();
 
         for mut unit in work_units {
@@ -158,17 +184,36 @@ impl Worker {
             };
 
             unit.clique_count = Some(count);
-            unit.status = WorkUnitStatus::COMPLETED;
-
-            // Logic for completion date etc could be added here or handled by server
+            unit.status = WorkUnitStatus::COMPLETE;
+            unit.completed_date = Some(
+                Utc::now()
+                    .naive_utc()
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            );
+            // Also set processing_started_date if not present, though ideally it should be set when picked up
+            if unit.processing_started_date.is_none() {
+                unit.processing_started_date = Some(
+                    Utc::now()
+                        .naive_utc()
+                        .format("%Y-%m-%dT%H:%M:%S")
+                        .to_string(),
+                );
+            }
 
             processed_units.push(unit);
+
+            // Check if we reached publish batch size
+            if processed_units.len() >= self.publish_size as usize {
+                self.client.update_work_units(&processed_units).await?;
+                processed_units.clear();
+            }
         }
 
         if !processed_units.is_empty() {
             self.client.update_work_units(&processed_units).await?;
         }
 
-        Ok(processed_units.len())
+        Ok(total_work)
     }
 }

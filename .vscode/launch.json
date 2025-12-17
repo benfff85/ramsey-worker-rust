@@ -9,7 +9,7 @@
             "args": [],
             "cwd": "${workspaceFolder}",
             "env": {
-                "RAMSEY_API_URL": "http://localhost:8080",
+                "RAMSEY_API_URL": "http://localhost:4040/api/ramsey",
                 "RAMSEY_CAMPAIGN_ID": "1"
             },
             "preLaunchTask": "cargo build"
@@ -22,7 +22,7 @@
             "args": [],
             "cwd": "${workspaceFolder}",
             "env": {
-                "RAMSEY_API_URL": "http://localhost:8080",
+                "RAMSEY_API_URL": "http://localhost:4040/api/ramsey",
                 "RAMSEY_CAMPAIGN_ID": "1"
             },
             "preLaunchTask": "cargo build --release"

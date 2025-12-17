@@ -17,6 +17,15 @@ pub struct WorkUnit {
     pub assigned_client: Option<String>,
     #[serde(rename = "workUnitAnalysisType")]
     pub analysis_type: WorkUnitAnalysisType,
+    pub priority: Option<WorkUnitPriority>,
+    #[serde(rename = "createdDate")]
+    pub created_date: Option<String>,
+    #[serde(rename = "assignedDate")]
+    pub assigned_date: Option<String>,
+    #[serde(rename = "processingStartedDate")]
+    pub processing_started_date: Option<String>,
+    #[serde(rename = "completedDate")]
+    pub completed_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,27 +37,36 @@ pub enum WorkUnitAnalysisType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WorkUnitStatus {
-    CREATED,
+    NEW,
     ASSIGNED,
-    COMPLETED,
-    ERROR,
+    COMPLETE,
+    ERROR, // Keeping internal error state if needed, but won't send to server
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WorkUnitPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphData {
+    #[serde(rename = "graphId")]
     pub id: i32,
     #[serde(rename = "vertexCount")]
     pub vertex_count: usize,
-    #[serde(rename = "structureData")]
+    #[serde(rename = "edgeData")]
     pub structure_data: String, // bitstring
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
     #[serde(rename = "clientId")]
-    pub client_id: Option<String>,
+    pub client_id: Option<i32>,
     #[serde(rename = "campaignId")]
     pub campaign_id: i32,
+    #[serde(rename = "type")]
     pub type_: ClientType,
     pub status: ClientStatus,
     #[serde(rename = "createdDate")]
