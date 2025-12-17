@@ -47,7 +47,6 @@ impl MiddlewareClient {
         let url = format!("{}/work-units", self.base_url); // PUT endpoint
 
         let json_payload = serde_json::to_string(work_units)?;
-        println!("DEBUG: Sending update_work_units payload: {}", json_payload);
 
         let response = self
             .client

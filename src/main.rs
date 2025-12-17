@@ -28,12 +28,12 @@ async fn main() {
         .expect("CLIENT_PHONE_HOME_FREQ must be a number");
 
     let fetch_size: i32 = env::var("WORK_UNIT_FETCH_COUNT")
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "50000".to_string())
         .parse()
         .expect("WORK_UNIT_FETCH_COUNT must be a number");
 
     let publish_size: i32 = env::var("WORK_UNIT_PUBLISH_COUNT")
-        .unwrap_or_else(|_| "2".to_string())
+        .unwrap_or_else(|_| "50000".to_string())
         .parse()
         .expect("WORK_UNIT_PUBLISH_COUNT must be a number");
 

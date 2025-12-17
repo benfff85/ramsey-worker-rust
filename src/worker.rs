@@ -197,14 +197,6 @@ impl Worker {
                     graph.flip_edges(&unit.edges_to_flip); // revert
 
                     let total = (clique_collection.total() as i32) - broken + new;
-                    println!(
-                        "DEBUG: Unit {} -> Base: {}, Broken: {}, New: {}, Total: {}",
-                        unit.id,
-                        clique_collection.total(),
-                        broken,
-                        new,
-                        total
-                    );
                     total
                 }
                 WorkUnitAnalysisType::COMPREHENSIVE | WorkUnitAnalysisType::NAIVE => {
