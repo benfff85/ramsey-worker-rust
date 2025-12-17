@@ -23,6 +23,9 @@ jobs:
       - name: Rust Version Check
         run: rustc --version && cargo --version
 
+      - name: Cache Cargo Registry
+        uses: Swatinem/rust-cache@v2
+
       - name: Cargo Check and Test
         run: |
           cargo check

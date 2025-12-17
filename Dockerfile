@@ -1,7 +1,19 @@
 # Build Stage
 FROM rust:latest AS builder
 WORKDIR /usr/src/app
-COPY . .
+
+# Create a clean dependency layer
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src
+RUN echo "fn main() {}" > src/main.rs
+RUN echo "" > src/lib.rs
+RUN cargo build --release
+
+# Build the actual application
+RUN rm -rf src
+COPY src src
+# Touch the main file to force a rebuild of the application code
+RUN touch src/main.rs
 RUN cargo build --release
 
 # Runtime Stage
