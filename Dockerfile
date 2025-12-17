@@ -12,8 +12,8 @@ RUN cargo build --release
 # Build the actual application
 RUN rm -rf src
 COPY src src
-# Touch the main file to force a rebuild of the application code
-RUN touch src/main.rs
+# Touch main.rs and lib.rs to force a rebuild of the application code
+RUN touch src/main.rs src/lib.rs
 RUN cargo build --release
 
 # Runtime Stage
