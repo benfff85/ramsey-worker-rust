@@ -1,0 +1,103 @@
+use crate::model::{Campaign, Client, GraphData, WorkUnit, WorkUnitStatus};
+use reqwest::{Client as HttpClient, StatusCode};
+use std::error::Error;
+use std::time::Duration;
+
+pub struct MiddlewareClient {
+    client: HttpClient,
+    base_url: String, // e.g. http://localhost:8080 or from config
+                      // Cache map for graphs if needed? Or just fetch on demand
+}
+
+impl MiddlewareClient {
+    pub fn new(base_url: String) -> Self {
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| HttpClient::new());
+
+        MiddlewareClient { client, base_url }
+    }
+
+    pub async fn get_work_units(
+        &self,
+        client_id: &str,
+        status: WorkUnitStatus,
+        page_size: usize,
+    ) -> Result<Vec<WorkUnit>, Box<dyn Error>> {
+        let url = format!("{}/work-units", self.base_url);
+        // Assuming the Java API query params: ?assignedClientId=...&status=...&pageSize=...
+        let params = [
+            ("assignedClientId", client_id),
+            ("status", &format!("{:?}", status)), // Enum debug print might match Java string? CREATED, ASSIGNED
+            ("pageSize", &page_size.to_string()),
+        ];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(vec![]);
+        }
+
+        let work_units = response.json::<Vec<WorkUnit>>().await?;
+        Ok(work_units)
+    }
+
+    pub async fn update_work_units(&self, work_units: &[WorkUnit]) -> Result<(), Box<dyn Error>> {
+        let url = format!("{}/work-units", self.base_url); // PUT endpoint
+        let response = self.client.put(&url).json(work_units).send().await?;
+
+        if !response.status().is_success() {
+            return Err(format!("Failed to update work units: {}", response.status()).into());
+        }
+        Ok(())
+    }
+
+    pub async fn get_graph(&self, graph_id: i32) -> Result<GraphData, Box<dyn Error>> {
+        let url = format!("{}/graphs/{}", self.base_url, graph_id);
+        let graph_data = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<GraphData>()
+            .await?;
+        Ok(graph_data)
+    }
+
+    pub async fn get_campaign(&self, campaign_id: i32) -> Result<Campaign, Box<dyn Error>> {
+        let url = format!("{}/campaigns/{}", self.base_url, campaign_id);
+        let campaign = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<Campaign>()
+            .await?;
+        Ok(campaign)
+    }
+
+    pub async fn create_client(&self, client: &Client) -> Result<Client, Box<dyn Error>> {
+        let url = format!("{}/clients", self.base_url);
+        let created_client = self
+            .client
+            .post(&url)
+            .json(client)
+            .send()
+            .await?
+            .json::<Client>()
+            .await?;
+        Ok(created_client)
+    }
+
+    pub async fn update_client(&self, client: &Client) -> Result<(), Box<dyn Error>> {
+        if let Some(id) = &client.client_id {
+            let url = format!("{}/clients/{}", self.base_url, id);
+            let response = self.client.put(&url).json(client).send().await?;
+            if !response.status().is_success() {
+                return Err(format!("Failed to update client: {}", response.status()).into());
+            }
+        }
+        Ok(())
+    }
+}
