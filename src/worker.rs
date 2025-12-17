@@ -1,4 +1,3 @@
-use crate::algorithm::get_new_cliques;
 use crate::client::MiddlewareClient;
 use crate::graph::Graph;
 use crate::model::{Client, ClientStatus, ClientType, WorkUnitAnalysisType, WorkUnitStatus};
@@ -169,16 +168,14 @@ impl Worker {
             // COMPREHENSIVE/NAIVE -> get_cliques_comprehensive
 
             let count = match unit.analysis_type {
-                WorkUnitAnalysisType::TARGETED => {
-                    get_new_cliques(graph, self.clique_size, &unit.edges_to_flip)
-                }
-                WorkUnitAnalysisType::COMPREHENSIVE | WorkUnitAnalysisType::NAIVE => {
-                    // For comprehensive, we might need to apply the flips first?
-                    // Java ComprehensiveWorkUnitProcessor does logic: flip -> check -> return count
-                    // Since specific edges to flip might be part of the work unit even for comprehensive checks (e.g. verifying a state)
+                WorkUnitAnalysisType::TARGETED
+                | WorkUnitAnalysisType::COMPREHENSIVE
+                | WorkUnitAnalysisType::NAIVE => {
+                    // Temporary fix: Use comprehensive check for everything to match Java's TOTAL count behavior.
+                    // The optimized delta logic (base - broken + new) requires caching the full clique list.
                     graph.flip_edges(&unit.edges_to_flip);
                     let c = crate::algorithm::get_cliques_comprehensive(graph, self.clique_size);
-                    graph.flip_edges(&unit.edges_to_flip); // revert back for cache consistency if needed
+                    graph.flip_edges(&unit.edges_to_flip); // revert back for cache consistency
                     c
                 }
             };
