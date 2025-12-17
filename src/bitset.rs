@@ -88,4 +88,20 @@ impl BitMatrix {
             *a &= *b;
         }
     }
+
+    pub fn to_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for (i, &word) in self.data.iter().enumerate() {
+            if word != 0 {
+                let mut temp = word;
+                let base_idx = i * 64;
+                while temp != 0 {
+                    let zeros = temp.trailing_zeros();
+                    indices.push(base_idx + zeros as usize);
+                    temp &= temp - 1; // Clear lowest set bit
+                }
+            }
+        }
+        indices
+    }
 }

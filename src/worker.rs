@@ -1,4 +1,6 @@
+use crate::algorithm::{get_all_cliques, get_new_cliques};
 use crate::client::MiddlewareClient;
+use crate::clique_collection::CliqueCollection;
 use crate::graph::Graph;
 use crate::model::{Client, ClientStatus, ClientType, WorkUnitAnalysisType, WorkUnitStatus};
 use chrono::Utc;
@@ -13,6 +15,7 @@ pub struct Worker {
     clique_size: usize,
     vertex_count: usize,
     graph_cache: HashMap<i32, Graph>,
+    clique_collection_cache: HashMap<i32, CliqueCollection>,
     poll_interval: Duration,
     heartbeat_interval: Duration,
     fetch_size: i32,
@@ -37,6 +40,7 @@ impl Worker {
             vertex_count,
             clique_size,
             graph_cache: HashMap::new(),
+            clique_collection_cache: HashMap::new(),
             poll_interval: Duration::from_millis(poll_interval_ms),
             heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
             fetch_size,
@@ -167,15 +171,46 @@ impl Worker {
             // TARGETED -> get_new_cliques
             // COMPREHENSIVE/NAIVE -> get_cliques_comprehensive
 
+            // Ensure we have the clique collection for this graph
+            if !self
+                .clique_collection_cache
+                .contains_key(&unit.base_graph_id)
+            {
+                let all_cliques = get_all_cliques(graph, self.clique_size);
+                let mut cc = CliqueCollection::new(self.vertex_count);
+                cc.set_cliques(all_cliques, self.vertex_count);
+                self.clique_collection_cache.insert(unit.base_graph_id, cc);
+            }
+
+            let clique_collection = self
+                .clique_collection_cache
+                .get(&unit.base_graph_id)
+                .unwrap();
+
             let count = match unit.analysis_type {
-                WorkUnitAnalysisType::TARGETED
-                | WorkUnitAnalysisType::COMPREHENSIVE
-                | WorkUnitAnalysisType::NAIVE => {
-                    // Temporary fix: Use comprehensive check for everything to match Java's TOTAL count behavior.
-                    // The optimized delta logic (base - broken + new) requires caching the full clique list.
+                WorkUnitAnalysisType::TARGETED => {
+                    let broken = clique_collection
+                        .get_count_of_cliques_containing_edges(&unit.edges_to_flip);
+
+                    graph.flip_edges(&unit.edges_to_flip);
+                    let new = get_new_cliques(graph, self.clique_size, &unit.edges_to_flip);
+                    graph.flip_edges(&unit.edges_to_flip); // revert
+
+                    let total = (clique_collection.total() as i32) - broken + new;
+                    println!(
+                        "DEBUG: Unit {} -> Base: {}, Broken: {}, New: {}, Total: {}",
+                        unit.id,
+                        clique_collection.total(),
+                        broken,
+                        new,
+                        total
+                    );
+                    total
+                }
+                WorkUnitAnalysisType::COMPREHENSIVE | WorkUnitAnalysisType::NAIVE => {
                     graph.flip_edges(&unit.edges_to_flip);
                     let c = crate::algorithm::get_cliques_comprehensive(graph, self.clique_size);
-                    graph.flip_edges(&unit.edges_to_flip); // revert back for cache consistency
+                    graph.flip_edges(&unit.edges_to_flip); // revert
                     c
                 }
             };
