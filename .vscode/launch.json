@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Ramsey Worker",
+            "program": "${workspaceFolder}/target/debug/ramsey-worker-rust",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RAMSEY_API_URL": "http://localhost:8080",
+                "RAMSEY_CAMPAIGN_ID": "1"
+            },
+            "preLaunchTask": "cargo build"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Release Ramsey Worker",
+            "program": "${workspaceFolder}/target/release/ramsey-worker-rust",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RAMSEY_API_URL": "http://localhost:8080",
+                "RAMSEY_CAMPAIGN_ID": "1"
+            },
+            "preLaunchTask": "cargo build --release"
+        }
+    ]
+}

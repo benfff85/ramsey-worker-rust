@@ -56,9 +56,38 @@ pub fn get_new_cliques(
     new_clique_count
 }
 
+pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
+    let mut clique_count = 0;
+
+    // RED
+    let r = BitMatrix::new(graph.vertex_count); // removed mut
+    let mut p = BitMatrix::new(graph.vertex_count);
+    let x = BitMatrix::new(graph.vertex_count);
+
+    // Set all bits in P to 1 (all vertices are candidates initially)
+    for i in 0..graph.vertex_count {
+        p.set(i);
+    }
+
+    clique_count += bron_kerbosch_count(
+        r.clone(),
+        p.clone(),
+        x.clone(),
+        &graph.adjacency,
+        clique_size,
+    );
+
+    // BLUE
+    graph.invert();
+    clique_count += bron_kerbosch_count(r, p, x, &graph.adjacency, clique_size);
+    graph.invert(); // Restore
+
+    clique_count
+}
+
 fn bron_kerbosch_count(
     mut r: BitMatrix,
-    mut p: BitMatrix,
+    mut p: BitMatrix, // reverted to mut
     mut x: BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,

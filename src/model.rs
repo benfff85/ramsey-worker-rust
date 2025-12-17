@@ -15,7 +15,15 @@ pub struct WorkUnit {
     pub clique_count: Option<i32>,
     #[serde(rename = "assignedClient")]
     pub assigned_client: Option<String>,
-    // Add other fields as needed, keeping it simple for now
+    #[serde(rename = "workUnitAnalysisType")]
+    pub analysis_type: WorkUnitAnalysisType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WorkUnitAnalysisType {
+    NAIVE,
+    COMPREHENSIVE,
+    TARGETED,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
