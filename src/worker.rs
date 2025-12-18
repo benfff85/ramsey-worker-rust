@@ -150,6 +150,10 @@ impl Worker {
             .await?;
 
         if work_units.is_empty() {
+            println!(
+                "[{}] No work units available, waiting...",
+                Utc::now().format("%Y-%m-%dT%H:%M:%S")
+            );
             return Ok(0);
         }
 
