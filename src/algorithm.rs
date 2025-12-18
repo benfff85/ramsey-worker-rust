@@ -3,6 +3,7 @@ use crate::graph::{Graph, WorkUnitEdge};
 
 /// Replicates TargetedCliqueCheckServiceBitSet.getNewCliques
 /// Counts new cliques formed after edge flips, using seeded Bron-Kerbosch.
+/// Uses the optimized no-X variant since we start with empty X.
 pub fn get_new_cliques(
     graph: &mut Graph,
     clique_size: usize,
@@ -25,9 +26,9 @@ pub fn get_new_cliques(
             p.clear(v1);
             p.clear(v2);
 
-            let mut x = BitMatrix::new();
+            // Use the no-X variant for targeted search (X starts empty and we don't need duplicate prevention)
             new_clique_count +=
-                bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
+                bron_kerbosch_count_no_x(&mut r, &mut p, &graph.adjacency, clique_size);
         }
     }
 
@@ -47,9 +48,8 @@ pub fn get_new_cliques(
             p.clear(v1);
             p.clear(v2);
 
-            let mut x = BitMatrix::new();
             new_clique_count +=
-                bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
+                bron_kerbosch_count_no_x(&mut r, &mut p, &graph.adjacency, clique_size);
         }
     }
 
@@ -107,7 +107,6 @@ pub fn get_all_cliques(graph: &mut Graph, clique_size: usize) -> Vec<Vec<usize>>
 }
 
 /// Bron-Kerbosch with in-place mutation and backtracking.
-/// This avoids cloning R and X on every recursive call.
 fn bron_kerbosch_collect_inplace(
     r: &mut BitMatrix,
     p: &mut BitMatrix,
@@ -129,29 +128,21 @@ fn bron_kerbosch_collect_inplace(
         return;
     }
 
-    // Copy candidates to iterate over (Copy is free with fixed array)
     let candidates = *p;
 
     let mut v_opt = candidates.next_set_bit(0);
     while let Some(v) = v_opt {
-        // Add v to R
         r.set(v);
 
-        // Compute new_p = p ∩ N(v)
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
-        // Compute new_x = x ∩ N(v)
         let mut new_x = *x;
         new_x.and_assign(&adjacency[v]);
 
-        // Recurse with modified sets
         bron_kerbosch_collect_inplace(r, &mut new_p, &mut new_x, adjacency, clique_size, cliques);
 
-        // Backtrack: remove v from R
         r.clear(v);
-
-        // Move v from P to X
         p.clear(v);
         x.set(v);
 
@@ -167,7 +158,6 @@ pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     let mut p = BitMatrix::new();
     let mut x = BitMatrix::new();
 
-    // Set all bits in P to 1 (all vertices are candidates initially)
     for i in 0..graph.vertex_count {
         p.set(i);
     }
@@ -178,7 +168,6 @@ pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     // BLUE
     graph.invert();
 
-    // Reset for blue pass
     let mut r_blue = BitMatrix::new();
     let mut p_blue = BitMatrix::new();
     let mut x_blue = BitMatrix::new();
@@ -198,8 +187,7 @@ pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     clique_count
 }
 
-/// Bron-Kerbosch counting variant with in-place mutation and backtracking.
-/// This matches the Java implementation's approach of mutating R in place.
+/// Bron-Kerbosch counting with X tracking (for comprehensive search to avoid duplicates).
 #[inline]
 fn bron_kerbosch_count_inplace(
     r: &mut BitMatrix,
@@ -221,32 +209,68 @@ fn bron_kerbosch_count_inplace(
     }
 
     let mut count = 0;
-
-    // Copy candidates to iterate over (Copy is free with fixed array)
     let candidates = *p;
 
     let mut v_opt = candidates.next_set_bit(0);
     while let Some(v) = v_opt {
-        // Add v to R
         r.set(v);
 
-        // Compute new_p = p ∩ N(v)
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
-        // Compute new_x = x ∩ N(v)
         let mut new_x = *x;
         new_x.and_assign(&adjacency[v]);
 
-        // Recurse
         count += bron_kerbosch_count_inplace(r, &mut new_p, &mut new_x, adjacency, clique_size);
 
-        // Backtrack: remove v from R
         r.clear(v);
-
-        // Move v from P to X
         p.clear(v);
         x.set(v);
+
+        v_opt = candidates.next_set_bit(v + 1);
+    }
+
+    count
+}
+
+/// Optimized Bron-Kerbosch counting WITHOUT X tracking.
+/// Used for targeted/seeded search where X starts empty and we don't need
+/// to prevent duplicate cliques (each edge seeds a unique search space).
+/// Saves ~40 bytes copy + and_assign per recursion level.
+#[inline]
+fn bron_kerbosch_count_no_x(
+    r: &mut BitMatrix,
+    p: &mut BitMatrix,
+    adjacency: &[BitMatrix],
+    clique_size: usize,
+) -> i32 {
+    if r.cardinality() as usize == clique_size {
+        return 1;
+    }
+
+    if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
+        return 0;
+    }
+
+    if p.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let candidates = *p;
+
+    let mut v_opt = candidates.next_set_bit(0);
+    while let Some(v) = v_opt {
+        r.set(v);
+
+        let mut new_p = *p;
+        new_p.and_assign(&adjacency[v]);
+
+        count += bron_kerbosch_count_no_x(r, &mut new_p, adjacency, clique_size);
+
+        r.clear(v);
+        p.clear(v);
+        // No X tracking needed for targeted search
 
         v_opt = candidates.next_set_bit(v + 1);
     }
