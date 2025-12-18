@@ -2,7 +2,8 @@ use crate::algorithm::{get_all_cliques, get_new_cliques};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::graph::Graph;
-use crate::model::{Client, ClientStatus, ClientType, WorkUnitAnalysisType, WorkUnitStatus};
+use crate::model::{Client, ClientStatus, ClientType, WorkResult, WorkUnitAnalysisType};
+use crate::redis_client::RedisClient;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::error::Error;
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 pub struct Worker {
-    client: MiddlewareClient,
+    mw_client: MiddlewareClient,
+    redis_client: Option<RedisClient>,
     client_id: Option<i32>,
     clique_size: usize,
     vertex_count: usize,
@@ -19,8 +21,9 @@ pub struct Worker {
     poll_interval: Duration,
     heartbeat_interval: Duration,
     fetch_size: i32,
-    publish_size: i32, // Note: batch logic logic in cycle needs update to use this? Currently cycle does fetch-process-publish all in one go for fetched amount
+    publish_size: i32,
     campaign_id: i32,
+    stage_id: Option<i32>,
 }
 
 impl Worker {
@@ -35,7 +38,8 @@ impl Worker {
         publish_size: i32,
     ) -> Self {
         Worker {
-            client: MiddlewareClient::new(base_url),
+            mw_client: MiddlewareClient::new(base_url),
+            redis_client: None,
             client_id: None,
             vertex_count,
             clique_size,
@@ -46,7 +50,15 @@ impl Worker {
             fetch_size,
             publish_size,
             campaign_id,
+            stage_id: None,
         }
+    }
+
+    /// Connect to Redis
+    pub async fn connect_redis(&mut self, host: &str, port: u16) -> Result<(), Box<dyn Error>> {
+        let redis_client = RedisClient::new(host, port).await?;
+        self.redis_client = Some(redis_client);
+        Ok(())
     }
 
     pub async fn register(&mut self) -> Result<(), Box<dyn Error>> {
@@ -71,15 +83,12 @@ impl Worker {
             ),
         };
 
-        // In Java it gets campaign info first, updates config, then creates client
-        // We will simplify and assume config is passed in or we fetch campaign first
-
-        let campaign = self.client.get_campaign(self.campaign_id).await?;
+        let campaign = self.mw_client.get_campaign(self.campaign_id).await?;
         println!("Campaign Info: {:?}", campaign);
         self.vertex_count = campaign.vertex_count as usize;
         self.clique_size = campaign.subgraph_size as usize;
 
-        let registered_client = self.client.create_client(&client_data).await?;
+        let registered_client = self.mw_client.create_client(&client_data).await?;
         if let Some(id) = registered_client.client_id {
             self.client_id = Some(id);
             println!("Registered with Client ID: {}", id);
@@ -91,7 +100,7 @@ impl Worker {
     pub async fn run(&mut self) {
         if let Err(e) = self.register().await {
             eprintln!("Failed to register: {}", e);
-            return; // Initial registration failure is fatal
+            return;
         }
 
         println!(
@@ -100,7 +109,6 @@ impl Worker {
         );
 
         let mut last_heartbeat = Instant::now();
-        // heartbeat_interval is now in self
 
         loop {
             // Heartbeat check
@@ -118,7 +126,7 @@ impl Worker {
                             .to_string(),
                     ),
                 };
-                if let Err(e) = self.client.update_client(&hb_client).await {
+                if let Err(e) = self.mw_client.update_client(&hb_client).await {
                     eprintln!("Heartbeat failed: {}", e);
                 } else {
                     last_heartbeat = Instant::now();
@@ -128,10 +136,9 @@ impl Worker {
             match self.cycle().await {
                 Ok(count) => {
                     if count == 0 {
-                        // user feedback: sleep briefly
                         sleep(self.poll_interval).await;
                     } else {
-                        println!("Processed {} work units", count);
+                        println!("Processed {} work items", count);
                     }
                 }
                 Err(e) => {
@@ -143,105 +150,130 @@ impl Worker {
     }
 
     async fn cycle(&mut self) -> Result<usize, Box<dyn Error>> {
-        let client_id = self.client_id.expect("Client ID not set");
-        let work_units = self
-            .client
-            .get_work_units(client_id, WorkUnitStatus::ASSIGNED, self.fetch_size)
-            .await?;
+        // Get stage_id first (before borrowing redis_client)
+        let stage_id = self.get_or_fetch_stage_id().await?;
+        let fetch_size = self.fetch_size as usize;
 
-        if work_units.is_empty() {
+        let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
+
+        // Pop work items from Redis
+        let work_items = redis_client.pop_work_items(stage_id, fetch_size).await?;
+
+        if work_items.is_empty() {
             println!(
-                "[{}] No work units available, waiting...",
+                "[{}] No work items available in Redis queue, waiting...",
                 Utc::now().format("%Y-%m-%dT%H:%M:%S")
             );
             return Ok(0);
         }
 
-        let total_work = work_units.len();
-        let mut processed_units = Vec::new();
+        let total_work = work_items.len();
+        let mut processed_results: Vec<WorkResult> = Vec::new();
 
-        for mut unit in work_units {
+        for item in work_items {
             // Ensure we have the base graph
-            if !self.graph_cache.contains_key(&unit.base_graph_id) {
-                let graph_data = self.client.get_graph(unit.base_graph_id).await?;
+            if !self.graph_cache.contains_key(&item.base_graph_id) {
+                let graph_data = self.mw_client.get_graph(item.base_graph_id).await?;
                 let graph =
                     Graph::from_bitstring(&graph_data.structure_data, graph_data.vertex_count);
-                self.graph_cache.insert(unit.base_graph_id, graph);
+                self.graph_cache.insert(item.base_graph_id, graph);
             }
 
-            let graph = self.graph_cache.get_mut(&unit.base_graph_id).unwrap();
-
-            // Replicate logic based on analysis type
-            // TARGETED -> get_new_cliques
-            // COMPREHENSIVE/NAIVE -> get_cliques_comprehensive
+            let graph = self.graph_cache.get_mut(&item.base_graph_id).unwrap();
 
             // Ensure we have the clique collection for this graph
             if !self
                 .clique_collection_cache
-                .contains_key(&unit.base_graph_id)
+                .contains_key(&item.base_graph_id)
             {
                 let all_cliques = get_all_cliques(graph, self.clique_size);
                 let mut cc = CliqueCollection::new(self.vertex_count);
                 cc.set_cliques(all_cliques, self.vertex_count);
-                self.clique_collection_cache.insert(unit.base_graph_id, cc);
+                self.clique_collection_cache.insert(item.base_graph_id, cc);
             }
 
             let clique_collection = self
                 .clique_collection_cache
-                .get(&unit.base_graph_id)
+                .get(&item.base_graph_id)
                 .unwrap();
 
-            let count = match unit.analysis_type {
+            let count = match item.analysis_type {
                 WorkUnitAnalysisType::TARGETED => {
                     let broken = clique_collection
-                        .get_count_of_cliques_containing_edges(&unit.edges_to_flip);
+                        .get_count_of_cliques_containing_edges(&item.edges_to_flip);
 
-                    graph.flip_edges(&unit.edges_to_flip);
-                    let new = get_new_cliques(graph, self.clique_size, &unit.edges_to_flip);
-                    graph.flip_edges(&unit.edges_to_flip); // revert
+                    graph.flip_edges(&item.edges_to_flip);
+                    let new = get_new_cliques(graph, self.clique_size, &item.edges_to_flip);
+                    graph.flip_edges(&item.edges_to_flip); // revert
 
                     let total = (clique_collection.total() as i32) - broken + new;
                     total
                 }
                 WorkUnitAnalysisType::COMPREHENSIVE | WorkUnitAnalysisType::NAIVE => {
-                    graph.flip_edges(&unit.edges_to_flip);
+                    graph.flip_edges(&item.edges_to_flip);
                     let c = crate::algorithm::get_cliques_comprehensive(graph, self.clique_size);
-                    graph.flip_edges(&unit.edges_to_flip); // revert
+                    graph.flip_edges(&item.edges_to_flip); // revert
                     c
                 }
             };
 
-            unit.clique_count = Some(count);
-            unit.status = WorkUnitStatus::COMPLETE;
-            unit.completed_date = Some(
-                Utc::now()
-                    .naive_utc()
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            );
-            // Also set processing_started_date if not present, though ideally it should be set when picked up
-            if unit.processing_started_date.is_none() {
-                unit.processing_started_date = Some(
-                    Utc::now()
-                        .naive_utc()
-                        .format("%Y-%m-%dT%H:%M:%S")
-                        .to_string(),
-                );
-            }
+            // Create WorkResult for submission
+            let result = WorkResult {
+                id: None,
+                base_graph_id: item.base_graph_id,
+                stage_id: item.stage_id,
+                edges_to_flip: item.edges_to_flip,
+                clique_count: count,
+                work_unit_analysis_type: item.analysis_type,
+            };
 
-            processed_units.push(unit);
+            processed_results.push(result);
 
-            // Check if we reached publish batch size
-            if processed_units.len() >= self.publish_size as usize {
-                self.client.update_work_units(&processed_units).await?;
-                processed_units.clear();
+            // Submit batch if we reached publish size
+            if processed_results.len() >= self.publish_size as usize {
+                self.mw_client.submit_results(&processed_results).await?;
+                processed_results.clear();
             }
         }
 
-        if !processed_units.is_empty() {
-            self.client.update_work_units(&processed_units).await?;
+        // Submit remaining results
+        if !processed_results.is_empty() {
+            self.mw_client.submit_results(&processed_results).await?;
         }
 
         Ok(total_work)
+    }
+
+    /// Get or fetch the stage ID for the current campaign
+    async fn get_or_fetch_stage_id(&mut self) -> Result<i32, Box<dyn Error>> {
+        if let Some(stage_id) = self.stage_id {
+            return Ok(stage_id);
+        }
+
+        // Fetch the active stage for this campaign
+        let stages = self
+            .mw_client
+            .get_stages_by_campaign(self.campaign_id, "ACTIVE")
+            .await?;
+
+        if stages.is_empty() {
+            return Err("No active stage found for campaign".into());
+        }
+
+        if stages.len() > 1 {
+            eprintln!(
+                "Warning: Multiple active stages found for campaign {}, using first one",
+                self.campaign_id
+            );
+        }
+
+        let stage = &stages[0];
+        println!(
+            "Using stage {} for campaign {} (base_graph_id: {})",
+            stage.stage_id, self.campaign_id, stage.base_graph_id
+        );
+
+        self.stage_id = Some(stage.stage_id);
+        Ok(stage.stage_id)
     }
 }

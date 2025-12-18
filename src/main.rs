@@ -6,8 +6,15 @@ use std::env;
 async fn main() {
     dotenv().ok();
 
-    let base_url =
-        env::var("RAMSEY_API_URL").unwrap_or_else(|_| "http://localhost:4040 ".to_string());
+    let base_url = env::var("RAMSEY_API_URL")
+        .unwrap_or_else(|_| "http://localhost:4040/api/ramsey".to_string());
+
+    // Redis configuration
+    let redis_host = env::var("REDIS_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let redis_port: u16 = env::var("REDIS_PORT")
+        .unwrap_or_else(|_| "6379".to_string())
+        .parse()
+        .expect("REDIS_PORT must be a number");
 
     // Configurable via env or hardcoded/args for now
     let vertex_count = 288;
@@ -17,10 +24,11 @@ async fn main() {
         .unwrap_or_else(|_| "1".to_string())
         .parse()
         .expect("CAMPAIGN_ID must be a number");
-    let poll_interval_ms: u64 = env::var("WORK_UNIT_ROUTER_FREQ")
+
+    let poll_interval_ms: u64 = env::var("WORK_UNIT_POLL_FREQ")
         .unwrap_or_else(|_| "1000".to_string())
         .parse()
-        .expect("WORK_UNIT_ROUTER_FREQ must be a number");
+        .expect("WORK_UNIT_POLL_FREQ must be a number");
 
     let heartbeat_interval_ms: u64 = env::var("CLIENT_PHONE_HOME_FREQ")
         .unwrap_or_else(|_| "60000".to_string())
@@ -47,6 +55,12 @@ async fn main() {
         fetch_size,
         publish_size,
     );
+
+    // Connect to Redis
+    if let Err(e) = worker.connect_redis(&redis_host, redis_port).await {
+        eprintln!("Failed to connect to Redis: {}", e);
+        return;
+    }
 
     worker.run().await;
 }
