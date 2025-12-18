@@ -1,63 +1,53 @@
 use crate::graph::WorkUnitEdge;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct CliqueCollection {
-    // Map edge to the number of cliques it belongs to
-    edge_map: HashMap<(i32, i32), i32>,
+    // Flat array to map edge to the number of cliques it belongs to.
+    // Indexing: u * vertex_count + v (assuming u < v)
+    edge_counts: Vec<i32>,
+    vertex_count: usize,
     clique_count: usize,
     cliques: Vec<Vec<usize>>,
 }
 
 impl CliqueCollection {
     pub fn new(vertex_count: usize) -> Self {
-        let mut edge_map = HashMap::new();
-        // Pre-initialize edge map for all possible edges
-        // This mirrors the Java implementation logic, although Java uses Short.
-        // We use (min, max) tuple as key to ensure canonical representation.
-        for i in 0..vertex_count {
-            for j in (i + 1)..vertex_count {
-                edge_map.insert((i as i32, j as i32), 0);
-            }
-        }
+        // Size for N vertices should be N * N to cover all pairs simply
+        let size = vertex_count * vertex_count;
+        let edge_counts = vec![0; size];
 
         CliqueCollection {
-            edge_map,
+            edge_counts,
+            vertex_count,
             clique_count: 0,
             cliques: Vec::new(),
         }
     }
 
-    pub fn set_cliques(&mut self, input_cliques: Vec<Vec<usize>>, _vertex_count: usize) {
+    pub fn set_cliques(&mut self, input_cliques: Vec<Vec<usize>>, vertex_count: usize) {
         self.cliques = input_cliques;
         self.clique_count = self.cliques.len();
+        self.vertex_count = vertex_count;
 
-        // Reset edge map
-        // Re-populating might be faster than iterating to clear if map is large vs dense?
-        // But let's follow the clear-then-fill pattern or just re-create.
-        // The Java code iterates keys to reset to 0.
-        // We can just clear and loop over the keys we have, OR re-create.
-        // Re-creating the map requires recreating all keys.
-        // Let's iterate and zero out.
-        for val in self.edge_map.values_mut() {
-            *val = 0;
-        }
-
-        // Use a temporary edge to minimize allocation if we were keyed by object,
-        // but here we are keyed by tuple value so it's cheap.
+        // Reset counts
+        // Much faster to standard fill for vec
+        self.edge_counts.fill(0);
 
         for clique in &self.cliques {
             let size = clique.len();
             for i in 0..size {
-                let u = clique[i] as i32;
+                let u = clique[i];
                 for j in (i + 1)..size {
-                    let v = clique[j] as i32;
-                    let key = if u < v { (u, v) } else { (v, u) };
+                    let v = clique[j];
 
-                    self.edge_map
-                        .entry(key)
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1); // Should theoretically always hit valid key if initialized
+                    // Always order u < v for consistent indexing
+                    let (min, max) = if u < v { (u, v) } else { (v, u) };
+                    let idx = min * self.vertex_count + max;
+
+                    // Safety check not strictly needed if we trust inputs but good for panic avoidance
+                    if idx < self.edge_counts.len() {
+                        self.edge_counts[idx] += 1;
+                    }
                 }
             }
         }
@@ -66,12 +56,14 @@ impl CliqueCollection {
     pub fn get_count_of_cliques_containing_edges(&self, edges: &[WorkUnitEdge]) -> i32 {
         let mut sum = 0;
         for edge in edges {
-            let u = edge.vertex_one as i32;
-            let v = edge.vertex_two as i32;
-            let key = if u < v { (u, v) } else { (v, u) };
+            let u = edge.vertex_one as usize;
+            let v = edge.vertex_two as usize;
+            let (min, max) = if u < v { (u, v) } else { (v, u) };
 
-            if let Some(count) = self.edge_map.get(&key) {
-                sum += count;
+            let idx = min * self.vertex_count + max;
+
+            if idx < self.edge_counts.len() {
+                sum += self.edge_counts[idx];
             }
         }
         sum
