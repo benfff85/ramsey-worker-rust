@@ -1,69 +1,88 @@
-/// A fixed-size bitset optimized for graph operations.
-/// We use a vector of u64 to store the bits.
-/// For R(8,8) searching 288 vertices, we need 288 bits, which is 5 u64s (320 bits).
-#[derive(Clone, Debug)]
+/// A fixed-size bitset optimized for graph operations on R(8,8) with 288 vertices.
+/// Uses a fixed array of 5 u64s (320 bits) to enable Copy semantics - no heap allocation.
+pub const BITSET_WORDS: usize = 5; // ceil(288/64) = 5
+pub const BITSET_SIZE: usize = 288;
+
+#[derive(Clone, Copy, Debug)]
 pub struct BitMatrix {
-    size: usize,
-    data: Vec<u64>,
+    data: [u64; BITSET_WORDS],
 }
 
 impl BitMatrix {
-    pub fn new(size: usize) -> Self {
-        let num_u64 = (size + 63) / 64;
+    #[inline]
+    pub const fn new() -> Self {
         BitMatrix {
-            size,
-            data: vec![0; num_u64],
+            data: [0; BITSET_WORDS],
         }
     }
 
+    #[inline]
     pub fn set(&mut self, bit: usize) {
-        if bit < self.size {
-            self.data[bit / 64] |= 1 << (bit % 64);
-        }
+        debug_assert!(bit < BITSET_SIZE);
+        self.data[bit / 64] |= 1u64 << (bit % 64);
     }
 
+    #[inline]
     pub fn clear(&mut self, bit: usize) {
-        if bit < self.size {
-            self.data[bit / 64] &= !(1 << (bit % 64));
-        }
+        debug_assert!(bit < BITSET_SIZE);
+        self.data[bit / 64] &= !(1u64 << (bit % 64));
     }
 
+    #[inline]
     pub fn get(&self, bit: usize) -> bool {
-        if bit < self.size {
-            (self.data[bit / 64] & (1 << (bit % 64))) != 0
-        } else {
-            false
-        }
+        debug_assert!(bit < BITSET_SIZE);
+        (self.data[bit / 64] & (1u64 << (bit % 64))) != 0
     }
 
+    #[inline]
     pub fn flip(&mut self, bit: usize) {
-        if bit < self.size {
-            self.data[bit / 64] ^= 1 << (bit % 64);
+        debug_assert!(bit < BITSET_SIZE);
+        self.data[bit / 64] ^= 1u64 << (bit % 64);
+    }
+
+    /// Inverts all bits in the bitset using word-level XOR.
+    /// Clears the padding bits (288-319) after inversion.
+    #[inline]
+    pub fn invert_all(&mut self) {
+        for word in &mut self.data {
+            *word = !*word;
         }
+        // Clear padding bits beyond 288: 288 % 64 = 32
+        // Mask keeps only bits 0-31 of the last word
+        self.data[BITSET_WORDS - 1] &= (1u64 << (BITSET_SIZE % 64)) - 1;
     }
 
+    #[inline]
     pub fn cardinality(&self) -> u32 {
-        self.data.iter().map(|&x| x.count_ones()).sum()
+        self.data[0].count_ones()
+            + self.data[1].count_ones()
+            + self.data[2].count_ones()
+            + self.data[3].count_ones()
+            + self.data[4].count_ones()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.iter().all(|&x| x == 0)
+        self.data[0] == 0
+            && self.data[1] == 0
+            && self.data[2] == 0
+            && self.data[3] == 0
+            && self.data[4] == 0
     }
 
     /// Finds the index of the next set bit starting from `from_index`.
-    /// Returns None if no bit is set at or after `from_index`.
+    #[inline]
     pub fn next_set_bit(&self, from_index: usize) -> Option<usize> {
-        let idx = from_index;
-        let mut word_idx = idx / 64;
+        let mut word_idx = from_index / 64;
 
-        if word_idx >= self.data.len() {
+        if word_idx >= BITSET_WORDS {
             return None;
         }
 
-        // Handle the first word (potentially partial)
-        let bit_in_word = idx % 64;
-        let mask = !((1u64 << bit_in_word) - 1); // Mask out lower bits
-        let mut word = self.data[word_idx] & mask;
+        // Handle the first word (mask out lower bits)
+        let bit_in_word = from_index % 64;
+        let mask = !((1u64 << bit_in_word) - 1);
+        let word = self.data[word_idx] & mask;
 
         if word != 0 {
             return Some(word_idx * 64 + word.trailing_zeros() as usize);
@@ -71,10 +90,10 @@ impl BitMatrix {
 
         // Check subsequent words
         word_idx += 1;
-        while word_idx < self.data.len() {
-            word = self.data[word_idx];
-            if word != 0 {
-                return Some(word_idx * 64 + word.trailing_zeros() as usize);
+        while word_idx < BITSET_WORDS {
+            let w = self.data[word_idx];
+            if w != 0 {
+                return Some(word_idx * 64 + w.trailing_zeros() as usize);
             }
             word_idx += 1;
         }
@@ -82,15 +101,18 @@ impl BitMatrix {
         None
     }
 
-    // Perform logical AND with another BitMatrix in place
+    /// Perform logical AND with another BitMatrix in place (unrolled for 5 words)
+    #[inline]
     pub fn and_assign(&mut self, other: &BitMatrix) {
-        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
-            *a &= *b;
-        }
+        self.data[0] &= other.data[0];
+        self.data[1] &= other.data[1];
+        self.data[2] &= other.data[2];
+        self.data[3] &= other.data[3];
+        self.data[4] &= other.data[4];
     }
 
     pub fn to_indices(&self) -> Vec<usize> {
-        let mut indices = Vec::new();
+        let mut indices = Vec::with_capacity(8); // Cliques are size 8
         for (i, &word) in self.data.iter().enumerate() {
             if word != 0 {
                 let mut temp = word;

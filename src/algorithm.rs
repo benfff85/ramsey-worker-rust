@@ -1,7 +1,8 @@
 use crate::bitset::BitMatrix;
 use crate::graph::{Graph, WorkUnitEdge};
 
-// Replicates TargetedCliqueCheckServiceBitSet.getNewCliques
+/// Replicates TargetedCliqueCheckServiceBitSet.getNewCliques
+/// Counts new cliques formed after edge flips, using seeded Bron-Kerbosch.
 pub fn get_new_cliques(
     graph: &mut Graph,
     clique_size: usize,
@@ -15,17 +16,18 @@ pub fn get_new_cliques(
         let v2 = edge.vertex_two as usize;
 
         if graph.adjacency[v1].get(v2) {
-            let mut r = BitMatrix::new(graph.vertex_count);
+            let mut r = BitMatrix::new();
             r.set(v1);
             r.set(v2);
 
-            let mut p = graph.adjacency[v1].clone();
+            let mut p = graph.adjacency[v1];
             p.and_assign(&graph.adjacency[v2]);
             p.clear(v1);
             p.clear(v2);
 
-            let x = BitMatrix::new(graph.vertex_count);
-            new_clique_count += bron_kerbosch_count(r, p, x, &graph.adjacency, clique_size);
+            let mut x = BitMatrix::new();
+            new_clique_count +=
+                bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
         }
     }
 
@@ -36,21 +38,22 @@ pub fn get_new_cliques(
         let v2 = edge.vertex_two as usize;
 
         if graph.adjacency[v1].get(v2) {
-            let mut r = BitMatrix::new(graph.vertex_count);
+            let mut r = BitMatrix::new();
             r.set(v1);
             r.set(v2);
 
-            let mut p = graph.adjacency[v1].clone();
+            let mut p = graph.adjacency[v1];
             p.and_assign(&graph.adjacency[v2]);
             p.clear(v1);
             p.clear(v2);
 
-            let x = BitMatrix::new(graph.vertex_count);
-            new_clique_count += bron_kerbosch_count(r, p, x, &graph.adjacency, clique_size);
+            let mut x = BitMatrix::new();
+            new_clique_count +=
+                bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
         }
     }
 
-    // Restore graph state (optional, but good practice if graph is reused)
+    // Restore graph state
     graph.invert();
 
     new_clique_count
@@ -60,19 +63,19 @@ pub fn get_all_cliques(graph: &mut Graph, clique_size: usize) -> Vec<Vec<usize>>
     let mut cliques = Vec::new();
 
     // RED
-    let r = BitMatrix::new(graph.vertex_count);
-    let mut p = BitMatrix::new(graph.vertex_count);
-    let x = BitMatrix::new(graph.vertex_count);
+    let mut r = BitMatrix::new();
+    let mut p = BitMatrix::new();
+    let mut x = BitMatrix::new();
 
     // Set all bits in P to 1
     for i in 0..graph.vertex_count {
         p.set(i);
     }
 
-    bron_kerbosch_collect(
-        r.clone(),
-        p.clone(),
-        x.clone(),
+    bron_kerbosch_collect_inplace(
+        &mut r,
+        &mut p,
+        &mut x,
         &graph.adjacency,
         clique_size,
         &mut cliques,
@@ -82,18 +85,17 @@ pub fn get_all_cliques(graph: &mut Graph, clique_size: usize) -> Vec<Vec<usize>>
     graph.invert();
 
     // Reset for Blue pass
-    // R is empty, P is full, X is empty
-    let r_blue = BitMatrix::new(graph.vertex_count);
-    let mut p_blue = BitMatrix::new(graph.vertex_count);
-    let x_blue = BitMatrix::new(graph.vertex_count);
+    let mut r_blue = BitMatrix::new();
+    let mut p_blue = BitMatrix::new();
+    let mut x_blue = BitMatrix::new();
     for i in 0..graph.vertex_count {
         p_blue.set(i);
     }
 
-    bron_kerbosch_collect(
-        r_blue,
-        p_blue,
-        x_blue,
+    bron_kerbosch_collect_inplace(
+        &mut r_blue,
+        &mut p_blue,
+        &mut x_blue,
         &graph.adjacency,
         clique_size,
         &mut cliques,
@@ -104,10 +106,12 @@ pub fn get_all_cliques(graph: &mut Graph, clique_size: usize) -> Vec<Vec<usize>>
     cliques
 }
 
-fn bron_kerbosch_collect(
-    mut r: BitMatrix,
-    mut p: BitMatrix,
-    mut x: BitMatrix,
+/// Bron-Kerbosch with in-place mutation and backtracking.
+/// This avoids cloning R and X on every recursive call.
+fn bron_kerbosch_collect_inplace(
+    r: &mut BitMatrix,
+    p: &mut BitMatrix,
+    x: &mut BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,
     cliques: &mut Vec<Vec<usize>>,
@@ -125,18 +129,29 @@ fn bron_kerbosch_collect(
         return;
     }
 
-    let candidates = p.clone();
+    // Copy candidates to iterate over (Copy is free with fixed array)
+    let candidates = *p;
 
     let mut v_opt = candidates.next_set_bit(0);
     while let Some(v) = v_opt {
+        // Add v to R
         r.set(v);
 
-        let mut new_p = p.clone();
+        // Compute new_p = p ∩ N(v)
+        let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
-        bron_kerbosch_collect(r.clone(), new_p, x.clone(), adjacency, clique_size, cliques);
+        // Compute new_x = x ∩ N(v)
+        let mut new_x = *x;
+        new_x.and_assign(&adjacency[v]);
 
+        // Recurse with modified sets
+        bron_kerbosch_collect_inplace(r, &mut new_p, &mut new_x, adjacency, clique_size, cliques);
+
+        // Backtrack: remove v from R
         r.clear(v);
+
+        // Move v from P to X
         p.clear(v);
         x.set(v);
 
@@ -148,35 +163,48 @@ pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     let mut clique_count = 0;
 
     // RED
-    let r = BitMatrix::new(graph.vertex_count); // removed mut
-    let mut p = BitMatrix::new(graph.vertex_count);
-    let x = BitMatrix::new(graph.vertex_count);
+    let mut r = BitMatrix::new();
+    let mut p = BitMatrix::new();
+    let mut x = BitMatrix::new();
 
     // Set all bits in P to 1 (all vertices are candidates initially)
     for i in 0..graph.vertex_count {
         p.set(i);
     }
 
-    clique_count += bron_kerbosch_count(
-        r.clone(),
-        p.clone(),
-        x.clone(),
-        &graph.adjacency,
-        clique_size,
-    );
+    clique_count +=
+        bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
 
     // BLUE
     graph.invert();
-    clique_count += bron_kerbosch_count(r, p, x, &graph.adjacency, clique_size);
+
+    // Reset for blue pass
+    let mut r_blue = BitMatrix::new();
+    let mut p_blue = BitMatrix::new();
+    let mut x_blue = BitMatrix::new();
+    for i in 0..graph.vertex_count {
+        p_blue.set(i);
+    }
+
+    clique_count += bron_kerbosch_count_inplace(
+        &mut r_blue,
+        &mut p_blue,
+        &mut x_blue,
+        &graph.adjacency,
+        clique_size,
+    );
     graph.invert(); // Restore
 
     clique_count
 }
 
-fn bron_kerbosch_count(
-    mut r: BitMatrix,
-    mut p: BitMatrix, // reverted to mut
-    mut x: BitMatrix,
+/// Bron-Kerbosch counting variant with in-place mutation and backtracking.
+/// This matches the Java implementation's approach of mutating R in place.
+#[inline]
+fn bron_kerbosch_count_inplace(
+    r: &mut BitMatrix,
+    p: &mut BitMatrix,
+    x: &mut BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,
 ) -> i32 {
@@ -193,18 +221,30 @@ fn bron_kerbosch_count(
     }
 
     let mut count = 0;
-    let candidates = p.clone();
+
+    // Copy candidates to iterate over (Copy is free with fixed array)
+    let candidates = *p;
 
     let mut v_opt = candidates.next_set_bit(0);
     while let Some(v) = v_opt {
+        // Add v to R
         r.set(v);
 
-        let mut new_p = p.clone();
+        // Compute new_p = p ∩ N(v)
+        let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
-        count += bron_kerbosch_count(r.clone(), new_p, x.clone(), adjacency, clique_size);
+        // Compute new_x = x ∩ N(v)
+        let mut new_x = *x;
+        new_x.and_assign(&adjacency[v]);
 
+        // Recurse
+        count += bron_kerbosch_count_inplace(r, &mut new_p, &mut new_x, adjacency, clique_size);
+
+        // Backtrack: remove v from R
         r.clear(v);
+
+        // Move v from P to X
         p.clear(v);
         x.set(v);
 

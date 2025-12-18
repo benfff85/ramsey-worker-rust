@@ -12,8 +12,12 @@ RUN cargo build --release
 # Build the actual application
 RUN rm -rf src
 COPY src src
+COPY .cargo .cargo
 # Touch main.rs and lib.rs to force a rebuild of the application code
 RUN touch src/main.rs src/lib.rs
+# Override target-cpu=native from .cargo/config.toml for cross-platform Docker builds
+# Use "generic" which works on any CPU of that architecture
+ENV RUSTFLAGS="-C target-cpu=generic"
 RUN cargo build --release
 
 # Runtime Stage
