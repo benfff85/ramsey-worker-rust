@@ -94,3 +94,41 @@ pub struct Campaign {
     #[serde(rename = "subgraphSize")]
     pub subgraph_size: i32,
 }
+
+/// Work result - simplified structure for submitting processing results
+/// Matches the Java WorkResult entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(rename = "baseGraphId")]
+    pub base_graph_id: i32,
+    #[serde(rename = "stageId")]
+    pub stage_id: i32,
+    #[serde(rename = "edgesToFlip")]
+    pub edges_to_flip: Vec<crate::graph::WorkUnitEdge>,
+    #[serde(rename = "cliqueCount")]
+    pub clique_count: i32,
+    #[serde(rename = "workUnitAnalysisType")]
+    pub work_unit_analysis_type: WorkUnitAnalysisType,
+}
+
+/// Stage - represents a stage in a campaign
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stage {
+    #[serde(rename = "stageId")]
+    pub stage_id: i32,
+    pub status: StageStatus,
+    #[serde(rename = "baseGraphId")]
+    pub base_graph_id: i32,
+    #[serde(rename = "campaignId")]
+    pub campaign_id: i32,
+    #[serde(rename = "latestWorkUnitId")]
+    pub latest_work_unit_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StageStatus {
+    ACTIVE,
+    INACTIVE,
+}

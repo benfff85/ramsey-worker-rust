@@ -1,4 +1,4 @@
-use crate::model::{Campaign, Client, GraphData, WorkUnit, WorkUnitStatus};
+use crate::model::{Campaign, Client, GraphData, WorkResult, WorkUnit, WorkUnitStatus};
 use reqwest::{Client as HttpClient, StatusCode};
 use std::error::Error;
 use std::time::Duration;
@@ -65,6 +65,21 @@ impl MiddlewareClient {
         Ok(())
     }
 
+    /// Submit work results to the new /api/ramsey/results endpoint
+    pub async fn submit_results(&self, results: &[WorkResult]) -> Result<(), Box<dyn Error>> {
+        let url = format!("{}/results", self.base_url);
+
+        let response = self.client.post(&url).json(results).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eprintln!("DEBUG: Failed to submit results: {} - {}", status, text);
+            return Err(format!("Failed to submit results: {} - {}", status, text).into());
+        }
+        Ok(())
+    }
+
     pub async fn get_graph(&self, graph_id: i32) -> Result<GraphData, Box<dyn Error>> {
         let url = format!("{}/graphs/{}", self.base_url, graph_id);
         let graph_data = self
@@ -87,6 +102,30 @@ impl MiddlewareClient {
             .json::<Campaign>()
             .await?;
         Ok(campaign)
+    }
+
+    /// Get stages by campaign ID and status
+    pub async fn get_stages_by_campaign(
+        &self,
+        campaign_id: i32,
+        status: &str,
+    ) -> Result<Vec<crate::model::Stage>, Box<dyn Error>> {
+        let url = format!("{}/stages", self.base_url);
+        let params = [
+            ("campaignId", campaign_id.to_string()),
+            ("status", status.to_string()),
+        ];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+
+        if !response.status().is_success() {
+            let status_code = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to get stages: {} - {}", status_code, text).into());
+        }
+
+        let stages = response.json::<Vec<crate::model::Stage>>().await?;
+        Ok(stages)
     }
 
     pub async fn create_client(&self, client: &Client) -> Result<Client, Box<dyn Error>> {
