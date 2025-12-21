@@ -25,6 +25,7 @@ pub struct Worker {
     campaign_id: i32,
     stage_id: Option<i32>,
     base_graph_clique_count: Option<i32>,
+    publish_results: bool,
 }
 
 impl Worker {
@@ -37,6 +38,7 @@ impl Worker {
         heartbeat_interval_ms: u64,
         fetch_size: i32,
         publish_size: i32,
+        publish_results: bool,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -53,6 +55,7 @@ impl Worker {
             campaign_id,
             stage_id: None,
             base_graph_clique_count: None,
+            publish_results,
         }
     }
 
@@ -255,17 +258,20 @@ impl Worker {
                 }
             }
 
-            processed_results.push(result);
+            // Only collect results if publishing is enabled
+            if self.publish_results {
+                processed_results.push(result);
 
-            // Submit batch if we reached publish size
-            if processed_results.len() >= self.publish_size as usize {
-                self.mw_client.submit_results(&processed_results).await?;
-                processed_results.clear();
+                // Submit batch if we reached publish size
+                if processed_results.len() >= self.publish_size as usize {
+                    self.mw_client.submit_results(&processed_results).await?;
+                    processed_results.clear();
+                }
             }
         }
 
-        // Submit remaining results
-        if !processed_results.is_empty() {
+        // Submit remaining results (only if publishing enabled)
+        if self.publish_results && !processed_results.is_empty() {
             self.mw_client.submit_results(&processed_results).await?;
         }
 

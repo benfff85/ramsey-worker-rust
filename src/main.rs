@@ -45,6 +45,14 @@ async fn main() {
         .parse()
         .expect("WORK_UNIT_PUBLISH_COUNT must be a number");
 
+    let publish_results: bool = env::var("PUBLISH_RESULTS")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase()
+        .parse()
+        .unwrap_or(true);
+
+    println!("Publish results to MySQL: {}", publish_results);
+
     let mut worker = Worker::new(
         base_url,
         vertex_count,
@@ -54,6 +62,7 @@ async fn main() {
         heartbeat_interval_ms,
         fetch_size,
         publish_size,
+        publish_results,
     );
 
     // Connect to Redis
