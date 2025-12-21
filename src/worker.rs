@@ -24,6 +24,8 @@ pub struct Worker {
     publish_size: i32,
     campaign_id: i32,
     stage_id: Option<i32>,
+    base_graph_clique_count: Option<i32>,
+    publish_results: bool,
 }
 
 impl Worker {
@@ -36,6 +38,7 @@ impl Worker {
         heartbeat_interval_ms: u64,
         fetch_size: i32,
         publish_size: i32,
+        publish_results: bool,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -51,6 +54,8 @@ impl Worker {
             publish_size,
             campaign_id,
             stage_id: None,
+            base_graph_clique_count: None,
+            publish_results,
         }
     }
 
@@ -138,7 +143,11 @@ impl Worker {
                     if count == 0 {
                         sleep(self.poll_interval).await;
                     } else {
-                        println!("Processed {} work items", count);
+                        println!(
+                            "[{}] Processed {} work items",
+                            Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                            count
+                        );
                     }
                 }
                 Err(e) => {
@@ -161,9 +170,14 @@ impl Worker {
 
         if work_items.is_empty() {
             println!(
-                "[{}] No work items available in Redis queue, waiting...",
-                Utc::now().format("%Y-%m-%dT%H:%M:%S")
+                "[{}] No work items available in Redis queue for stage {}, clearing cache to check for new stage...",
+                Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                stage_id
             );
+            // Clear cached stage to force re-fetch on next cycle
+            // This allows detecting stage progression
+            self.stage_id = None;
+            self.base_graph_clique_count = None;
             return Ok(0);
         }
 
@@ -222,22 +236,42 @@ impl Worker {
                 id: None,
                 base_graph_id: item.base_graph_id,
                 stage_id: item.stage_id,
-                edges_to_flip: item.edges_to_flip,
+                edges_to_flip: item.edges_to_flip.clone(),
                 clique_count: count,
                 work_unit_analysis_type: item.analysis_type,
             };
 
-            processed_results.push(result);
+            // Check if this result is better than the base graph
+            if let Some(base_count) = self.base_graph_clique_count {
+                if count < base_count {
+                    // Update best result in Redis
+                    if let Some(redis) = self.redis_client.as_mut() {
+                        let _ = redis
+                            .update_best_if_better(
+                                item.stage_id,
+                                item.base_graph_id,
+                                &item.edges_to_flip,
+                                count,
+                            )
+                            .await;
+                    }
+                }
+            }
 
-            // Submit batch if we reached publish size
-            if processed_results.len() >= self.publish_size as usize {
-                self.mw_client.submit_results(&processed_results).await?;
-                processed_results.clear();
+            // Only collect results if publishing is enabled
+            if self.publish_results {
+                processed_results.push(result);
+
+                // Submit batch if we reached publish size
+                if processed_results.len() >= self.publish_size as usize {
+                    self.mw_client.submit_results(&processed_results).await?;
+                    processed_results.clear();
+                }
             }
         }
 
-        // Submit remaining results
-        if !processed_results.is_empty() {
+        // Submit remaining results (only if publishing enabled)
+        if self.publish_results && !processed_results.is_empty() {
             self.mw_client.submit_results(&processed_results).await?;
         }
 
@@ -271,6 +305,14 @@ impl Worker {
         println!(
             "Using stage {} for campaign {} (base_graph_id: {})",
             stage.stage_id, self.campaign_id, stage.base_graph_id
+        );
+
+        // Fetch the base graph to get its clique count
+        let graph_data = self.mw_client.get_graph(stage.base_graph_id).await?;
+        self.base_graph_clique_count = graph_data.clique_count;
+        println!(
+            "Base graph clique count: {:?}",
+            self.base_graph_clique_count
         );
 
         self.stage_id = Some(stage.stage_id);
