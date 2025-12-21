@@ -167,9 +167,14 @@ impl Worker {
 
         if work_items.is_empty() {
             println!(
-                "[{}] No work items available in Redis queue, waiting...",
-                Utc::now().format("%Y-%m-%dT%H:%M:%S")
+                "[{}] No work items available in Redis queue for stage {}, clearing cache to check for new stage...",
+                Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                stage_id
             );
+            // Clear cached stage to force re-fetch on next cycle
+            // This allows detecting stage progression
+            self.stage_id = None;
+            self.base_graph_clique_count = None;
             return Ok(0);
         }
 
