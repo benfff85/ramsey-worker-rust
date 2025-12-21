@@ -58,6 +58,8 @@ pub struct GraphData {
     pub vertex_count: usize,
     #[serde(rename = "edgeData")]
     pub structure_data: String, // bitstring
+    #[serde(rename = "cliqueCount")]
+    pub clique_count: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
