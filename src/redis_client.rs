@@ -49,25 +49,56 @@ impl RedisClient {
         Ok(RedisClient { connection })
     }
 
-    /// Pop work items from the queue (RPOP for FIFO ordering)
+    /// Pop work items from the queue using atomic Lua script
+    /// This prevents race conditions when multiple workers pop simultaneously
     pub async fn pop_work_items(
         &mut self,
         stage_id: i32,
         count: usize,
     ) -> Result<Vec<WorkQueueItem>, Box<dyn Error>> {
         let queue_key = format!("work_queue:{}", stage_id);
-        let mut items = Vec::with_capacity(count);
 
-        for _ in 0..count {
-            let result: Option<String> = self.connection.rpop(&queue_key, None).await?;
-            match result {
-                Some(json) => match serde_json::from_str::<WorkQueueItem>(&json) {
-                    Ok(item) => items.push(item),
-                    Err(e) => {
-                        eprintln!("Failed to deserialize work queue item: {} - {}", json, e);
-                    }
-                },
-                None => break, // Queue is empty
+        // Lua script that atomically:
+        // 1. Gets items from the end of the list
+        // 2. Trims the list to remove those items
+        // 3. Returns the items
+        // This is atomic - no other command can interleave
+        let lua_script = r#"
+            local key = KEYS[1]
+            local count = tonumber(ARGV[1])
+            local len = redis.call('LLEN', key)
+            if len == 0 then
+                return {}
+            end
+            local actual_count = math.min(count, len)
+            local start = -actual_count
+            local items = redis.call('LRANGE', key, start, -1)
+            if #items > 0 then
+                redis.call('LTRIM', key, 0, -(#items + 1))
+            end
+            return items
+        "#;
+
+        let items_json: Vec<String> = redis::cmd("EVAL")
+            .arg(lua_script)
+            .arg(1) // number of keys
+            .arg(&queue_key)
+            .arg(count)
+            .query_async(&mut self.connection)
+            .await?;
+
+        if items_json.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Deserialize items (reverse to maintain FIFO order since LRANGE returns oldest last)
+        let mut items = Vec::with_capacity(items_json.len());
+        for json in items_json.into_iter().rev() {
+            match serde_json::from_str::<WorkQueueItem>(&json) {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    eprintln!("Failed to deserialize work queue item: {} - {}", json, e);
+                }
             }
         }
 
