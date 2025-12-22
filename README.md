@@ -8,8 +8,9 @@ High-performance worker for the Ramsey distributed computing system. Consumes wo
 ┌───────────┐     ┌─────────────────┐     ┌────────────┐
 │   Redis   │────▶│   Rust Worker   │────▶│   MySQL    │
 │   Queue   │     │  (Bron-Kerbosch)│     │  (results) │
-│           │◀────│                 │     │            │
+│           │◀────│                 │     │  optional  │
 │best_result│     │ (tracks best)   │     │            │
+│proc_count │◀────│ (tracks count)  │     │            │
 └───────────┘     └─────────────────┘     └────────────┘
 ```
 
@@ -55,6 +56,7 @@ The Queue Manager's `StageProgressionMonitor` polls this key and triggers stage 
 | `WORK_UNIT_PUBLISH_COUNT` | Batch size for result submission | `50000` |
 | `WORK_UNIT_POLL_FREQ` | Polling interval (ms) when queue empty | `1000` |
 | `CLIENT_PHONE_HOME_FREQ` | Heartbeat interval (ms) | `60000` |
+| `PUBLISH_RESULTS` | Whether to submit results to MySQL | `true` |
 
 ## Building
 
