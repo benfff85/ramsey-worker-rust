@@ -140,4 +140,15 @@ impl RedisClient {
             None => Ok(None),
         }
     }
+
+    /// Increment the processed work unit count for a stage
+    pub async fn increment_processed_count(
+        &mut self,
+        stage_id: i32,
+        count: i64,
+    ) -> Result<i64, Box<dyn Error>> {
+        let key = format!("processed_count:{}", stage_id);
+        let new_count: i64 = self.connection.incr(&key, count).await?;
+        Ok(new_count)
+    }
 }

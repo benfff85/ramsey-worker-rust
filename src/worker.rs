@@ -182,6 +182,7 @@ impl Worker {
         }
 
         let total_work = work_items.len();
+        let work_stage_id = work_items.first().map(|i| i.stage_id).unwrap_or(stage_id);
         let mut processed_results: Vec<WorkResult> = Vec::new();
 
         for item in work_items {
@@ -273,6 +274,15 @@ impl Worker {
         // Submit remaining results (only if publishing enabled)
         if self.publish_results && !processed_results.is_empty() {
             self.mw_client.submit_results(&processed_results).await?;
+        }
+
+        // Always update processed count in Redis
+        if total_work > 0 {
+            if let Some(redis) = self.redis_client.as_mut() {
+                let _ = redis
+                    .increment_processed_count(work_stage_id, total_work as i64)
+                    .await;
+            }
         }
 
         Ok(total_work)
