@@ -182,7 +182,7 @@ impl Worker {
         }
 
         let total_work = work_items.len();
-        let work_stage_id = work_items.first().map(|i| i.stage_id).unwrap_or(stage_id);
+        let work_stage_id = stage_id; // stage_id comes from MW API, not work item
         let mut processed_results: Vec<WorkResult> = Vec::new();
 
         for item in work_items {
@@ -236,7 +236,7 @@ impl Worker {
             let result = WorkResult {
                 id: None,
                 base_graph_id: item.base_graph_id,
-                stage_id: item.stage_id,
+                stage_id: work_stage_id, // Use stage_id from MW API
                 edges_to_flip: item.edges_to_flip.clone(),
                 clique_count: count,
                 work_unit_analysis_type: item.analysis_type,
@@ -249,7 +249,7 @@ impl Worker {
                     if let Some(redis) = self.redis_client.as_mut() {
                         let _ = redis
                             .update_best_if_better(
-                                item.stage_id,
+                                work_stage_id, // Use stage_id from MW API
                                 item.base_graph_id,
                                 &item.edges_to_flip,
                                 count,
