@@ -7,6 +7,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target_cpu: generic
+            tag_suffix: ""
+          - target_cpu: apple-m4
+            tag_suffix: "-apple-m4"
 
     steps:
       - uses: actions/checkout@v6
@@ -46,6 +53,7 @@ jobs:
         run: |
           docker buildx create --use
           docker buildx build --platform linux/amd64,linux/arm64 \
-            -t benferenchak/ramsey-worker-rust:${{ env.TAG_NAME }} \
-            -t benferenchak/ramsey-worker-rust:latest \
+            --build-arg TARGET_CPU=${{ matrix.target_cpu }} \
+            -t benferenchak/ramsey-worker-rust:${{ env.TAG_NAME }}${{ matrix.tag_suffix }} \
+            -t benferenchak/ramsey-worker-rust:latest${{ matrix.tag_suffix }} \
             --push .
