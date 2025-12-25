@@ -13,6 +13,6 @@ serde_json = "1.0.145"
 tokio = { version = "1.48.0", features = ["full"] }
 
 [profile.release]
-lto = true           # Link-Time Optimization for better inlining across crates
+lto = "fat"          # Link-Time Optimization for better inlining across crates
 codegen-units = 1    # Single codegen unit for best optimization (slower compile)
 opt-level = 3        # Maximum optimization level
