@@ -138,15 +138,18 @@ impl Worker {
                 }
             }
 
+            let cycle_start = Instant::now();
             match self.cycle().await {
                 Ok(count) => {
                     if count == 0 {
                         sleep(self.poll_interval).await;
                     } else {
+                        let elapsed_ms = cycle_start.elapsed().as_millis();
                         println!(
-                            "[{}] Processed {} work items",
+                            "[{}] Processed {} work items in {}ms",
                             Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                            count
+                            count,
+                            elapsed_ms
                         );
                     }
                 }
