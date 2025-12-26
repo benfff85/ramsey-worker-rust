@@ -47,7 +47,7 @@ jobs:
       - name: Build and Push Multi-Platform Docker Image
         run: |
           docker buildx create --use
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --platform linux/arm64 \
             --build-arg TARGET_CPU=${{ matrix.target_cpu }} \
             -t benferenchak/ramsey-worker-rust:${{ env.BRANCH_NAME }}${{ matrix.tag_suffix }} \
             --push .
