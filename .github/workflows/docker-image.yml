@@ -14,8 +14,8 @@ jobs:
         include:
           - target_cpu: generic
             tag_suffix: ""
-          - target_cpu: apple-m4
-            tag_suffix: "-apple-m4"
+          - target_cpu: neoverse-v2
+            tag_suffix: "-neoverse-v2"
 
     steps:
       - uses: actions/checkout@v6
