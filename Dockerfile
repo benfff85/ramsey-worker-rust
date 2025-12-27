@@ -15,9 +15,10 @@ COPY src src
 COPY .cargo .cargo
 # Touch main.rs and lib.rs to force a rebuild of the application code
 RUN touch src/main.rs src/lib.rs
-# Override target-cpu=native from .cargo/config.toml for cross-platform Docker builds
-# Use "generic" which works on any CPU of that architecture
-ENV RUSTFLAGS="-C target-cpu=generic"
+# TARGET_CPU can be overridden at build time: --build-arg TARGET_CPU=apple-m4
+# Options: generic (default), apple-m4, neoverse-v2 (Graviton3/4), etc.
+ARG TARGET_CPU=generic
+ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 RUN cargo build --release
 
 # Runtime Stage

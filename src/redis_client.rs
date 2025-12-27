@@ -6,12 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 
 /// Work queue item - matches the Java WorkQueueItem model
+/// Note: stageId removed as worker gets it from MW API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkQueueItem {
     #[serde(rename = "baseGraphId")]
     pub base_graph_id: i32,
-    #[serde(rename = "stageId")]
-    pub stage_id: i32,
     #[serde(rename = "edgesToFlip")]
     pub edges_to_flip: Vec<WorkUnitEdge>,
     #[serde(rename = "analysisType")]

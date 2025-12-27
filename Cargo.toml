@@ -6,13 +6,13 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.42", features = ["serde"] }
 dotenv = "0.15.0"
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.0", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12.28", features = ["json", "blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.48.0", features = ["full"] }
 
 [profile.release]
-lto = true           # Link-Time Optimization for better inlining across crates
+lto = "fat"          # Link-Time Optimization for better inlining across crates
 codegen-units = 1    # Single codegen unit for best optimization (slower compile)
 opt-level = 3        # Maximum optimization level
