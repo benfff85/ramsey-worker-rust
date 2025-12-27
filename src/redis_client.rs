@@ -1,5 +1,4 @@
 use crate::graph::WorkUnitEdge;
-use crate::model::WorkUnitAnalysisType;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -13,8 +12,6 @@ pub struct WorkQueueItem {
     pub base_graph_id: i32,
     #[serde(rename = "edgesToFlip")]
     pub edges_to_flip: Vec<WorkUnitEdge>,
-    #[serde(rename = "analysisType")]
-    pub analysis_type: WorkUnitAnalysisType,
 }
 
 /// Best result for a stage - stored in Redis for stage progression
