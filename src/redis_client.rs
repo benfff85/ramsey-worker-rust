@@ -4,14 +4,38 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
-/// Work queue item - matches the Java WorkQueueItem model
-/// Note: stageId removed as worker gets it from MW API
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Work queue item - parsed from compact format: baseGraphId|v1,v2|v1,v2
+#[derive(Debug, Clone)]
 pub struct WorkQueueItem {
-    #[serde(rename = "baseGraphId")]
     pub base_graph_id: i32,
-    #[serde(rename = "edgesToFlip")]
     pub edges_to_flip: Vec<WorkUnitEdge>,
+}
+
+/// Parse compact format: baseGraphId|v1,v2|v1,v2
+fn parse_compact_work_item(compact: &str) -> Result<WorkQueueItem, Box<dyn Error + Send + Sync>> {
+    let parts: Vec<&str> = compact.split('|').collect();
+    if parts.len() < 3 {
+        return Err(format!("Invalid format, expected at least 3 parts: {}", compact).into());
+    }
+
+    let base_graph_id: i32 = parts[0].parse()?;
+    let mut edges_to_flip = Vec::with_capacity(parts.len() - 1);
+
+    for edge_str in &parts[1..] {
+        let vertices: Vec<&str> = edge_str.split(',').collect();
+        if vertices.len() != 2 {
+            return Err(format!("Invalid edge format: {}", edge_str).into());
+        }
+        edges_to_flip.push(WorkUnitEdge {
+            vertex_one: vertices[0].parse()?,
+            vertex_two: vertices[1].parse()?,
+        });
+    }
+
+    Ok(WorkQueueItem {
+        base_graph_id,
+        edges_to_flip,
+    })
 }
 
 /// Best result for a stage - stored in Redis for stage progression
@@ -87,13 +111,14 @@ impl RedisClient {
             return Ok(Vec::new());
         }
 
-        // Deserialize items (reverse to maintain FIFO order since LRANGE returns oldest last)
+        // Parse compact format: baseGraphId|v1,v2|v1,v2
+        // Reverse to maintain FIFO order since LRANGE returns oldest last
         let mut items = Vec::with_capacity(items_json.len());
-        for json in items_json.into_iter().rev() {
-            match serde_json::from_str::<WorkQueueItem>(&json) {
+        for compact in items_json.into_iter().rev() {
+            match parse_compact_work_item(&compact) {
                 Ok(item) => items.push(item),
                 Err(e) => {
-                    eprintln!("Failed to deserialize work queue item: {} - {}", json, e);
+                    eprintln!("Failed to parse work queue item: {} - {}", compact, e);
                 }
             }
         }
