@@ -215,34 +215,24 @@ impl Worker {
                 .get(&item.base_graph_id)
                 .unwrap();
 
-            let count = match item.analysis_type {
-                WorkUnitAnalysisType::TARGETED => {
-                    let broken = clique_collection
-                        .get_count_of_cliques_containing_edges(&item.edges_to_flip);
+            // Always use TARGETED analysis mode
+            let broken = clique_collection
+                .get_count_of_cliques_containing_edges(&item.edges_to_flip);
 
-                    graph.flip_edges(&item.edges_to_flip);
-                    let new = get_new_cliques(graph, self.clique_size, &item.edges_to_flip);
-                    graph.flip_edges(&item.edges_to_flip); // revert
+            graph.flip_edges(&item.edges_to_flip);
+            let new = get_new_cliques(graph, self.clique_size, &item.edges_to_flip);
+            graph.flip_edges(&item.edges_to_flip); // revert
 
-                    let total = (clique_collection.total() as i32) - broken + new;
-                    total
-                }
-                WorkUnitAnalysisType::COMPREHENSIVE | WorkUnitAnalysisType::NAIVE => {
-                    graph.flip_edges(&item.edges_to_flip);
-                    let c = crate::algorithm::get_cliques_comprehensive(graph, self.clique_size);
-                    graph.flip_edges(&item.edges_to_flip); // revert
-                    c
-                }
-            };
+            let count = (clique_collection.total() as i32) - broken + new;
 
-            // Create WorkResult for submission
+            // Create WorkResult for submission (always use TARGETED)
             let result = WorkResult {
                 id: None,
                 base_graph_id: item.base_graph_id,
                 stage_id: work_stage_id, // Use stage_id from MW API
                 edges_to_flip: item.edges_to_flip.clone(),
                 clique_count: count,
-                work_unit_analysis_type: item.analysis_type,
+                work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
             };
 
             // Check if this result is better than the base graph
