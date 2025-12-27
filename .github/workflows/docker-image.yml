@@ -9,16 +9,16 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target_cpu: generic
+            tag_suffix: ""
+          - target_cpu: neoverse-v2
+            tag_suffix: "-neoverse-v2"
 
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
 
       - name: Rust Version Check
         run: rustc --version && cargo --version
@@ -47,6 +47,7 @@ jobs:
       - name: Build and Push Multi-Platform Docker Image
         run: |
           docker buildx create --use
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            -t benferenchak/ramsey-worker-rust:${{ env.BRANCH_NAME }} \
+          docker buildx build --platform linux/arm64 \
+            --build-arg TARGET_CPU=${{ matrix.target_cpu }} \
+            -t benferenchak/ramsey-worker-rust:${{ env.BRANCH_NAME }}${{ matrix.tag_suffix }} \
             --push .
