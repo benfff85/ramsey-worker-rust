@@ -222,11 +222,6 @@ impl Worker {
             // Early termination only when not publishing results
             // When publishing, we need the full clique count for the WorkResult
             let count = if !self.publish_results {
-                // Early exit: if no cliques are broken, we can't improve (new cliques >= 0)
-                if broken == 0 {
-                    continue;
-                }
-
                 graph.flip_edges(&item.edges_to_flip);
                 let (new, exceeded) = get_new_cliques_with_limit(
                     graph,
