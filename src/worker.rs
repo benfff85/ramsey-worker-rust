@@ -1,4 +1,4 @@
-use crate::algorithm::{get_all_cliques, get_new_cliques};
+use crate::algorithm::{get_all_cliques, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::graph::Graph;
@@ -216,14 +216,44 @@ impl Worker {
                 .unwrap();
 
             // Always use TARGETED analysis mode
-            let broken = clique_collection
-                .get_count_of_cliques_containing_edges(&item.edges_to_flip);
+            let broken =
+                clique_collection.get_count_of_cliques_containing_edges(&item.edges_to_flip);
 
-            graph.flip_edges(&item.edges_to_flip);
-            let new = get_new_cliques(graph, self.clique_size, &item.edges_to_flip);
-            graph.flip_edges(&item.edges_to_flip); // revert
+            // Early termination only when not publishing results
+            // When publishing, we need the full clique count for the WorkResult
+            let count = if !self.publish_results {
+                // Early exit: if no cliques are broken, we can't improve (new cliques >= 0)
+                if broken == 0 {
+                    continue;
+                }
 
-            let count = (clique_collection.total() as i32) - broken + new;
+                graph.flip_edges(&item.edges_to_flip);
+                let (new, exceeded) = get_new_cliques_with_limit(
+                    graph,
+                    self.clique_size,
+                    &item.edges_to_flip,
+                    broken,
+                );
+                graph.flip_edges(&item.edges_to_flip); // revert
+
+                // If exceeded, this flip can't improve - skip to next work unit
+                if exceeded {
+                    continue;
+                }
+
+                (clique_collection.total() as i32) - broken + new
+            } else {
+                // Full count needed for publishing
+                graph.flip_edges(&item.edges_to_flip);
+                let (new, _) = get_new_cliques_with_limit(
+                    graph,
+                    self.clique_size,
+                    &item.edges_to_flip,
+                    i32::MAX,
+                );
+                graph.flip_edges(&item.edges_to_flip); // revert
+                (clique_collection.total() as i32) - broken + new
+            };
 
             // Create WorkResult for submission (always use TARGETED)
             let result = WorkResult {

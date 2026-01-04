@@ -4,15 +4,23 @@ use crate::graph::{Graph, WorkUnitEdge};
 /// Replicates TargetedCliqueCheckServiceBitSet.getNewCliques
 /// Counts new cliques formed after edge flips, using seeded Bron-Kerbosch.
 /// Uses the optimized no-X variant since we start with empty X.
-pub fn get_new_cliques(
+///
+/// Early termination: if `threshold` is provided and count exceeds it,
+/// stops counting and returns early (since we can't improve on best).
+pub fn get_new_cliques_with_limit(
     graph: &mut Graph,
     clique_size: usize,
     flipped_edges: &[WorkUnitEdge],
-) -> i32 {
+    threshold: i32,
+) -> (i32, bool) {
     let mut new_clique_count = 0;
+    let mut exceeded = false;
 
     // Check RED (current adjacency)
     for edge in flipped_edges {
+        if exceeded {
+            break;
+        }
         let v1 = edge.vertex_one as usize;
         let v2 = edge.vertex_two as usize;
 
@@ -26,15 +34,28 @@ pub fn get_new_cliques(
             p.clear(v1);
             p.clear(v2);
 
-            // Use the no-X variant for targeted search (X starts empty and we don't need duplicate prevention)
-            new_clique_count +=
-                bron_kerbosch_count_no_x(&mut r, &mut p, &graph.adjacency, clique_size);
+            // Use the no-X variant with limit for targeted search
+            let remaining = threshold - new_clique_count;
+            let (count, over) = bron_kerbosch_count_no_x_with_limit(
+                &mut r,
+                &mut p,
+                &graph.adjacency,
+                clique_size,
+                remaining,
+            );
+            new_clique_count += count;
+            if over {
+                exceeded = true;
+            }
         }
     }
 
     // Check BLUE (inverted adjacency)
     graph.invert();
     for edge in flipped_edges {
+        if exceeded {
+            break;
+        }
         let v1 = edge.vertex_one as usize;
         let v2 = edge.vertex_two as usize;
 
@@ -48,15 +69,35 @@ pub fn get_new_cliques(
             p.clear(v1);
             p.clear(v2);
 
-            new_clique_count +=
-                bron_kerbosch_count_no_x(&mut r, &mut p, &graph.adjacency, clique_size);
+            let remaining = threshold - new_clique_count;
+            let (count, over) = bron_kerbosch_count_no_x_with_limit(
+                &mut r,
+                &mut p,
+                &graph.adjacency,
+                clique_size,
+                remaining,
+            );
+            new_clique_count += count;
+            if over {
+                exceeded = true;
+            }
         }
     }
 
     // Restore graph state
     graph.invert();
 
-    new_clique_count
+    (new_clique_count, exceeded)
+}
+
+/// Original version without early termination (for base graph enumeration)
+pub fn get_new_cliques(
+    graph: &mut Graph,
+    clique_size: usize,
+    flipped_edges: &[WorkUnitEdge],
+) -> i32 {
+    let (count, _) = get_new_cliques_with_limit(graph, clique_size, flipped_edges, i32::MAX);
+    count
 }
 
 pub fn get_all_cliques(graph: &mut Graph, clique_size: usize) -> Vec<Vec<usize>> {
@@ -236,24 +277,31 @@ fn bron_kerbosch_count_inplace(
 /// Optimized Bron-Kerbosch counting WITHOUT X tracking.
 /// Used for targeted/seeded search where X starts empty and we don't need
 /// to prevent duplicate cliques (each edge seeds a unique search space).
-/// Saves ~40 bytes copy + and_assign per recursion level.
+/// Bron-Kerbosch counting with early termination when limit is exceeded.
+/// Returns (count, exceeded) - if exceeded is true, count may be incomplete
+/// but we know it's greater than the limit.
 #[inline]
-fn bron_kerbosch_count_no_x(
+fn bron_kerbosch_count_no_x_with_limit(
     r: &mut BitMatrix,
     p: &mut BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,
-) -> i32 {
+    limit: i32,
+) -> (i32, bool) {
     if r.cardinality() as usize == clique_size {
-        return 1;
+        // Found a clique - check if we've exceeded limit
+        if limit <= 0 {
+            return (1, true);
+        }
+        return (1, false);
     }
 
     if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
-        return 0;
+        return (0, false);
     }
 
     if p.is_empty() {
-        return 0;
+        return (0, false);
     }
 
     let mut count = 0;
@@ -266,14 +314,21 @@ fn bron_kerbosch_count_no_x(
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
-        count += bron_kerbosch_count_no_x(r, &mut new_p, adjacency, clique_size);
+        let remaining = limit - count;
+        let (sub_count, exceeded) =
+            bron_kerbosch_count_no_x_with_limit(r, &mut new_p, adjacency, clique_size, remaining);
+        count += sub_count;
+
+        if exceeded || count > limit {
+            r.clear(v);
+            return (count, true);
+        }
 
         r.clear(v);
         p.clear(v);
-        // No X tracking needed for targeted search
 
         v_opt = candidates.next_set_bit(v + 1);
     }
 
-    count
+    (count, false)
 }

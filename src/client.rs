@@ -25,15 +25,12 @@ impl MiddlewareClient {
         status: WorkUnitStatus,
         fetch_size: i32,
     ) -> Result<Vec<WorkUnit>, Box<dyn Error>> {
-        let url = format!("{}/work-units", self.base_url);
-        // Assuming the Java API query params: ?assignedClientId=...&status=...&pageSize=...
-        let params = [
-            ("assignedClientId", &client_id.to_string()),
-            ("status", &format!("{:?}", status)), // Enum debug print might match Java string? CREATED, ASSIGNED
-            ("pageSize", &fetch_size.to_string()),
-        ];
+        let url = format!(
+            "{}/work-units?assignedClientId={}&status={:?}&pageSize={}",
+            self.base_url, client_id, status, fetch_size
+        );
 
-        let response = self.client.get(&url).query(&params).send().await?;
+        let response: reqwest::Response = self.client.get(&url).send().await?;
 
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(vec![]);
@@ -110,13 +107,12 @@ impl MiddlewareClient {
         campaign_id: i32,
         status: &str,
     ) -> Result<Vec<crate::model::Stage>, Box<dyn Error>> {
-        let url = format!("{}/stages", self.base_url);
-        let params = [
-            ("campaignId", campaign_id.to_string()),
-            ("status", status.to_string()),
-        ];
+        let url = format!(
+            "{}/stages?campaignId={}&status={}",
+            self.base_url, campaign_id, status
+        );
 
-        let response = self.client.get(&url).query(&params).send().await?;
+        let response: reqwest::Response = self.client.get(&url).send().await?;
 
         if !response.status().is_success() {
             let status_code = response.status();
