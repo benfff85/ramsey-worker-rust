@@ -21,8 +21,8 @@ ARG TARGET_CPU=generic
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 RUN cargo build --release
 
-# Runtime Stage
-FROM debian:bookworm-slim
+# Runtime Stage - use trixie to match glibc 2.38 from rust:latest
+FROM debian:trixie-slim
 WORKDIR /usr/local/bin
 
 # Install OpenSSL/CA certificates required for reqwest
