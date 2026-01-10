@@ -10,10 +10,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - target_cpu: generic
+          - platform: linux/arm64
+            target_cpu: generic
             tag_suffix: ""
-          - target_cpu: neoverse-v2
+          - platform: linux/arm64
+            target_cpu: neoverse-v2
             tag_suffix: "-neoverse-v2"
+          - platform: linux/amd64
+            target_cpu: x86-64
+            tag_suffix: "-amd64"
 
     steps:
       - uses: actions/checkout@v6
@@ -45,7 +50,7 @@ jobs:
       - name: Build and Push Multi-Platform Docker Image
         run: |
           docker buildx create --use
-          docker buildx build --platform linux/arm64 \
+          docker buildx build --platform ${{ matrix.platform }} \
             --build-arg TARGET_CPU=${{ matrix.target_cpu }} \
             -t benferenchak/ramsey-worker-rust:${{ env.TAG_NAME }}${{ matrix.tag_suffix }} \
             -t benferenchak/ramsey-worker-rust:latest${{ matrix.tag_suffix }} \
