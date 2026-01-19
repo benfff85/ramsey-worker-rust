@@ -95,6 +95,8 @@ pub struct Campaign {
     pub vertex_count: i32,
     #[serde(rename = "subgraphSize")]
     pub subgraph_size: i32,
+    #[serde(rename = "totalPairs")]
+    pub total_pairs: Option<i64>,
 }
 
 /// Work result - simplified structure for submitting processing results
@@ -127,6 +129,10 @@ pub struct Stage {
     pub campaign_id: i32,
     #[serde(rename = "latestWorkUnitId")]
     pub latest_work_unit_id: Option<i32>,
+    #[serde(rename = "workEnumerationStrategy")]
+    pub work_enumeration_strategy: Option<WorkEnumerationStrategy>,
+    #[serde(rename = "details")]
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,3 +140,33 @@ pub enum StageStatus {
     ACTIVE,
     INACTIVE,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WorkEnumerationStrategy {
+    BASIC,
+    SINGLE_EDGE_CARDINALITY,
+    DUAL_EDGE_CARDINALITY,
+}
+
+/// Stage configuration stored in Redis for counter-based work
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageConfig {
+    #[serde(rename = "stageId")]
+    pub stage_id: i32,
+    #[serde(rename = "baseGraphId")]
+    pub base_graph_id: i32,
+    pub strategy: WorkEnumerationStrategy,
+    #[serde(rename = "totalPairs")]
+    pub total_pairs: i64,
+    pub graph: GraphSnapshot,
+}
+
+/// Graph snapshot for embedding in StageConfig
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphSnapshot {
+    #[serde(rename = "vertexCount")]
+    pub vertex_count: usize,
+    #[serde(rename = "edgeData")]
+    pub edge_data: String,
+}
+
