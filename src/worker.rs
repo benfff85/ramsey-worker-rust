@@ -257,6 +257,8 @@ impl Worker {
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
 
+        let mut processed_results: Vec<WorkResult> = Vec::new();
+
         // Process each work unit in the range
         for idx in start_index..end_index {
             let (red_edge, blue_edge) = enumerator.index_to_edge_pair(idx);
@@ -301,6 +303,29 @@ impl Worker {
                     }
                 }
             }
+
+            // Collect results for publishing
+            if self.publish_results {
+                let result = WorkResult {
+                    id: None,
+                    base_graph_id,
+                    stage_id,
+                    edges_to_flip: edges_to_flip.clone(),
+                    clique_count: count,
+                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                };
+                processed_results.push(result);
+
+                if processed_results.len() >= self.publish_size as usize {
+                    self.mw_client.submit_results(&processed_results).await?;
+                    processed_results.clear();
+                }
+            }
+        }
+
+        // Submit remaining results
+        if self.publish_results && !processed_results.is_empty() {
+            self.mw_client.submit_results(&processed_results).await?;
         }
 
         // Update processed count
