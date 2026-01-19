@@ -189,26 +189,37 @@ impl Worker {
             let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
             if let Some(config) = redis_client.get_stage_config(stage_id).await? {
                 println!(
-                    "[{}] Loaded stage config: strategy={:?}, totalPairs={}",
+                    "[{}] Loaded stage config: strategy={:?}, totalPairs={}, baseGraphId={}",
                     Utc::now().format("%Y-%m-%dT%H:%M:%S"),
                     config.strategy,
-                    config.total_pairs
+                    config.total_pairs,
+                    config.base_graph_id
                 );
 
-                // Build graph from config
-                let graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
-                
-                // Cache graph and build clique collection
-                self.graph_cache.insert(config.base_graph_id, graph);
-                
-                // Get mutable graph reference for clique calculation
-                let graph = self.graph_cache.get_mut(&config.base_graph_id).unwrap();
-                let all_cliques = get_all_cliques(graph, self.clique_size);
-                let mut cc = CliqueCollection::new(self.vertex_count);
-                cc.set_cliques(all_cliques, self.vertex_count);
-                self.clique_collection_cache.insert(config.base_graph_id, cc);
+                // Check if we already have this graph cached (reuse across stages!)
+                if !self.graph_cache.contains_key(&config.base_graph_id) {
+                    println!("[{}] Building graph from stage_config (first time for graph {})",
+                        Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                        config.base_graph_id
+                    );
+                    let graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+                    self.graph_cache.insert(config.base_graph_id, graph);
+                    
+                    // Build clique collection for this graph
+                    let graph = self.graph_cache.get_mut(&config.base_graph_id).unwrap();
+                    let all_cliques = get_all_cliques(graph, self.clique_size);
+                    let mut cc = CliqueCollection::new(self.vertex_count);
+                    cc.set_cliques(all_cliques, self.vertex_count);
+                    self.clique_collection_cache.insert(config.base_graph_id, cc);
+                } else {
+                    println!("[{}] Reusing cached graph {} for new stage {}",
+                        Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                        config.base_graph_id,
+                        stage_id
+                    );
+                }
 
-                // Create enumerator (needs immutable ref)
+                // Create enumerator for this stage (uses cached graph)
                 let graph = self.graph_cache.get(&config.base_graph_id).unwrap();
                 self.enumerator = Some(create_enumerator(&config.strategy, graph));
                 self.stage_config = Some(config);
