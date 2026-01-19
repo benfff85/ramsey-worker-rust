@@ -4,26 +4,51 @@ High-performance worker for the Ramsey distributed computing system. Consumes wo
 
 ## Architecture
 
+The worker supports two modes of operation: **Counter-Based** (New) and **Queue-Based** (Legacy).
+
+### Counter-Based Mode (Preferred)
+```
+┌───────────────┐     ┌─────────────────┐     ┌────────────┐
+│     Redis     │◀───▶│   Rust Worker   │────▶│   MySQL    │
+│ stage_config  │     │ (calculates work│     │  (results) │
+│ work_index    │     │  locally via    │     │  optional  │
+│ best_result   │     │  enumerator)    │     │            │
+└───────────────┘     └─────────────────┘     └────────────┘
+```
+
+### Queue-Based Mode (Legacy)
 ```
 ┌───────────┐     ┌─────────────────┐     ┌────────────┐
 │   Redis   │────▶│   Rust Worker   │────▶│   MySQL    │
-│   Queue   │     │  (Bron-Kerbosch)│     │  (results) │
-│           │◀────│                 │     │  optional  │
-│best_result│     │ (tracks best)   │     │            │
-│proc_count │◀────│ (tracks count)  │     │            │
-└───────────┘     └─────────────────┘     └────────────┘
+│ work_queue│     │  (pops items)   │     │  (results) │
+│           │     │                 │     │            │
+└───────────┘     └─────────────────┘ └────────────┘
 ```
 
 ## How It Works
 
 1. **Registration**: Worker registers with middleware as a CLIQUECHECKER client
-2. **Stage Discovery**: Fetches active stage and base graph clique count from middleware
-3. **Work Loop**:
-   - Pops work items from Redis queue (`RPOP work_queue:{stageId}`)
-   - Processes each item using optimized Bron-Kerbosch clique counting
-   - **If result has fewer cliques than base graph**: Updates `best_result:{stageId}` in Redis
-   - Submits results to middleware (`POST /api/ramsey/results`)
-4. **Heartbeat**: Periodically updates last phone home time
+2. **Stage Discovery**: Fetches active stage details.
+3. **Mode Selection**:
+   - if `stage_config:{id}` exists in Redis -> **Counter-Based Mode**
+   - if not -> **Queue-Based Mode**
+
+### Counter-Based Cycle
+1. **Claim Work**: Atomically increments `stage_work_index:{id}` to claim a range of indices (e.g. 1000-2000).
+2. **Graph Caching**: Fetches and caches the base graph graph data (only once per graph ID).
+3. **Enumeration**: Converts claimed indices into edge pairs using the configured strategy:
+   - `BASIC`: Sequential iteration
+   - `DUAL_EDGE_CARDINALITY`: Sorted by edge cardinality for targeted exploration
+4. **Processing**: Runs Bron-Kerbosch on each edge pair.
+
+### Queue-Based Cycle (Legacy)
+1. **Pop Work**: Pops work items (`RPOP`) containing explicit edge pairs from Redis.
+2. **Processing**: Runs Bron-Kerbosch.
+
+4. **Result Handling** (Both Modes):
+   - **If result has fewer cliques**: Updates `best_result:{stageId}` in Redis
+   - **Result Publishing**: If enabled, batches and submits `WorkResult` to middleware (`POST /api/ramsey/results`)
+   - **Heartbeat**: Periodically updates last phone home time
 
 ## Best Result Tracking
 
