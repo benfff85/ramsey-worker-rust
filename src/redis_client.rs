@@ -58,22 +58,42 @@ pub struct RedisClient {
 }
 
 impl RedisClient {
-    /// Create a new Redis client
+    /// Create a new Redis client with timeout configuration
     pub async fn new(host: &str, port: u16) -> Result<Self, Box<dyn Error>> {
         let redis_url = format!("redis://{}:{}", host, port);
         println!("Connecting to Redis at {}", redis_url);
 
         let client = redis::Client::open(redis_url)?;
-        let connection = ConnectionManager::new(client).await?;
 
-        println!("Connected to Redis");
-        Ok(RedisClient { connection })
+        // ConnectionManager handles automatic reconnection
+        // Retry connection with backoff for initial setup
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            match ConnectionManager::new(client.clone()).await {
+                Ok(conn) => {
+                    println!("Connected to Redis");
+                    return Ok(RedisClient { connection: conn });
+                }
+                Err(e) => {
+                    let delay_ms = 1000 * attempt;
+                    eprintln!(
+                        "Redis connection attempt {}/3 failed: {}. Retrying in {}ms...",
+                        attempt, e, delay_ms
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+
+        Err(Box::new(last_error.unwrap()))
     }
 
     // ========== Counter-Based Work Distribution Methods ==========
 
     /// Claim a range of work indices atomically using INCRBY.
     /// Returns Some((start_index, end_index)) if work is available, None if all work claimed.
+    /// Includes retry logic for transient network failures.
     pub async fn claim_work_range(
         &mut self,
         stage_id: i32,
@@ -82,8 +102,34 @@ impl RedisClient {
     ) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
         let index_key = format!("stage_work_index:{}", stage_id);
 
-        // INCRBY returns the new value after incrementing
-        let end_index: i64 = self.connection.incr(&index_key, batch_size).await?;
+        // INCRBY with inline retry
+        let mut end_index: i64 = 0;
+        for attempt in 0..3u32 {
+            match self
+                .connection
+                .incr::<_, _, i64>(&index_key, batch_size)
+                .await
+            {
+                Ok(val) => {
+                    end_index = val;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 2 {
+                        return Err(Box::new(e));
+                    }
+                    let delay = 500 * 2u64.pow(attempt);
+                    eprintln!(
+                        "Redis claim_work_range failed (attempt {}/3): {}. Retrying in {}ms...",
+                        attempt + 1,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+
         let start_index = end_index - batch_size;
 
         // If start_index is already >= total_pairs, all work has been claimed
@@ -99,12 +145,36 @@ impl RedisClient {
 
     /// Get the stage configuration from Redis (includes graph data).
     /// This should be fetched once per stage and cached locally.
+    /// Includes retry logic for transient network failures.
     pub async fn get_stage_config(
         &mut self,
         stage_id: i32,
     ) -> Result<Option<StageConfig>, Box<dyn Error>> {
         let config_key = format!("stage_config:{}", stage_id);
-        let result: Option<String> = self.connection.get(&config_key).await?;
+
+        // GET with inline retry
+        let mut result: Option<String> = None;
+        for attempt in 0..3u32 {
+            match self.connection.get::<_, Option<String>>(&config_key).await {
+                Ok(val) => {
+                    result = val;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 2 {
+                        return Err(Box::new(e));
+                    }
+                    let delay = 500 * 2u64.pow(attempt);
+                    eprintln!(
+                        "Redis get_stage_config failed (attempt {}/3): {}. Retrying in {}ms...",
+                        attempt + 1,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
 
         match result {
             Some(json) => {
@@ -116,10 +186,31 @@ impl RedisClient {
     }
 
     /// Check if stage config exists (indicates counter-based mode).
+    /// Includes retry logic for transient network failures.
     pub async fn has_stage_config(&mut self, stage_id: i32) -> Result<bool, Box<dyn Error>> {
         let config_key = format!("stage_config:{}", stage_id);
-        let exists: bool = self.connection.exists(&config_key).await?;
-        Ok(exists)
+
+        // EXISTS with inline retry
+        for attempt in 0..3u32 {
+            match self.connection.exists::<_, bool>(&config_key).await {
+                Ok(exists) => return Ok(exists),
+                Err(e) => {
+                    if attempt == 2 {
+                        return Err(Box::new(e));
+                    }
+                    let delay = 500 * 2u64.pow(attempt);
+                    eprintln!(
+                        "Redis has_stage_config failed (attempt {}/3): {}. Retrying in {}ms...",
+                        attempt + 1,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+
+        Ok(false) // Unreachable
     }
 
     // ========== Queue-Based Work Distribution Methods (existing) ==========
@@ -259,4 +350,3 @@ impl RedisClient {
         Ok(new_count)
     }
 }
-
