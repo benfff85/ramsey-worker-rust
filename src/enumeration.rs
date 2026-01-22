@@ -1,0 +1,215 @@
+//! Work enumeration strategies for counter-based work distribution.
+//!
+//! Workers claim index ranges via INCRBY and use these strategies to
+//! convert indices into specific edge pairs to process.
+
+use crate::graph::{Graph, WorkUnitEdge};
+
+/// Trait for work enumeration strategies
+pub trait WorkEnumerator {
+    /// Convert a work index to the corresponding edge pair
+    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge);
+
+    /// Get total number of work units
+    fn total_pairs(&self) -> i64;
+}
+
+/// Edge with computed cardinality for sorting
+#[derive(Clone, Debug)]
+pub struct ScoredEdge {
+    pub vertex_one: u16,
+    pub vertex_two: u16,
+    pub cardinality: i32,
+}
+
+/// BASIC enumeration: simple row-major iteration over all edge pairs.
+/// For n edges total, pairs are indexed as: pair_index = red_idx * blue_count + blue_idx
+pub struct BasicEnumerator {
+    red_edges: Vec<ScoredEdge>,
+    blue_edges: Vec<ScoredEdge>,
+    total_pairs: i64,
+}
+
+impl BasicEnumerator {
+    pub fn new(graph: &Graph) -> Self {
+        let vertex_count = graph.vertex_count;
+
+        // Build edge list (same for red and blue in BASIC mode - just split by color)
+        let mut red_edges = Vec::new();
+        let mut blue_edges = Vec::new();
+
+        for i in 0..vertex_count {
+            for j in (i + 1)..vertex_count {
+                let edge = ScoredEdge {
+                    vertex_one: i as u16,
+                    vertex_two: j as u16,
+                    cardinality: 0, // Not used in BASIC
+                };
+                // Check adjacency - if connected (1), it's red; else blue
+                if graph.adjacency[i].get(j) {
+                    red_edges.push(edge);
+                } else {
+                    blue_edges.push(edge);
+                }
+            }
+        }
+
+        let total_pairs = (red_edges.len() as i64) * (blue_edges.len() as i64);
+
+        BasicEnumerator {
+            red_edges,
+            blue_edges,
+            total_pairs,
+        }
+    }
+}
+
+impl WorkEnumerator for BasicEnumerator {
+    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge) {
+        let blue_count = self.blue_edges.len() as i64;
+        let red_idx = (index / blue_count) as usize;
+        let blue_idx = (index % blue_count) as usize;
+
+        let red_edge = &self.red_edges[red_idx];
+        let blue_edge = &self.blue_edges[blue_idx];
+
+        (
+            WorkUnitEdge {
+                vertex_one: red_edge.vertex_one,
+                vertex_two: red_edge.vertex_two,
+            },
+            WorkUnitEdge {
+                vertex_one: blue_edge.vertex_one,
+                vertex_two: blue_edge.vertex_two,
+            },
+        )
+    }
+
+    fn total_pairs(&self) -> i64 {
+        self.total_pairs
+    }
+}
+
+/// DUAL_EDGE_CARDINALITY enumeration: edges sorted by cardinality (descending).
+/// Prioritizes high-impact edge pairs first.
+pub struct DualCardinalityEnumerator {
+    red_edges: Vec<ScoredEdge>,
+    blue_edges: Vec<ScoredEdge>,
+    total_pairs: i64,
+}
+
+impl DualCardinalityEnumerator {
+    pub fn new(graph: &Graph) -> Self {
+        let vertex_count = graph.vertex_count;
+
+        // Build edge list with cardinality calculation
+        let mut red_edges = Vec::new();
+        let mut blue_edges = Vec::new();
+
+        // First pass: build edge lists
+        for i in 0..vertex_count {
+            for j in (i + 1)..vertex_count {
+                let edge = ScoredEdge {
+                    vertex_one: i as u16,
+                    vertex_two: j as u16,
+                    cardinality: 0,
+                };
+                if graph.adjacency[i].get(j) {
+                    red_edges.push(edge);
+                } else {
+                    blue_edges.push(edge);
+                }
+            }
+        }
+
+        // Calculate cardinality for each edge
+        // Cardinality = number of same-colored edges adjacent to this edge's vertices
+        Self::calculate_cardinalities(&mut red_edges, graph, true);
+        Self::calculate_cardinalities(&mut blue_edges, graph, false);
+
+        // Sort by cardinality descending
+        red_edges.sort_by(|a, b| b.cardinality.cmp(&a.cardinality));
+        blue_edges.sort_by(|a, b| b.cardinality.cmp(&a.cardinality));
+
+        let total_pairs = (red_edges.len() as i64) * (blue_edges.len() as i64);
+
+        DualCardinalityEnumerator {
+            red_edges,
+            blue_edges,
+            total_pairs,
+        }
+    }
+
+    fn calculate_cardinalities(edges: &mut [ScoredEdge], graph: &Graph, is_red: bool) {
+        for edge in edges.iter_mut() {
+            let v1 = edge.vertex_one as usize;
+            let v2 = edge.vertex_two as usize;
+            let mut cardinality = 0;
+
+            // Count same-colored neighbors of v1
+            for k in 0..graph.vertex_count {
+                if k != v1 && k != v2 {
+                    let is_connected = graph.adjacency[v1].get(k);
+                    if is_connected == is_red {
+                        cardinality += 1;
+                    }
+                }
+            }
+
+            // Count same-colored neighbors of v2
+            for k in 0..graph.vertex_count {
+                if k != v1 && k != v2 {
+                    let is_connected = graph.adjacency[v2].get(k);
+                    if is_connected == is_red {
+                        cardinality += 1;
+                    }
+                }
+            }
+
+            edge.cardinality = cardinality;
+        }
+    }
+}
+
+impl WorkEnumerator for DualCardinalityEnumerator {
+    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge) {
+        let blue_count = self.blue_edges.len() as i64;
+        let red_idx = (index / blue_count) as usize;
+        let blue_idx = (index % blue_count) as usize;
+
+        let red_edge = &self.red_edges[red_idx];
+        let blue_edge = &self.blue_edges[blue_idx];
+
+        (
+            WorkUnitEdge {
+                vertex_one: red_edge.vertex_one,
+                vertex_two: red_edge.vertex_two,
+            },
+            WorkUnitEdge {
+                vertex_one: blue_edge.vertex_one,
+                vertex_two: blue_edge.vertex_two,
+            },
+        )
+    }
+
+    fn total_pairs(&self) -> i64 {
+        self.total_pairs
+    }
+}
+
+/// Create the appropriate enumerator based on strategy name
+pub fn create_enumerator(
+    strategy: &crate::model::WorkEnumerationStrategy,
+    graph: &Graph,
+) -> Box<dyn WorkEnumerator + Send> {
+    match strategy {
+        crate::model::WorkEnumerationStrategy::BASIC => Box::new(BasicEnumerator::new(graph)),
+        crate::model::WorkEnumerationStrategy::SINGLE_EDGE_CARDINALITY => {
+            // For now, use same as dual (can be refined later)
+            Box::new(DualCardinalityEnumerator::new(graph))
+        }
+        crate::model::WorkEnumerationStrategy::DUAL_EDGE_CARDINALITY => {
+            Box::new(DualCardinalityEnumerator::new(graph))
+        }
+    }
+}

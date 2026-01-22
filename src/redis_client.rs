@@ -1,4 +1,5 @@
 use crate::graph::WorkUnitEdge;
+use crate::model::StageConfig;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,60 @@ impl RedisClient {
         println!("Connected to Redis");
         Ok(RedisClient { connection })
     }
+
+    // ========== Counter-Based Work Distribution Methods ==========
+
+    /// Claim a range of work indices atomically using INCRBY.
+    /// Returns Some((start_index, end_index)) if work is available, None if all work claimed.
+    pub async fn claim_work_range(
+        &mut self,
+        stage_id: i32,
+        batch_size: i64,
+        total_pairs: i64,
+    ) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
+        let index_key = format!("stage_work_index:{}", stage_id);
+
+        // INCRBY returns the new value after incrementing
+        let end_index: i64 = self.connection.incr(&index_key, batch_size).await?;
+        let start_index = end_index - batch_size;
+
+        // If start_index is already >= total_pairs, all work has been claimed
+        if start_index >= total_pairs {
+            return Ok(None);
+        }
+
+        // Clamp end_index to total_pairs
+        let clamped_end = end_index.min(total_pairs);
+
+        Ok(Some((start_index, clamped_end)))
+    }
+
+    /// Get the stage configuration from Redis (includes graph data).
+    /// This should be fetched once per stage and cached locally.
+    pub async fn get_stage_config(
+        &mut self,
+        stage_id: i32,
+    ) -> Result<Option<StageConfig>, Box<dyn Error>> {
+        let config_key = format!("stage_config:{}", stage_id);
+        let result: Option<String> = self.connection.get(&config_key).await?;
+
+        match result {
+            Some(json) => {
+                let config = serde_json::from_str::<StageConfig>(&json)?;
+                Ok(Some(config))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check if stage config exists (indicates counter-based mode).
+    pub async fn has_stage_config(&mut self, stage_id: i32) -> Result<bool, Box<dyn Error>> {
+        let config_key = format!("stage_config:{}", stage_id);
+        let exists: bool = self.connection.exists(&config_key).await?;
+        Ok(exists)
+    }
+
+    // ========== Queue-Based Work Distribution Methods (existing) ==========
 
     /// Pop work items from the queue using atomic Lua script
     /// This prevents race conditions when multiple workers pop simultaneously
@@ -204,3 +259,4 @@ impl RedisClient {
         Ok(new_count)
     }
 }
+
