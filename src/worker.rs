@@ -178,7 +178,15 @@ impl Worker {
         let has_counter = redis_client.has_stage_config(stage_id).await?;
 
         if !has_counter {
-            return Err(format!("No stage config found in Redis for stage {}", stage_id).into());
+            // Stage config missing - likely stage progressed externally
+            // Clear cache so we re-fetch the active stage on next cycle
+            println!(
+                "[{}] Stage config missing for stage {} - stage may have progressed, refreshing...",
+                Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                stage_id
+            );
+            self.clear_stage_cache();
+            return Ok(0); // Return 0 to trigger poll interval, then retry with fresh stage
         }
 
         self.cycle_counter_based(stage_id).await
