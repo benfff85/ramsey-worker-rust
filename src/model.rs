@@ -1,53 +1,10 @@
-use crate::graph::WorkUnitEdge;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkUnit {
-    pub id: i32,
-    #[serde(rename = "baseGraphId")]
-    pub base_graph_id: i32,
-    #[serde(rename = "stageId")]
-    pub stage_id: i32,
-    #[serde(rename = "edgesToFlip")]
-    pub edges_to_flip: Vec<WorkUnitEdge>,
-    pub status: WorkUnitStatus,
-    #[serde(rename = "cliqueCount")]
-    pub clique_count: Option<i32>,
-    #[serde(rename = "assignedClient")]
-    pub assigned_client: Option<String>,
-    #[serde(rename = "workUnitAnalysisType")]
-    pub analysis_type: WorkUnitAnalysisType,
-    pub priority: Option<WorkUnitPriority>,
-    #[serde(rename = "createdDate")]
-    pub created_date: Option<String>,
-    #[serde(rename = "assignedDate")]
-    pub assigned_date: Option<String>,
-    #[serde(rename = "processingStartedDate")]
-    pub processing_started_date: Option<String>,
-    #[serde(rename = "completedDate")]
-    pub completed_date: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WorkUnitAnalysisType {
     NAIVE,
     COMPREHENSIVE,
     TARGETED,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum WorkUnitStatus {
-    NEW,
-    ASSIGNED,
-    COMPLETE,
-    ERROR, // Keeping internal error state if needed, but won't send to server
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum WorkUnitPriority {
-    LOW,
-    MEDIUM,
-    HIGH,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,4 +126,3 @@ pub struct GraphSnapshot {
     #[serde(rename = "edgeData")]
     pub edge_data: String,
 }
-

@@ -1,5 +1,5 @@
-use crate::model::{Campaign, Client, GraphData, WorkResult, WorkUnit, WorkUnitStatus};
-use reqwest::{Client as HttpClient, StatusCode};
+use crate::model::{Campaign, Client, GraphData, WorkResult};
+use reqwest::Client as HttpClient;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -60,49 +60,6 @@ impl MiddlewareClient {
         }
 
         Err(last_error.unwrap_or_else(|| "Unknown error after retries".into()))
-    }
-
-    pub async fn get_work_units(
-        &self,
-        client_id: i32,
-        status: WorkUnitStatus,
-        fetch_size: i32,
-    ) -> Result<Vec<WorkUnit>, Box<dyn Error>> {
-        let url = format!(
-            "{}/work-units?assignedClientId={}&status={:?}&pageSize={}",
-            self.base_url, client_id, status, fetch_size
-        );
-
-        let response: reqwest::Response = self.client.get(&url).send().await?;
-
-        if response.status() == StatusCode::NO_CONTENT {
-            return Ok(vec![]);
-        }
-
-        let work_units = response.json::<Vec<WorkUnit>>().await?;
-        Ok(work_units)
-    }
-
-    pub async fn update_work_units(&self, work_units: &[WorkUnit]) -> Result<(), Box<dyn Error>> {
-        let url = format!("{}/work-units", self.base_url); // PUT endpoint
-
-        let json_payload = serde_json::to_string(work_units)?;
-
-        let response = self
-            .client
-            .put(&url)
-            .header("Content-Type", "application/json")
-            .body(json_payload)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            eprintln!("DEBUG: Failed to update work units: {} - {}", status, text);
-            return Err(format!("Failed to update work units: {} - {}", status, text).into());
-        }
-        Ok(())
     }
 
     /// Submit work results to the new /api/ramsey/results endpoint
