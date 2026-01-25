@@ -26,7 +26,13 @@ FROM debian:trixie-slim
 WORKDIR /usr/local/bin
 
 # Install OpenSSL/CA certificates required for reqwest
-RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client \
+    iproute2 \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
 
 COPY --from=builder /usr/src/app/target/release/ramsey-worker-rust .
 
