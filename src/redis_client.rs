@@ -5,40 +5,6 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
-/// Work queue item - parsed from compact format: baseGraphId|v1,v2|v1,v2
-#[derive(Debug, Clone)]
-pub struct WorkQueueItem {
-    pub base_graph_id: i32,
-    pub edges_to_flip: Vec<WorkUnitEdge>,
-}
-
-/// Parse compact format: baseGraphId|v1,v2|v1,v2
-fn parse_compact_work_item(compact: &str) -> Result<WorkQueueItem, Box<dyn Error + Send + Sync>> {
-    let parts: Vec<&str> = compact.split('|').collect();
-    if parts.len() < 3 {
-        return Err(format!("Invalid format, expected at least 3 parts: {}", compact).into());
-    }
-
-    let base_graph_id: i32 = parts[0].parse()?;
-    let mut edges_to_flip = Vec::with_capacity(parts.len() - 1);
-
-    for edge_str in &parts[1..] {
-        let vertices: Vec<&str> = edge_str.split(',').collect();
-        if vertices.len() != 2 {
-            return Err(format!("Invalid edge format: {}", edge_str).into());
-        }
-        edges_to_flip.push(WorkUnitEdge {
-            vertex_one: vertices[0].parse()?,
-            vertex_two: vertices[1].parse()?,
-        });
-    }
-
-    Ok(WorkQueueItem {
-        base_graph_id,
-        edges_to_flip,
-    })
-}
-
 /// Best result for a stage - stored in Redis for stage progression
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BestResult {
@@ -213,71 +179,7 @@ impl RedisClient {
         Ok(false) // Unreachable
     }
 
-    // ========== Queue-Based Work Distribution Methods (existing) ==========
-
-    /// Pop work items from the queue using atomic Lua script
-    /// This prevents race conditions when multiple workers pop simultaneously
-    pub async fn pop_work_items(
-        &mut self,
-        stage_id: i32,
-        count: usize,
-    ) -> Result<Vec<WorkQueueItem>, Box<dyn Error>> {
-        let queue_key = format!("work_queue:{}", stage_id);
-
-        // Lua script that atomically:
-        // 1. Gets items from the end of the list
-        // 2. Trims the list to remove those items
-        // 3. Returns the items
-        // This is atomic - no other command can interleave
-        let lua_script = r#"
-            local key = KEYS[1]
-            local count = tonumber(ARGV[1])
-            local len = redis.call('LLEN', key)
-            if len == 0 then
-                return {}
-            end
-            local actual_count = math.min(count, len)
-            local start = -actual_count
-            local items = redis.call('LRANGE', key, start, -1)
-            if #items > 0 then
-                redis.call('LTRIM', key, 0, -(#items + 1))
-            end
-            return items
-        "#;
-
-        let items_json: Vec<String> = redis::cmd("EVAL")
-            .arg(lua_script)
-            .arg(1) // number of keys
-            .arg(&queue_key)
-            .arg(count)
-            .query_async(&mut self.connection)
-            .await?;
-
-        if items_json.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Parse compact format: baseGraphId|v1,v2|v1,v2
-        // Reverse to maintain FIFO order since LRANGE returns oldest last
-        let mut items = Vec::with_capacity(items_json.len());
-        for compact in items_json.into_iter().rev() {
-            match parse_compact_work_item(&compact) {
-                Ok(item) => items.push(item),
-                Err(e) => {
-                    eprintln!("Failed to parse work queue item: {} - {}", compact, e);
-                }
-            }
-        }
-
-        Ok(items)
-    }
-
-    /// Get the queue depth (O(1) operation)
-    pub async fn get_queue_depth(&mut self, stage_id: i32) -> Result<i64, Box<dyn Error>> {
-        let queue_key = format!("work_queue:{}", stage_id);
-        let size: i64 = self.connection.llen(&queue_key).await?;
-        Ok(size)
-    }
+    // ========== Best Result & Progress Tracking ==========
 
     /// Update best result if the new result is better (lower clique count)
     /// Returns true if updated, false otherwise
