@@ -30,5 +30,5 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/
 
 COPY --from=builder /usr/src/app/target/release/ramsey-worker-rust .
 
-# Set the binary as the entrypoint
-CMD ["./ramsey-worker-rust"]
+# Spawn WORKER_COUNT processes (default: 1) to utilize multi-core containers
+CMD ["sh", "-c", "for i in $(seq 1 ${WORKER_COUNT:-1}); do ./ramsey-worker-rust & done; wait"]
