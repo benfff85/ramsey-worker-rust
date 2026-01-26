@@ -354,6 +354,9 @@ impl Worker {
         self.base_graph_clique_count = None;
         self.stage_config = None;
         self.enumerator = None;
+        // Clear graph caches to prevent memory leak on stage progression
+        self.graph_cache.clear();
+        self.clique_collection_cache.clear();
     }
 
     async fn get_or_fetch_stage_id(&mut self) -> Result<i32, Box<dyn Error>> {
