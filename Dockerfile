@@ -37,5 +37,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /usr/src/app/target/release/ramsey-worker-rust .
 
-# Spawn WORKER_COUNT processes (default: 1) to utilize multi-core containers
-CMD ["sh", "-c", "for i in $(seq 1 ${WORKER_COUNT:-1}); do ./ramsey-worker-rust & done; wait"]
+# Spawn WORKER_COUNT processes (default: auto-detect cores) to utilize multi-core containers
+CMD ["sh", "-c", "export WORKER_COUNT=${WORKER_COUNT:-$(nproc)}; echo \"Starting $WORKER_COUNT workers\"; for i in $(seq 1 $WORKER_COUNT); do ./ramsey-worker-rust & done; wait"]
