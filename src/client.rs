@@ -1,3 +1,4 @@
+use crate::log_error;
 use crate::model::{Campaign, Client, GraphData, WorkResult};
 use reqwest::Client as HttpClient;
 use std::error::Error;
@@ -45,7 +46,7 @@ impl MiddlewareClient {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let delay = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt);
-                    eprintln!(
+                    log_error!(
                         "{} failed (attempt {}/{}): {}. Retrying in {}ms...",
                         operation_name,
                         attempt + 1,
@@ -71,7 +72,7 @@ impl MiddlewareClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eprintln!("DEBUG: Failed to submit results: {} - {}", status, text);
+            log_error!("DEBUG: Failed to submit results: {} - {}", status, text);
             return Err(format!("Failed to submit results: {} - {}", status, text).into());
         }
         Ok(())
@@ -145,7 +146,7 @@ impl MiddlewareClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eprintln!("DEBUG: Server returned error: {} - {}", status, text);
+            log_error!("DEBUG: Server returned error: {} - {}", status, text);
             return Err(format!("Server error: {} - {}", status, text).into());
         }
 

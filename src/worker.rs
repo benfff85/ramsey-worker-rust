@@ -7,6 +7,7 @@ use crate::model::{
     Client, ClientStatus, ClientType, StageConfig, WorkResult, WorkUnitAnalysisType,
 };
 use crate::redis_client::RedisClient;
+use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::error::Error;
@@ -29,6 +30,7 @@ pub struct Worker {
     stage_id: Option<i32>,
     base_graph_clique_count: Option<i32>,
     publish_results: bool,
+    top_results_count: usize,
     // Counter-based mode state
     stage_config: Option<StageConfig>,
     enumerator: Option<Box<dyn WorkEnumerator + Send>>,
@@ -45,6 +47,7 @@ impl Worker {
         fetch_size: i32,
         publish_size: i32,
         publish_results: bool,
+        top_results_count: usize,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -62,6 +65,7 @@ impl Worker {
             stage_id: None,
             base_graph_clique_count: None,
             publish_results,
+            top_results_count,
             stage_config: None,
             enumerator: None,
         }
@@ -75,7 +79,7 @@ impl Worker {
     }
 
     pub async fn register(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("Registering worker with campaign ID: {}", self.campaign_id);
+        log_info!("Registering worker with campaign ID: {}", self.campaign_id);
 
         let client_data = Client {
             client_id: None,
@@ -97,14 +101,14 @@ impl Worker {
         };
 
         let campaign = self.mw_client.get_campaign(self.campaign_id).await?;
-        println!("Campaign Info: {:?}", campaign);
+        log_info!("Campaign Info: {:?}", campaign);
         self.vertex_count = campaign.vertex_count as usize;
         self.clique_size = campaign.subgraph_size as usize;
 
         let registered_client = self.mw_client.create_client(&client_data).await?;
         if let Some(id) = registered_client.client_id {
             self.client_id = Some(id);
-            println!("Registered with Client ID: {}", id);
+            log_info!("Registered with Client ID: {}", id);
         }
 
         Ok(())
@@ -112,11 +116,11 @@ impl Worker {
 
     pub async fn run(&mut self) {
         if let Err(e) = self.register().await {
-            eprintln!("Failed to register: {}", e);
+            log_error!("Failed to register: {}", e);
             return;
         }
 
-        println!(
+        log_info!(
             "Worker started for client: {}",
             self.client_id.as_ref().unwrap()
         );
@@ -140,7 +144,11 @@ impl Worker {
                     ),
                 };
                 if let Err(e) = self.mw_client.update_client(&hb_client).await {
-                    eprintln!("Heartbeat failed: {}", e);
+                    eprintln!(
+                        "[{}] Heartbeat failed: {}",
+                        Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                        e
+                    );
                 } else {
                     last_heartbeat = Instant::now();
                 }
@@ -153,16 +161,15 @@ impl Worker {
                         sleep(self.poll_interval).await;
                     } else {
                         let elapsed_ms = cycle_start.elapsed().as_millis();
-                        println!(
-                            "[{}] Processed {} work items in {}ms",
-                            Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                            count,
-                            elapsed_ms
-                        );
+                        log_info!("Processed {} work items in {}ms", count, elapsed_ms);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error in worker cycle: {}", e);
+                    eprintln!(
+                        "[{}] Error in worker cycle: {}",
+                        Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                        e
+                    );
                     sleep(self.poll_interval).await;
                 }
             }
@@ -180,9 +187,8 @@ impl Worker {
         if !has_counter {
             // Stage config missing - likely stage progressed externally
             // Clear cache so we re-fetch the active stage on next cycle
-            println!(
-                "[{}] Stage config missing for stage {} - stage may have progressed, refreshing...",
-                Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+            log_info!(
+                "Stage config missing for stage {} - stage may have progressed, refreshing...",
                 stage_id
             );
             self.clear_stage_cache();
@@ -198,9 +204,8 @@ impl Worker {
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
             let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
             if let Some(config) = redis_client.get_stage_config(stage_id).await? {
-                println!(
-                    "[{}] Loaded stage config: strategy={:?}, totalPairs={}, baseGraphId={}",
-                    Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                log_info!(
+                    "Loaded stage config: strategy={:?}, totalPairs={}, baseGraphId={}",
                     config.strategy,
                     config.total_pairs,
                     config.base_graph_id
@@ -208,9 +213,8 @@ impl Worker {
 
                 // Check if we already have this graph cached (reuse across stages!)
                 if !self.graph_cache.contains_key(&config.base_graph_id) {
-                    println!(
-                        "[{}] Building graph from stage_config (first time for graph {})",
-                        Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                    log_info!(
+                        "Building graph from stage_config (first time for graph {})",
                         config.base_graph_id
                     );
                     let graph =
@@ -225,9 +229,8 @@ impl Worker {
                     self.clique_collection_cache
                         .insert(config.base_graph_id, cc);
                 } else {
-                    println!(
-                        "[{}] Reusing cached graph {} for new stage {}",
-                        Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+                    log_info!(
+                        "Reusing cached graph {} for new stage {}",
                         config.base_graph_id,
                         stage_id
                     );
@@ -258,11 +261,7 @@ impl Worker {
         let (start_index, end_index) = match range {
             Some(r) => r,
             None => {
-                println!(
-                    "[{}] All work claimed for stage {}, clearing cache...",
-                    Utc::now().format("%Y-%m-%dT%H:%M:%S"),
-                    stage_id
-                );
+                log_info!("All work claimed for stage {}, clearing cache...", stage_id);
                 self.clear_stage_cache();
                 return Ok(0);
             }
@@ -274,6 +273,15 @@ impl Worker {
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
 
+        // Fetch the current threshold for top-N results (None = accept anything)
+        let top_threshold: Option<i32> = {
+            let redis = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            redis
+                .get_top_results_threshold(stage_id, self.top_results_count)
+                .await
+                .unwrap_or(None)
+        };
+
         let mut processed_results: Vec<WorkResult> = Vec::new();
 
         // Process each work unit in the range
@@ -282,34 +290,60 @@ impl Worker {
             let edges_to_flip = vec![red_edge, blue_edge];
 
             let broken = clique_collection.get_count_of_cliques_containing_edges(&edges_to_flip);
+            let base_total = clique_collection.total() as i32;
 
-            // Early termination when not publishing
+            // Early termination when not publishing: stop counting if result can't be in top-N
             let count = if !self.publish_results {
+                // Calculate the limit for early termination based on threshold
+                // If threshold exists: max_new = threshold - (base_total - broken) - 1
+                // This is the max new cliques that would still beat the threshold
+                let early_limit = match top_threshold {
+                    Some(threshold) => {
+                        let max_count = threshold - 1; // Must be strictly less
+                        let max_new = max_count - base_total + broken;
+                        if max_new < 0 { 0 } else { max_new }
+                    }
+                    None => i32::MAX, // No threshold, count everything
+                };
+
                 graph.flip_edges(&edges_to_flip);
-                let (new, exceeded) =
-                    get_new_cliques_with_limit(graph, self.clique_size, &edges_to_flip, broken);
+                let (new, exceeded) = get_new_cliques_with_limit(
+                    graph,
+                    self.clique_size,
+                    &edges_to_flip,
+                    early_limit,
+                );
                 graph.flip_edges(&edges_to_flip);
 
                 if exceeded {
                     continue;
                 }
-                (clique_collection.total() as i32) - broken + new
+                base_total - broken + new
             } else {
                 graph.flip_edges(&edges_to_flip);
                 let (new, _) =
                     get_new_cliques_with_limit(graph, self.clique_size, &edges_to_flip, i32::MAX);
                 graph.flip_edges(&edges_to_flip);
-                (clique_collection.total() as i32) - broken + new
+                base_total - broken + new
             };
 
-            // Check if better than base
-            if let Some(base_count) = self.base_graph_clique_count {
-                if count < base_count {
-                    if let Some(redis) = self.redis_client.as_mut() {
-                        let _ = redis
-                            .update_best_if_better(stage_id, base_graph_id, &edges_to_flip, count)
-                            .await;
-                    }
+            // Track as a potential best result (stored in top-N sorted set)
+            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
+            let should_submit = match top_threshold {
+                None => true, // Set is not full, accept any result
+                Some(threshold) => count < threshold,
+            };
+            if should_submit {
+                if let Some(redis) = self.redis_client.as_mut() {
+                    let _ = redis
+                        .add_to_top_results(
+                            stage_id,
+                            base_graph_id,
+                            &edges_to_flip,
+                            count,
+                            self.top_results_count,
+                        )
+                        .await;
                 }
             }
 
@@ -374,21 +408,23 @@ impl Worker {
         }
 
         if stages.len() > 1 {
-            eprintln!(
+            log_error!(
                 "Warning: Multiple active stages for campaign {}, using first",
                 self.campaign_id
             );
         }
 
         let stage = &stages[0];
-        println!(
+        log_info!(
             "Using stage {} for campaign {} (base_graph_id: {})",
-            stage.stage_id, self.campaign_id, stage.base_graph_id
+            stage.stage_id,
+            self.campaign_id,
+            stage.base_graph_id
         );
 
         let graph_data = self.mw_client.get_graph(stage.base_graph_id).await?;
         self.base_graph_clique_count = graph_data.clique_count;
-        println!(
+        log_info!(
             "Base graph clique count: {:?}",
             self.base_graph_clique_count
         );

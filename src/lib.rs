@@ -4,7 +4,7 @@ pub mod client;
 pub mod clique_collection;
 pub mod enumeration;
 pub mod graph;
+pub mod logging;
 pub mod model;
 pub mod redis_client;
 pub mod worker;
-
