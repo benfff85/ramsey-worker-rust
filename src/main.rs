@@ -1,5 +1,5 @@
 use dotenv::dotenv;
-use ramsey_worker_rust::worker::Worker;
+use ramsey_worker_rust::{log_error, log_info, worker::Worker};
 use std::env;
 
 #[tokio::main]
@@ -51,7 +51,13 @@ async fn main() {
         .parse()
         .unwrap_or(true);
 
-    println!("Publish results to MySQL: {}", publish_results);
+    let top_results_count: usize = env::var("TOP_RESULTS_COUNT")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse()
+        .expect("TOP_RESULTS_COUNT must be a number");
+
+    log_info!("Publish results to MySQL: {}", publish_results);
+    log_info!("Tracking top {} results per stage", top_results_count);
 
     let mut worker = Worker::new(
         base_url,
@@ -63,11 +69,12 @@ async fn main() {
         fetch_size,
         publish_size,
         publish_results,
+        top_results_count,
     );
 
     // Connect to Redis
     if let Err(e) = worker.connect_redis(&redis_host, redis_port).await {
-        eprintln!("Failed to connect to Redis: {}", e);
+        log_error!("Failed to connect to Redis: {}", e);
         return;
     }
 

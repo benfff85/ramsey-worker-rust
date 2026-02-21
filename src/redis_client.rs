@@ -1,5 +1,6 @@
 use crate::graph::WorkUnitEdge;
 use crate::model::StageConfig;
+use crate::{log_error, log_info};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ impl RedisClient {
     /// Create a new Redis client with timeout configuration
     pub async fn new(host: &str, port: u16) -> Result<Self, Box<dyn Error>> {
         let redis_url = format!("redis://{}:{}", host, port);
-        println!("Connecting to Redis at {}", redis_url);
+        log_info!("Connecting to Redis at {}", redis_url);
 
         let client = redis::Client::open(redis_url)?;
 
@@ -37,14 +38,16 @@ impl RedisClient {
         for attempt in 1..=3 {
             match ConnectionManager::new(client.clone()).await {
                 Ok(conn) => {
-                    println!("Connected to Redis");
+                    log_info!("Connected to Redis");
                     return Ok(RedisClient { connection: conn });
                 }
                 Err(e) => {
                     let delay_ms = 1000 * attempt;
-                    eprintln!(
+                    log_error!(
                         "Redis connection attempt {}/3 failed: {}. Retrying in {}ms...",
-                        attempt, e, delay_ms
+                        attempt,
+                        e,
+                        delay_ms
                     );
                     last_error = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -57,7 +60,8 @@ impl RedisClient {
 
     // ========== Counter-Based Work Distribution Methods ==========
 
-    /// Claim a range of work indices atomically using INCRBY.
+    /// Claim a range of work indices atomically using a Lua script.
+    /// Prevents counter from exceeding total_pairs by checking before incrementing.
     /// Returns Some((start_index, end_index)) if work is available, None if all work claimed.
     /// Includes retry logic for transient network failures.
     pub async fn claim_work_range(
@@ -68,24 +72,49 @@ impl RedisClient {
     ) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
         let index_key = format!("stage_work_index:{}", stage_id);
 
-        // INCRBY with inline retry
-        let mut end_index: i64 = 0;
+        // Lua script: atomically check and increment, never exceeding total_pairs
+        // Returns: start_index if work available, -1 if exhausted
+        let script = redis::Script::new(
+            r#"
+            local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+            local batch = tonumber(ARGV[1])
+            local total = tonumber(ARGV[2])
+            if current >= total then
+                return -1
+            end
+            local new_end = current + batch
+            redis.call('SET', KEYS[1], new_end)
+            return current
+            "#,
+        );
+
+        // Retry with backoff
         for attempt in 0..3u32 {
-            match self
-                .connection
-                .incr::<_, _, i64>(&index_key, batch_size)
+            match script
+                .key(&index_key)
+                .arg(batch_size)
+                .arg(total_pairs)
+                .invoke_async::<i64>(&mut self.connection)
                 .await
             {
-                Ok(val) => {
-                    end_index = val;
-                    break;
+                Ok(start_index) => {
+                    if start_index < 0 {
+                        // All work has been claimed
+                        return Ok(None);
+                    }
+
+                    let end_index = start_index + batch_size;
+                    // Clamp end_index to total_pairs
+                    let clamped_end = end_index.min(total_pairs);
+
+                    return Ok(Some((start_index, clamped_end)));
                 }
                 Err(e) => {
                     if attempt == 2 {
                         return Err(Box::new(e));
                     }
                     let delay = 500 * 2u64.pow(attempt);
-                    eprintln!(
+                    log_error!(
                         "Redis claim_work_range failed (attempt {}/3): {}. Retrying in {}ms...",
                         attempt + 1,
                         e,
@@ -96,17 +125,7 @@ impl RedisClient {
             }
         }
 
-        let start_index = end_index - batch_size;
-
-        // If start_index is already >= total_pairs, all work has been claimed
-        if start_index >= total_pairs {
-            return Ok(None);
-        }
-
-        // Clamp end_index to total_pairs
-        let clamped_end = end_index.min(total_pairs);
-
-        Ok(Some((start_index, clamped_end)))
+        Ok(None) // Unreachable
     }
 
     /// Get the stage configuration from Redis (includes graph data).
@@ -131,7 +150,7 @@ impl RedisClient {
                         return Err(Box::new(e));
                     }
                     let delay = 500 * 2u64.pow(attempt);
-                    eprintln!(
+                    log_error!(
                         "Redis get_stage_config failed (attempt {}/3): {}. Retrying in {}ms...",
                         attempt + 1,
                         e,
@@ -165,7 +184,7 @@ impl RedisClient {
                         return Err(Box::new(e));
                     }
                     let delay = 500 * 2u64.pow(attempt);
-                    eprintln!(
+                    log_error!(
                         "Redis has_stage_config failed (attempt {}/3): {}. Retrying in {}ms...",
                         attempt + 1,
                         e,
@@ -179,10 +198,130 @@ impl RedisClient {
         Ok(false) // Unreachable
     }
 
-    // ========== Best Result & Progress Tracking ==========
+    // ========== Top-N Best Results Tracking (Sorted Set) ==========
+
+    /// Add a result to the top-N sorted set for a stage.
+    /// Uses Redis sorted set with score = clique_count.
+    /// Atomically adds and trims to keep only the best N results (lowest clique counts).
+    /// Returns true if this result is currently in the top N, false otherwise.
+    pub async fn add_to_top_results(
+        &mut self,
+        stage_id: i32,
+        base_graph_id: i32,
+        edges_to_flip: &[WorkUnitEdge],
+        clique_count: i32,
+        max_results: usize,
+    ) -> Result<bool, Box<dyn Error>> {
+        let key = format!("best_results:{}", stage_id);
+
+        let result = BestResult {
+            base_graph_id,
+            stage_id,
+            edges_to_flip: edges_to_flip.to_vec(),
+            clique_count,
+        };
+        let json = serde_json::to_string(&result)?;
+
+        // Lua script: ZADD, then ZREMRANGEBYRANK to keep only top N (lowest scores)
+        // Returns 1 if this result is still in the set after trim, 0 otherwise
+        let script = redis::Script::new(
+            r#"
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+            redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[3], -1)
+            local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
+            if rank then
+                return 1
+            else
+                return 0
+            end
+            "#,
+        );
+
+        let kept: i32 = script
+            .key(&key)
+            .arg(clique_count)
+            .arg(&json)
+            .arg(max_results as i64) // Keep indices 0 to max_results-1, remove from max_results onward
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        if kept == 1 {
+            log_info!(
+                "Added to top-{} results for stage {}: clique_count={}",
+                max_results,
+                stage_id,
+                clique_count
+            );
+        }
+
+        Ok(kept == 1)
+    }
+
+    /// Get the threshold score (worst/highest score in top-N) for a stage.
+    /// Returns None if there are fewer than max_results entries (any result would be accepted).
+    /// Returns Some(threshold) if the set is "full" - only results better than this should be submitted.
+    pub async fn get_top_results_threshold(
+        &mut self,
+        stage_id: i32,
+        max_results: usize,
+    ) -> Result<Option<i32>, Box<dyn Error>> {
+        let key = format!("best_results:{}", stage_id);
+
+        // Get the count of entries in the set
+        let count: i64 = redis::cmd("ZCARD")
+            .arg(&key)
+            .query_async(&mut self.connection)
+            .await?;
+
+        if (count as usize) < max_results {
+            // Set isn't full yet - accept any result
+            return Ok(None);
+        }
+
+        // Get the score of the last (worst) entry: index max_results-1
+        let scores: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg((max_results - 1) as i64)
+            .arg((max_results - 1) as i64)
+            .arg("WITHSCORES")
+            .query_async(&mut self.connection)
+            .await?;
+
+        match scores.first() {
+            Some((_, score)) => Ok(Some(*score as i32)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the current best (lowest clique count) result for a stage from the sorted set.
+    /// This returns the result with rank 0 (lowest score).
+    pub async fn get_best_result(
+        &mut self,
+        stage_id: i32,
+    ) -> Result<Option<BestResult>, Box<dyn Error>> {
+        let key = format!("best_results:{}", stage_id);
+
+        // ZRANGE with LIMIT 0 1 gets the single lowest score
+        let results: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(0)
+            .query_async(&mut self.connection)
+            .await?;
+
+        match results.first() {
+            Some(json) => {
+                let best = serde_json::from_str::<BestResult>(json)?;
+                Ok(Some(best))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // ========== Legacy Best Result (single key - for backward compatibility) ==========
 
     /// Update best result if the new result is better (lower clique count)
-    /// Returns true if updated, false otherwise
+    /// DEPRECATED: Use add_to_top_results instead. Keeping for backward compatibility.
     pub async fn update_best_if_better(
         &mut self,
         stage_id: i32,
@@ -214,9 +353,10 @@ impl RedisClient {
             };
             let json = serde_json::to_string(&new_best)?;
             self.connection.set::<_, _, ()>(&key, json).await?;
-            println!(
+            log_info!(
                 "New best result for stage {}: clique_count={}",
-                stage_id, clique_count
+                stage_id,
+                clique_count
             );
             Ok(true)
         } else {
@@ -224,22 +364,7 @@ impl RedisClient {
         }
     }
 
-    /// Get the current best result for a stage
-    pub async fn get_best_result(
-        &mut self,
-        stage_id: i32,
-    ) -> Result<Option<BestResult>, Box<dyn Error>> {
-        let key = format!("best_result:{}", stage_id);
-        let result: Option<String> = self.connection.get(&key).await?;
-
-        match result {
-            Some(json) => {
-                let best = serde_json::from_str::<BestResult>(&json)?;
-                Ok(Some(best))
-            }
-            None => Ok(None),
-        }
-    }
+    // ========== Progress Tracking ==========
 
     /// Increment the processed work unit count for a stage
     pub async fn increment_processed_count(
