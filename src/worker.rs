@@ -1,4 +1,4 @@
-use crate::algorithm::{get_all_cliques, get_new_cliques_with_limit};
+use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, create_enumerator};
@@ -55,7 +55,8 @@ impl Worker {
         sa_mode: bool,
         sa_max_iterations: u64,
         sa_initial_temp: f64,
-        sa_max_flip_count: usize,
+        sa_min_pairs: usize,
+        sa_max_pairs: usize,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -80,7 +81,8 @@ impl Worker {
             sa_config: SaConfig {
                 max_iterations: sa_max_iterations,
                 initial_temp: sa_initial_temp,
-                max_flip_count: sa_max_flip_count,
+                min_pairs: sa_min_pairs,
+                max_pairs: sa_max_pairs,
             },
         }
     }
@@ -422,8 +424,15 @@ impl Worker {
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
 
-        // Build graph from stage config
-        let base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        // Build graph and CliqueCollection from stage config.
+        // The clique collection provides per-edge participation scores for guided edge selection.
+        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
+        let mut clique_collection = CliqueCollection::new(self.vertex_count);
+        clique_collection.set_cliques(all_cliques, self.vertex_count);
+
+        // Recount cliques after get_all_cliques (which may mutate graph state)
+        get_cliques_comprehensive(&mut base_graph, self.clique_size);
 
         // Get current threshold for top-N filtering
         let threshold: Option<i32> = {
@@ -435,7 +444,7 @@ impl Worker {
         };
 
         // Run one complete SA schedule
-        let result = run_sa(&base_graph, self.clique_size, &self.sa_config, threshold);
+        let result = run_sa(&base_graph, self.clique_size, &self.sa_config, &clique_collection, threshold);
 
         // Submit best result to Redis if it's worth tracking
         let should_submit = match threshold {

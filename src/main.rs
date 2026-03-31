@@ -71,18 +71,23 @@ async fn main() {
         .parse()
         .expect("SA_INITIAL_TEMP must be a number");
 
-    let sa_max_flip_count: usize = env::var("SA_MAX_FLIP_COUNT")
-        .unwrap_or_else(|_| "4".to_string())
+    let sa_min_pairs: usize = env::var("SA_MIN_PAIRS")
+        .unwrap_or_else(|_| "2".to_string())
         .parse()
-        .expect("SA_MAX_FLIP_COUNT must be a number");
+        .expect("SA_MIN_PAIRS must be a number");
+
+    let sa_max_pairs: usize = env::var("SA_MAX_PAIRS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .expect("SA_MAX_PAIRS must be a number");
 
     log_info!("Publish results to MySQL: {}", publish_results);
     log_info!("Tracking top {} results per stage", top_results_count);
 
     if sa_mode {
         log_info!("Worker mode: SIMULATED_ANNEALING");
-        log_info!("  max_iterations={}, initial_temp={}, max_flip_count={}",
-            sa_max_iterations, sa_initial_temp, sa_max_flip_count);
+        log_info!("  max_iterations={}, initial_temp={}, min_pairs={}, max_pairs={}",
+            sa_max_iterations, sa_initial_temp, sa_min_pairs, sa_max_pairs);
     } else {
         log_info!("Worker mode: EXHAUSTIVE");
     }
@@ -101,7 +106,8 @@ async fn main() {
         sa_mode,
         sa_max_iterations,
         sa_initial_temp,
-        sa_max_flip_count,
+        sa_min_pairs,
+        sa_max_pairs,
     );
 
     // Connect to Redis
