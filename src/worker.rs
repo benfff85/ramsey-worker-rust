@@ -55,6 +55,7 @@ impl Worker {
         sa_mode: bool,
         sa_max_iterations: u64,
         sa_initial_temp: f64,
+        sa_cooling_rate: f64,
         sa_min_pairs: usize,
         sa_max_pairs: usize,
     ) -> Self {
@@ -81,6 +82,7 @@ impl Worker {
             sa_config: SaConfig {
                 max_iterations: sa_max_iterations,
                 initial_temp: sa_initial_temp,
+                cooling_rate: sa_cooling_rate,
                 min_pairs: sa_min_pairs,
                 max_pairs: sa_max_pairs,
             },

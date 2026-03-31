@@ -67,9 +67,14 @@ async fn main() {
         .expect("SA_MAX_ITERATIONS must be a number");
 
     let sa_initial_temp: f64 = env::var("SA_INITIAL_TEMP")
-        .unwrap_or_else(|_| "100.0".to_string())
+        .unwrap_or_else(|_| "1000.0".to_string())
         .parse()
         .expect("SA_INITIAL_TEMP must be a number");
+
+    let sa_cooling_rate: f64 = env::var("SA_COOLING_RATE")
+        .unwrap_or_else(|_| "0.999".to_string())
+        .parse()
+        .expect("SA_COOLING_RATE must be a number");
 
     let sa_min_pairs: usize = env::var("SA_MIN_PAIRS")
         .unwrap_or_else(|_| "2".to_string())
@@ -86,8 +91,8 @@ async fn main() {
 
     if sa_mode {
         log_info!("Worker mode: SIMULATED_ANNEALING");
-        log_info!("  max_iterations={}, initial_temp={}, min_pairs={}, max_pairs={}",
-            sa_max_iterations, sa_initial_temp, sa_min_pairs, sa_max_pairs);
+        log_info!("  max_iterations={}, initial_temp={}, cooling_rate={}, min_pairs={}, max_pairs={}",
+            sa_max_iterations, sa_initial_temp, sa_cooling_rate, sa_min_pairs, sa_max_pairs);
     } else {
         log_info!("Worker mode: EXHAUSTIVE");
     }
@@ -106,6 +111,7 @@ async fn main() {
         sa_mode,
         sa_max_iterations,
         sa_initial_temp,
+        sa_cooling_rate,
         sa_min_pairs,
         sa_max_pairs,
     );

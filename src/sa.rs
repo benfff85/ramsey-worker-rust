@@ -14,6 +14,9 @@ pub struct SaRunResult {
 pub struct SaConfig {
     pub max_iterations: u64,
     pub initial_temp: f64,
+    /// Geometric cooling rate applied each iteration: temp *= cooling_rate.
+    /// Values close to 1.0 (e.g. 0.999) cool slowly; smaller values cool faster.
+    pub cooling_rate: f64,
     /// Minimum number of red+blue edge pairs to flip per iteration.
     /// Should be >= 2 since exhaustive search already covers 1-pair mutations.
     pub min_pairs: usize,
@@ -54,25 +57,26 @@ pub fn run_sa(
     if let Some(t) = threshold {
         log_info!(
             "SA starting: vertex_count={}, clique_size={}, initial_cliques={}, threshold={}, \
-             max_iterations={}, initial_temp={:.2}, min_pairs={}, max_pairs={}",
+             max_iterations={}, initial_temp={:.2}, cooling_rate={:.4}, min_pairs={}, max_pairs={}",
             vertex_count, clique_size, initial_clique_count, t,
-            config.max_iterations, config.initial_temp, config.min_pairs, config.max_pairs
+            config.max_iterations, config.initial_temp, config.cooling_rate, config.min_pairs, config.max_pairs
         );
     } else {
         log_info!(
             "SA starting: vertex_count={}, clique_size={}, initial_cliques={}, threshold=none, \
-             max_iterations={}, initial_temp={:.2}, min_pairs={}, max_pairs={}",
+             max_iterations={}, initial_temp={:.2}, cooling_rate={:.4}, min_pairs={}, max_pairs={}",
             vertex_count, clique_size, initial_clique_count,
-            config.max_iterations, config.initial_temp, config.min_pairs, config.max_pairs
+            config.max_iterations, config.initial_temp, config.cooling_rate, config.min_pairs, config.max_pairs
         );
     }
 
     let mut rng = rand::rng();
 
+    let mut temp = config.initial_temp;
+
     for iteration in 0..config.max_iterations {
-        // Linear cooling
-        let temp = config.initial_temp
-            * (1.0 - (iteration as f64) / (config.max_iterations as f64));
+        // Geometric cooling: temp decays by cooling_rate each iteration
+        temp *= config.cooling_rate;
 
         // Pick a random pair count in [min_pairs, max_pairs]
         let num_pairs = if config.min_pairs == config.max_pairs {
