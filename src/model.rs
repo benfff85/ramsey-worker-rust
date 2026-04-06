@@ -37,6 +37,7 @@ pub struct Client {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientType {
     CLIQUECHECKER,
+    SIMULATED_ANNEALING,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

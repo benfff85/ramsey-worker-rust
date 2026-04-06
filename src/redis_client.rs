@@ -19,6 +19,19 @@ pub struct BestResult {
     pub clique_count: i32,
 }
 
+/// SA best result - stored in Redis with full graph bitstring instead of edges to flip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaBestResult {
+    #[serde(rename = "baseGraphId")]
+    pub base_graph_id: i32,
+    #[serde(rename = "stageId")]
+    pub stage_id: i32,
+    #[serde(rename = "graphBitstring")]
+    pub graph_bitstring: String,
+    #[serde(rename = "cliqueCount")]
+    pub clique_count: i32,
+}
+
 /// Redis client for work queue operations
 pub struct RedisClient {
     connection: ConnectionManager,
@@ -248,6 +261,61 @@ impl RedisClient {
         if kept == 1 {
             log_info!(
                 "Added to top-{} results for stage {}: clique_count={}",
+                max_results,
+                stage_id,
+                clique_count
+            );
+        }
+
+        Ok(kept == 1)
+    }
+
+    /// Add an SA result to the top-N sorted set for a stage.
+    /// Uses the same sorted set key as exhaustive workers, but the member JSON
+    /// contains a graphBitstring field instead of edgesToFlip.
+    pub async fn add_sa_result_to_top_results(
+        &mut self,
+        stage_id: i32,
+        base_graph_id: i32,
+        graph_bitstring: &str,
+        clique_count: i32,
+        max_results: usize,
+    ) -> Result<bool, Box<dyn Error>> {
+        let key = format!("best_results:{}", stage_id);
+
+        let result = SaBestResult {
+            base_graph_id,
+            stage_id,
+            graph_bitstring: graph_bitstring.to_string(),
+            clique_count,
+        };
+        let json = serde_json::to_string(&result)?;
+
+        // Same Lua script as add_to_top_results: ZADD + trim + check rank
+        let script = redis::Script::new(
+            r#"
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+            redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[3], -1)
+            local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
+            if rank then
+                return 1
+            else
+                return 0
+            end
+            "#,
+        );
+
+        let kept: i32 = script
+            .key(&key)
+            .arg(clique_count)
+            .arg(&json)
+            .arg(max_results as i64)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        if kept == 1 {
+            log_info!(
+                "SA: Added to top-{} results for stage {}: clique_count={}",
                 max_results,
                 stage_id,
                 clique_count

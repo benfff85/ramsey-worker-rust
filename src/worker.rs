@@ -1,4 +1,4 @@
-use crate::algorithm::{get_all_cliques, get_new_cliques_with_limit};
+use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, create_enumerator};
@@ -7,6 +7,7 @@ use crate::model::{
     Client, ClientStatus, ClientType, StageConfig, WorkResult, WorkUnitAnalysisType,
 };
 use crate::redis_client::RedisClient;
+use crate::sa::{SaConfig, run_sa};
 use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -34,6 +35,9 @@ pub struct Worker {
     // Counter-based mode state
     stage_config: Option<StageConfig>,
     enumerator: Option<Box<dyn WorkEnumerator + Send>>,
+    // Simulated annealing mode config
+    sa_mode: bool,
+    sa_config: SaConfig,
 }
 
 impl Worker {
@@ -48,6 +52,12 @@ impl Worker {
         publish_size: i32,
         publish_results: bool,
         top_results_count: usize,
+        sa_mode: bool,
+        sa_max_iterations: u64,
+        sa_initial_temp: f64,
+        sa_cooling_rate: f64,
+        sa_min_pairs: usize,
+        sa_max_pairs: usize,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -68,6 +78,14 @@ impl Worker {
             top_results_count,
             stage_config: None,
             enumerator: None,
+            sa_mode,
+            sa_config: SaConfig {
+                max_iterations: sa_max_iterations,
+                initial_temp: sa_initial_temp,
+                cooling_rate: sa_cooling_rate,
+                min_pairs: sa_min_pairs,
+                max_pairs: sa_max_pairs,
+            },
         }
     }
 
@@ -84,7 +102,7 @@ impl Worker {
         let client_data = Client {
             client_id: None,
             campaign_id: self.campaign_id,
-            type_: ClientType::CLIQUECHECKER,
+            type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING } else { ClientType::CLIQUECHECKER },
             status: ClientStatus::ACTIVE,
             created_date: Some(
                 Utc::now()
@@ -133,7 +151,7 @@ impl Worker {
                 let hb_client = Client {
                     client_id: self.client_id,
                     campaign_id: self.campaign_id,
-                    type_: ClientType::CLIQUECHECKER,
+                    type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING } else { ClientType::CLIQUECHECKER },
                     status: ClientStatus::ACTIVE,
                     created_date: None,
                     last_phone_home_date: Some(
@@ -195,7 +213,11 @@ impl Worker {
             return Ok(0); // Return 0 to trigger poll interval, then retry with fresh stage
         }
 
-        self.cycle_counter_based(stage_id).await
+        if self.sa_mode {
+            self.cycle_simulated_annealing(stage_id).await
+        } else {
+            self.cycle_counter_based(stage_id).await
+        }
     }
 
     /// Counter-based work cycle: claim index ranges and enumerate locally
@@ -381,6 +403,78 @@ impl Worker {
         }
 
         Ok(work_count)
+    }
+
+    async fn cycle_simulated_annealing(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
+        // Ensure we have stage config cached
+        if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
+            let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            if let Some(config) = redis_client.get_stage_config(stage_id).await? {
+                log_info!(
+                    "SA: Loaded stage config: baseGraphId={}, strategy={:?}",
+                    config.base_graph_id,
+                    config.strategy
+                );
+                self.stage_config = Some(config);
+            } else {
+                return Err(
+                    format!("Stage config not found in Redis for stage {}", stage_id).into(),
+                );
+            }
+        }
+
+        let config = self.stage_config.as_ref().unwrap();
+        let base_graph_id = config.base_graph_id;
+
+        // Build graph and CliqueCollection from stage config.
+        // The clique collection provides per-edge participation scores for guided edge selection.
+        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
+        let mut clique_collection = CliqueCollection::new(self.vertex_count);
+        clique_collection.set_cliques(all_cliques, self.vertex_count);
+
+        // Recount cliques after get_all_cliques (which may mutate graph state)
+        get_cliques_comprehensive(&mut base_graph, self.clique_size);
+
+        // Get current threshold for top-N filtering
+        let threshold: Option<i32> = {
+            let redis = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            redis
+                .get_top_results_threshold(stage_id, self.top_results_count)
+                .await
+                .unwrap_or(None)
+        };
+
+        // Run one complete SA schedule
+        let result = run_sa(&base_graph, self.clique_size, &self.sa_config, &clique_collection, threshold);
+
+        // Submit best result to Redis if it's worth tracking
+        let should_submit = match threshold {
+            None => true,
+            Some(t) => result.best_clique_count < t,
+        };
+
+        if should_submit {
+            if let Some(redis) = self.redis_client.as_mut() {
+                let _ = redis
+                    .add_sa_result_to_top_results(
+                        stage_id,
+                        base_graph_id,
+                        &result.best_graph_bitstring,
+                        result.best_clique_count,
+                        self.top_results_count,
+                    )
+                    .await;
+            }
+        }
+
+        // Update processed count (1 per SA run)
+        if let Some(redis) = self.redis_client.as_mut() {
+            let _ = redis.increment_processed_count(stage_id, 1).await;
+        }
+
+        // Return 1 to indicate work was done (avoids poll sleep)
+        Ok(1)
     }
 
     fn clear_stage_cache(&mut self) {

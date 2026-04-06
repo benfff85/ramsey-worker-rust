@@ -57,6 +57,23 @@ impl Graph {
         }
     }
 
+    /// Convert graph adjacency matrix back to bitstring format.
+    /// Inverse of `from_bitstring()`.
+    pub fn to_bitstring(&self) -> String {
+        let edge_count = self.vertex_count * (self.vertex_count - 1) / 2;
+        let mut bits = String::with_capacity(edge_count);
+        for i in 0..self.vertex_count {
+            for j in (i + 1)..self.vertex_count {
+                if self.adjacency[i].get(j) {
+                    bits.push('1');
+                } else {
+                    bits.push('0');
+                }
+            }
+        }
+        bits
+    }
+
     #[inline]
     pub fn flip_edges(&mut self, edges: &[WorkUnitEdge]) {
         for edge in edges {

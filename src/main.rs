@@ -56,8 +56,46 @@ async fn main() {
         .parse()
         .expect("TOP_RESULTS_COUNT must be a number");
 
+    let sa_mode: bool = env::var("WORKER_MODE")
+        .unwrap_or_else(|_| "EXHAUSTIVE".to_string())
+        .to_uppercase()
+        == "SIMULATED_ANNEALING";
+
+    let sa_max_iterations: u64 = env::var("SA_MAX_ITERATIONS")
+        .unwrap_or_else(|_| "100000".to_string())
+        .parse()
+        .expect("SA_MAX_ITERATIONS must be a number");
+
+    let sa_initial_temp: f64 = env::var("SA_INITIAL_TEMP")
+        .unwrap_or_else(|_| "1000.0".to_string())
+        .parse()
+        .expect("SA_INITIAL_TEMP must be a number");
+
+    let sa_cooling_rate: f64 = env::var("SA_COOLING_RATE")
+        .unwrap_or_else(|_| "0.999".to_string())
+        .parse()
+        .expect("SA_COOLING_RATE must be a number");
+
+    let sa_min_pairs: usize = env::var("SA_MIN_PAIRS")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .expect("SA_MIN_PAIRS must be a number");
+
+    let sa_max_pairs: usize = env::var("SA_MAX_PAIRS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .expect("SA_MAX_PAIRS must be a number");
+
     log_info!("Publish results to MySQL: {}", publish_results);
     log_info!("Tracking top {} results per stage", top_results_count);
+
+    if sa_mode {
+        log_info!("Worker mode: SIMULATED_ANNEALING");
+        log_info!("  max_iterations={}, initial_temp={}, cooling_rate={}, min_pairs={}, max_pairs={}",
+            sa_max_iterations, sa_initial_temp, sa_cooling_rate, sa_min_pairs, sa_max_pairs);
+    } else {
+        log_info!("Worker mode: EXHAUSTIVE");
+    }
 
     let mut worker = Worker::new(
         base_url,
@@ -70,6 +108,12 @@ async fn main() {
         publish_size,
         publish_results,
         top_results_count,
+        sa_mode,
+        sa_max_iterations,
+        sa_initial_temp,
+        sa_cooling_rate,
+        sa_min_pairs,
+        sa_max_pairs,
     );
 
     // Connect to Redis
