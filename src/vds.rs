@@ -91,13 +91,30 @@ pub fn run_vds(
         config.max_depth, config.top_first_edges, config.branching_factor, config.worsening_tolerance
     );
 
-    let _ = clique_collection;
+    let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
+    let candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
 
-    // Stub: return no improvement
+    let mut best_count = base_clique_count;
+    let mut best_sequence: Vec<WorkUnitEdge> = Vec::new();
+
+    for edge in &candidates {
+        let count = evaluate_flip(&mut working_graph, clique_collection, edge, clique_size, base_clique_count);
+        if count < best_count {
+            best_count = count;
+            best_sequence = vec![edge.clone()];
+        }
+    }
+
+    let improved = !best_sequence.is_empty();
+    log_info!(
+        "VDS finished: base={}, best={}, improved={}, sequence_len={}",
+        base_clique_count, best_count, improved, best_sequence.len()
+    );
+
     VdsRunResult {
-        edges_to_flip: Vec::new(),
-        final_clique_count: base_clique_count,
-        improved: false,
+        edges_to_flip: best_sequence,
+        final_clique_count: best_count,
+        improved,
     }
 }
 
@@ -113,26 +130,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_vds_stub_returns_no_improvement() {
-        let mut graph = make_k4_graph();
-        let all_cliques = get_all_cliques(&mut graph, 3);
-        let mut cc = CliqueCollection::new(4);
-        cc.set_cliques(all_cliques.clone(), 4);
-
-        let config = VdsConfig {
-            max_depth: 4,
-            top_first_edges: 10,
-            branching_factor: 5,
-            worsening_tolerance: 100,
-            random_seed: None,
-        };
-
-        let result = run_vds(&graph, 3, &config, &cc, all_cliques.len() as i32);
-        assert!(!result.improved);
-        assert!(result.edges_to_flip.is_empty());
-    }
-
-    #[test]
     fn test_rank_edges_by_participation_orders_high_first() {
         // K4 as red-complete: all 6 edges present
         let mut graph = make_k4_graph();
@@ -144,6 +141,36 @@ mod tests {
         assert_eq!(ranked.len(), 6); // all 6 edges of K4
         // In K4 with triangles as cliques, every edge is in exactly 2 triangles,
         // so the order is stable but participation counts are equal. Just assert length.
+    }
+
+    #[test]
+    fn test_run_vds_depth_1_finds_obvious_improvement() {
+        // K5 red-complete: all 10 edges present.
+        // K5 has C(5,3) = 10 red triangles, 0 blue triangles.
+        // Each edge of K5 is in exactly 3 triangles.
+        // Flipping one edge breaks 3 red triangles and creates 0 blue triangles
+        // (would need 3 missing red edges to form a blue triangle, but only 1 edge is flipped).
+        // Expected: 10 - 3 = 7 triangles after flipping one edge.
+        let bitstring = "1111111111".to_string(); // 10 edges in upper triangle of K5
+        let mut graph = Graph::from_bitstring(&bitstring, 5);
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let base_total = all_cliques.len() as i32;
+        let mut cc = CliqueCollection::new(5);
+        cc.set_cliques(all_cliques, 5);
+
+        let config = VdsConfig {
+            max_depth: 1,
+            top_first_edges: 10,
+            branching_factor: 10,
+            worsening_tolerance: 10000,
+            random_seed: Some(42),
+        };
+
+        let result = run_vds(&graph, 3, &config, &cc, base_total);
+        assert!(result.improved, "depth-1 VDS must find an improvement on K5");
+        assert_eq!(result.edges_to_flip.len(), 1);
+        assert!(result.final_clique_count < base_total);
+        assert_eq!(result.final_clique_count, 7);
     }
 
     #[test]
