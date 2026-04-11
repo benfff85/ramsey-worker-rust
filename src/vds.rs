@@ -1,7 +1,14 @@
+use std::collections::HashSet;
+
 use crate::algorithm::get_new_cliques_with_limit;
 use crate::clique_collection::CliqueCollection;
 use crate::graph::{Graph, WorkUnitEdge};
 use crate::log_info;
+
+struct SearchState {
+    best_sequence: Vec<WorkUnitEdge>,
+    best_count: i32,
+}
 
 pub struct VdsConfig {
     pub max_depth: usize,
@@ -94,27 +101,171 @@ pub fn run_vds(
     let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
     let candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
 
-    let mut best_count = base_clique_count;
-    let mut best_sequence: Vec<WorkUnitEdge> = Vec::new();
+    let mut state = SearchState {
+        best_sequence: Vec::new(),
+        best_count: base_clique_count,
+    };
+    let mut current_sequence: Vec<WorkUnitEdge> = Vec::new();
+    let mut destroyed: HashSet<u32> = HashSet::new();
 
-    for edge in &candidates {
-        let count = evaluate_flip(&mut working_graph, clique_collection, edge, clique_size, base_clique_count);
-        if count < best_count {
-            best_count = count;
-            best_sequence = vec![edge.clone()];
+    for first_edge in &candidates {
+        // Compute delta for this first flip
+        let delta = compute_delta(&mut working_graph, clique_collection, first_edge, clique_size, &destroyed);
+
+        // Apply the flip and update destroyed set
+        let destroyed_now: Vec<u32> = clique_collection
+            .get_cliques_containing_edge(first_edge)
+            .iter()
+            .filter(|c| !destroyed.contains(c))
+            .copied()
+            .collect();
+        working_graph.flip_edges(&[first_edge.clone()]);
+        for c in &destroyed_now {
+            destroyed.insert(*c);
         }
+        current_sequence.push(first_edge.clone());
+
+        let cumulative = base_clique_count + delta;
+        if cumulative < state.best_count {
+            state.best_count = cumulative;
+            state.best_sequence = current_sequence.clone();
+        }
+
+        // Recurse into deeper levels
+        if config.max_depth >= 2 {
+            search_depth(
+                &mut working_graph, clique_collection, clique_size,
+                cumulative, 2, config.max_depth,
+                &mut destroyed, &mut current_sequence,
+                &mut state, config, base_clique_count,
+            );
+        }
+
+        // Backtrack: unflip, restore destroyed set
+        working_graph.flip_edges(&[first_edge.clone()]);
+        for c in &destroyed_now {
+            destroyed.remove(c);
+        }
+        current_sequence.pop();
     }
 
-    let improved = !best_sequence.is_empty();
-    log_info!(
-        "VDS finished: base={}, best={}, improved={}, sequence_len={}",
-        base_clique_count, best_count, improved, best_sequence.len()
-    );
+    let improved = !state.best_sequence.is_empty() && state.best_count < base_clique_count;
+
+    // Final verification: apply the best sequence and recount comprehensively.
+    // If the running-delta was optimistic (tracker bug), bail out.
+    if improved {
+        let mut verify_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
+        verify_graph.flip_edges(&state.best_sequence);
+        let verified_count = crate::algorithm::get_cliques_comprehensive(&mut verify_graph, clique_size);
+        if verified_count != state.best_count {
+            log_info!(
+                "VDS verification MISMATCH: tracker said {}, comprehensive says {} — skipping submission",
+                state.best_count, verified_count
+            );
+            return VdsRunResult {
+                edges_to_flip: Vec::new(),
+                final_clique_count: base_clique_count,
+                improved: false,
+            };
+        }
+        log_info!(
+            "VDS verified: base={}, final={}, sequence_len={}",
+            base_clique_count, verified_count, state.best_sequence.len()
+        );
+    } else {
+        log_info!("VDS finished: no improvement found");
+    }
 
     VdsRunResult {
-        edges_to_flip: best_sequence,
-        final_clique_count: best_count,
+        edges_to_flip: state.best_sequence,
+        final_clique_count: state.best_count,
         improved,
+    }
+}
+
+fn compute_delta(
+    working_graph: &mut Graph,
+    clique_collection: &CliqueCollection,
+    edge: &WorkUnitEdge,
+    clique_size: usize,
+    destroyed: &HashSet<u32>,
+) -> i32 {
+    // Broken = cliques in CC containing this edge MINUS those already destroyed
+    let broken: i32 = clique_collection
+        .get_cliques_containing_edge(edge)
+        .iter()
+        .filter(|c| !destroyed.contains(c))
+        .count() as i32;
+
+    working_graph.flip_edges(&[edge.clone()]);
+    let (new, _) = get_new_cliques_with_limit(working_graph, clique_size, &[edge.clone()], i32::MAX);
+    working_graph.flip_edges(&[edge.clone()]); // restore
+    -broken + new
+}
+
+fn search_depth(
+    working_graph: &mut Graph,
+    clique_collection: &CliqueCollection,
+    clique_size: usize,
+    cumulative_count: i32,
+    current_depth: usize,
+    max_depth: usize,
+    destroyed: &mut HashSet<u32>,
+    current_sequence: &mut Vec<WorkUnitEdge>,
+    state: &mut SearchState,
+    config: &VdsConfig,
+    base_clique_count: i32,
+) {
+    // Generate and rank candidates for this level (top branching_factor).
+    // Rank from the ORIGINAL clique_collection (fast); could be refined per-depth.
+    let candidates = rank_edges_by_participation(working_graph, clique_collection, config.branching_factor);
+
+    for edge in &candidates {
+        // Skip edges already in the sequence (prevents same-edge-twice no-op)
+        if current_sequence.iter().any(|e| e.vertex_one == edge.vertex_one && e.vertex_two == edge.vertex_two) {
+            continue;
+        }
+
+        let delta = compute_delta(working_graph, clique_collection, edge, clique_size, destroyed);
+        let new_cumulative = cumulative_count + delta;
+
+        // Worsening tolerance: prune branches that go too far above baseline
+        if new_cumulative - base_clique_count > config.worsening_tolerance {
+            continue;
+        }
+
+        // Apply
+        let destroyed_now: Vec<u32> = clique_collection
+            .get_cliques_containing_edge(edge)
+            .iter()
+            .filter(|c| !destroyed.contains(c))
+            .copied()
+            .collect();
+        working_graph.flip_edges(&[edge.clone()]);
+        for c in &destroyed_now {
+            destroyed.insert(*c);
+        }
+        current_sequence.push(edge.clone());
+
+        if new_cumulative < state.best_count {
+            state.best_count = new_cumulative;
+            state.best_sequence = current_sequence.clone();
+        }
+
+        if current_depth < max_depth {
+            search_depth(
+                working_graph, clique_collection, clique_size,
+                new_cumulative, current_depth + 1, max_depth,
+                destroyed, current_sequence, state, config, base_clique_count,
+            );
+        }
+
+        // Backtrack
+        working_graph.flip_edges(&[edge.clone()]);
+        for c in &destroyed_now {
+            destroyed.remove(c);
+        }
+        current_sequence.pop();
     }
 }
 
@@ -171,6 +322,53 @@ mod tests {
         assert_eq!(result.edges_to_flip.len(), 1);
         assert!(result.final_clique_count < base_total);
         assert_eq!(result.final_clique_count, 7);
+    }
+
+    #[test]
+    fn test_run_vds_depth_2_escapes_local_minimum() {
+        // Empty graph on 6 vertices: 0 red triangles, but C(6,3) = 20 blue triangles.
+        //
+        // Flipping (0,1) red: still 0 red triangles, blue triangles = 20 - 4 = 16
+        // (edge (0,1) was in 4 blue triangles: {0,1,x} for x in {2,3,4,5}).
+        //
+        // Flipping (0,1) then (2,3) red: red triangles = 0 (no two red edges share a vertex),
+        // blue triangles = 20 - 4 - 4 = 12 (no overlap between the two destroyed sets).
+        //
+        // So depth-1 finds (0,1) → 16, depth-2 finds (0,1)+(2,3) → 12.
+        let bitstring = "000000000000000".to_string(); // 15 edges, all absent
+        let mut graph = Graph::from_bitstring(&bitstring, 6);
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let base_total = all_cliques.len() as i32;
+        let mut cc = CliqueCollection::new(6);
+        cc.set_cliques(all_cliques, 6);
+
+        let config_d1 = VdsConfig {
+            max_depth: 1,
+            top_first_edges: 15,
+            branching_factor: 15,
+            worsening_tolerance: 10000,
+            random_seed: Some(42),
+        };
+        let result_d1 = run_vds(&graph, 3, &config_d1, &cc, base_total);
+
+        let config_d2 = VdsConfig {
+            max_depth: 2,
+            top_first_edges: 15,
+            branching_factor: 15,
+            worsening_tolerance: 10000,
+            random_seed: Some(42),
+        };
+        let result_d2 = run_vds(&graph, 3, &config_d2, &cc, base_total);
+
+        assert!(result_d1.improved);
+        assert!(result_d2.improved);
+        assert!(
+            result_d2.final_clique_count < result_d1.final_clique_count,
+            "depth-2 ({}) must beat depth-1 ({})",
+            result_d2.final_clique_count,
+            result_d1.final_clique_count
+        );
+        assert!(result_d2.edges_to_flip.len() >= 2);
     }
 
     #[test]
