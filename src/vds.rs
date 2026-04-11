@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Instant;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -12,6 +13,17 @@ use crate::log_info;
 struct SearchState {
     best_sequence: Vec<WorkUnitEdge>,
     best_count: i32,
+}
+
+/// Per-run search statistics, updated as run_vds and search_depth iterate.
+/// `nodes_visited` is the total number of candidate edges evaluated across
+/// all depths (each evaluation is one Bron-Kerbosch new-clique enumeration).
+/// `branches_pruned` is the count of subtree skips from the worsening_tolerance
+/// guard at depth >= 2.
+#[derive(Default)]
+struct SearchStats {
+    nodes_visited: u64,
+    branches_pruned: u64,
 }
 
 pub struct VdsConfig {
@@ -126,9 +138,12 @@ pub fn run_vds(
     };
     let mut current_sequence: Vec<WorkUnitEdge> = Vec::new();
     let mut destroyed: HashSet<u32> = HashSet::new();
+    let mut stats = SearchStats::default();
+    let started = Instant::now();
 
     for first_edge in &candidates {
         // Compute delta for this first flip
+        stats.nodes_visited += 1;
         let delta = compute_delta(&mut working_graph, clique_collection, first_edge, clique_size, &destroyed);
 
         // Apply the flip and update destroyed set
@@ -157,6 +172,7 @@ pub fn run_vds(
                 cumulative, 2, config.max_depth,
                 &mut destroyed, &mut current_sequence,
                 &mut state, config, base_clique_count,
+                &mut stats,
             );
         }
 
@@ -168,6 +184,8 @@ pub fn run_vds(
         current_sequence.pop();
     }
 
+    let elapsed_ms = started.elapsed().as_millis();
+
     let improved = !state.best_sequence.is_empty() && state.best_count < base_clique_count;
 
     // Final verification: apply the best sequence and recount comprehensively.
@@ -178,8 +196,10 @@ pub fn run_vds(
         let verified_count = crate::algorithm::get_cliques_comprehensive(&mut verify_graph, clique_size);
         if verified_count != state.best_count {
             log_info!(
-                "VDS verification MISMATCH: tracker said {}, comprehensive says {} — skipping submission",
-                state.best_count, verified_count
+                "VDS verification MISMATCH: tracker said {}, comprehensive says {} — skipping submission \
+                 (elapsed_ms={}, nodes_visited={}, branches_pruned={})",
+                state.best_count, verified_count,
+                elapsed_ms, stats.nodes_visited, stats.branches_pruned
             );
             return VdsRunResult {
                 edges_to_flip: Vec::new(),
@@ -188,11 +208,18 @@ pub fn run_vds(
             };
         }
         log_info!(
-            "VDS verified: base={}, final={}, sequence_len={}",
-            base_clique_count, verified_count, state.best_sequence.len()
+            "VDS verified: base={}, final={}, delta={}, sequence_len={}, \
+             elapsed_ms={}, nodes_visited={}, branches_pruned={}",
+            base_clique_count, verified_count,
+            verified_count - base_clique_count,
+            state.best_sequence.len(),
+            elapsed_ms, stats.nodes_visited, stats.branches_pruned
         );
     } else {
-        log_info!("VDS finished: no improvement found");
+        log_info!(
+            "VDS finished: no improvement found, elapsed_ms={}, nodes_visited={}, branches_pruned={}",
+            elapsed_ms, stats.nodes_visited, stats.branches_pruned
+        );
     }
 
     VdsRunResult {
@@ -234,6 +261,7 @@ fn search_depth(
     state: &mut SearchState,
     config: &VdsConfig,
     base_clique_count: i32,
+    stats: &mut SearchStats,
 ) {
     // Generate and rank candidates for this level (top branching_factor).
     // Rank from the ORIGINAL clique_collection (fast); could be refined per-depth.
@@ -245,11 +273,13 @@ fn search_depth(
             continue;
         }
 
+        stats.nodes_visited += 1;
         let delta = compute_delta(working_graph, clique_collection, edge, clique_size, destroyed);
         let new_cumulative = cumulative_count + delta;
 
         // Worsening tolerance: prune branches that go too far above baseline
         if new_cumulative - base_clique_count > config.worsening_tolerance {
+            stats.branches_pruned += 1;
             continue;
         }
 
@@ -276,6 +306,7 @@ fn search_depth(
                 working_graph, clique_collection, clique_size,
                 new_cumulative, current_depth + 1, max_depth,
                 destroyed, current_sequence, state, config, base_clique_count,
+                stats,
             );
         }
 
