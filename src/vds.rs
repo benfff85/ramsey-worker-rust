@@ -326,6 +326,8 @@ mod tests {
 
     #[test]
     fn test_run_vds_depth_2_escapes_local_minimum() {
+        use crate::algorithm::get_cliques_comprehensive;
+
         // Empty graph on 6 vertices: 0 red triangles, but C(6,3) = 20 blue triangles.
         //
         // Flipping (0,1) red: still 0 red triangles, blue triangles = 20 - 4 = 16
@@ -362,13 +364,37 @@ mod tests {
 
         assert!(result_d1.improved);
         assert!(result_d2.improved);
+        assert_eq!(result_d1.final_clique_count, 16, "depth-1 should reach 16");
+        assert_eq!(result_d2.final_clique_count, 12, "depth-2 should reach 12");
         assert!(
             result_d2.final_clique_count < result_d1.final_clique_count,
             "depth-2 ({}) must beat depth-1 ({})",
             result_d2.final_clique_count,
             result_d1.final_clique_count
         );
-        assert!(result_d2.edges_to_flip.len() >= 2);
+        assert_eq!(result_d2.edges_to_flip.len(), 2, "depth-2 sequence should be exactly 2 flips");
+
+        // Independent verification: apply the reported edges to a fresh graph and
+        // recount comprehensively. This must equal final_clique_count, otherwise
+        // the tracker delta diverged from ground truth.
+        let mut verify_graph = Graph::from_bitstring(&graph.to_bitstring(), graph.vertex_count);
+        verify_graph.flip_edges(&result_d2.edges_to_flip);
+        let verified = get_cliques_comprehensive(&mut verify_graph, 3);
+        assert_eq!(
+            verified, result_d2.final_clique_count,
+            "comprehensive recount ({}) must match VDS-reported count ({})",
+            verified, result_d2.final_clique_count
+        );
+
+        // Same independent check for depth-1.
+        let mut verify_graph_d1 = Graph::from_bitstring(&graph.to_bitstring(), graph.vertex_count);
+        verify_graph_d1.flip_edges(&result_d1.edges_to_flip);
+        let verified_d1 = get_cliques_comprehensive(&mut verify_graph_d1, 3);
+        assert_eq!(
+            verified_d1, result_d1.final_clique_count,
+            "depth-1 comprehensive recount ({}) must match VDS-reported count ({})",
+            verified_d1, result_d1.final_clique_count
+        );
     }
 
     #[test]
