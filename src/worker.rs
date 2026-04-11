@@ -120,7 +120,9 @@ impl Worker {
         let client_data = Client {
             client_id: None,
             campaign_id: self.campaign_id,
-            type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING } else { ClientType::CLIQUECHECKER },
+            type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING }
+                   else if self.vds_mode { ClientType::VARIABLE_DEPTH_SEARCH }
+                   else { ClientType::CLIQUECHECKER },
             status: ClientStatus::ACTIVE,
             created_date: Some(
                 Utc::now()
@@ -169,7 +171,9 @@ impl Worker {
                 let hb_client = Client {
                     client_id: self.client_id,
                     campaign_id: self.campaign_id,
-                    type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING } else { ClientType::CLIQUECHECKER },
+                    type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING }
+                           else if self.vds_mode { ClientType::VARIABLE_DEPTH_SEARCH }
+                           else { ClientType::CLIQUECHECKER },
                     status: ClientStatus::ACTIVE,
                     created_date: None,
                     last_phone_home_date: Some(
@@ -233,6 +237,8 @@ impl Worker {
 
         if self.sa_mode {
             self.cycle_simulated_annealing(stage_id).await
+        } else if self.vds_mode {
+            self.cycle_variable_depth_search(stage_id).await
         } else {
             self.cycle_counter_based(stage_id).await
         }
@@ -492,6 +498,83 @@ impl Worker {
         }
 
         // Return 1 to indicate work was done (avoids poll sleep)
+        Ok(1)
+    }
+
+    async fn cycle_variable_depth_search(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
+        // Ensure we have stage config cached
+        if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
+            let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            if let Some(config) = redis_client.get_stage_config(stage_id).await? {
+                log_info!(
+                    "VDS: Loaded stage config: baseGraphId={}, strategy={:?}",
+                    config.base_graph_id,
+                    config.strategy
+                );
+                self.stage_config = Some(config);
+            } else {
+                return Err(
+                    format!("Stage config not found in Redis for stage {}", stage_id).into(),
+                );
+            }
+        }
+
+        let config = self.stage_config.as_ref().unwrap();
+        let base_graph_id = config.base_graph_id;
+
+        // Build graph and CliqueCollection from stage config.
+        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
+        let base_clique_count = all_cliques.len() as i32;
+        let mut clique_collection = CliqueCollection::new(self.vertex_count);
+        clique_collection.set_cliques(all_cliques, self.vertex_count);
+
+        // Recount cliques after get_all_cliques (which may mutate graph state)
+        get_cliques_comprehensive(&mut base_graph, self.clique_size);
+
+        // Get current threshold for top-N filtering
+        let threshold: Option<i32> = {
+            let redis = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            redis
+                .get_top_results_threshold(stage_id, self.top_results_count)
+                .await
+                .unwrap_or(None)
+        };
+
+        // Run one complete VDS
+        let result = run_vds(
+            &base_graph,
+            self.clique_size,
+            &self.vds_config,
+            &clique_collection,
+            base_clique_count,
+        );
+
+        // Submit best result to Redis if it improved and beats the threshold
+        let should_submit = result.improved && match threshold {
+            None => true,
+            Some(t) => result.final_clique_count < t,
+        };
+
+        if should_submit {
+            if let Some(redis) = self.redis_client.as_mut() {
+                let _ = redis
+                    .add_to_top_results(
+                        stage_id,
+                        base_graph_id,
+                        &result.edges_to_flip,
+                        result.final_clique_count,
+                        self.top_results_count,
+                    )
+                    .await;
+            }
+        }
+
+        // Update processed count (1 per VDS run)
+        if let Some(redis) = self.redis_client.as_mut() {
+            let _ = redis.increment_processed_count(stage_id, 1).await;
+        }
+
         Ok(1)
     }
 
