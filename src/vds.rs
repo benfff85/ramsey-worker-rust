@@ -1,3 +1,4 @@
+use crate::algorithm::get_new_cliques_with_limit;
 use crate::clique_collection::CliqueCollection;
 use crate::graph::{Graph, WorkUnitEdge};
 use crate::log_info;
@@ -14,6 +15,28 @@ pub struct VdsRunResult {
     pub edges_to_flip: Vec<WorkUnitEdge>,
     pub final_clique_count: i32,
     pub improved: bool,
+}
+
+/// Compute the clique count that would result from flipping `edge`, without
+/// permanently modifying the graph. Uses the incremental formula:
+///   new_total = base_total - broken_cliques + new_cliques
+/// where `broken_cliques` is read from the (pristine) CliqueCollection and
+/// `new_cliques` is computed via seeded Bron-Kerbosch on the flipped graph.
+///
+/// This is the correctness oracle for depth-1 VDS. At depth >= 2 the caller
+/// must track `destroyed_cliques` to adjust `broken_cliques` for prior flips.
+pub fn evaluate_flip(
+    graph: &mut Graph,
+    clique_collection: &CliqueCollection,
+    edge: &WorkUnitEdge,
+    clique_size: usize,
+    base_total: i32,
+) -> i32 {
+    let broken = clique_collection.get_count_of_cliques_containing_edges(&[edge.clone()]);
+    graph.flip_edges(&[edge.clone()]);
+    let (new, _) = get_new_cliques_with_limit(graph, clique_size, &[edge.clone()], i32::MAX);
+    graph.flip_edges(&[edge.clone()]); // unflip (restore)
+    base_total - broken + new
 }
 
 /// Return the top-K edges (across both colors) ranked by the number of cliques
@@ -121,5 +144,30 @@ mod tests {
         assert_eq!(ranked.len(), 6); // all 6 edges of K4
         // In K4 with triangles as cliques, every edge is in exactly 2 triangles,
         // so the order is stable but participation counts are equal. Just assert length.
+    }
+
+    #[test]
+    fn test_evaluate_flip_matches_comprehensive_count() {
+        use crate::algorithm::get_cliques_comprehensive;
+
+        let mut graph = make_k4_graph();
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let base_total = all_cliques.len() as i32;
+        let mut cc = CliqueCollection::new(4);
+        cc.set_cliques(all_cliques, 4);
+
+        // Recount for a clean baseline
+        let verified_base = get_cliques_comprehensive(&mut graph, 3);
+        assert_eq!(verified_base, base_total);
+
+        // Flip edge (0,1) and verify evaluate_flip predicts the comprehensive result
+        let edge = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };
+        let predicted = evaluate_flip(&mut graph, &cc, &edge, 3, base_total);
+
+        graph.flip_edges(&[edge.clone()]);
+        let actual = get_cliques_comprehensive(&mut graph, 3);
+        graph.flip_edges(&[edge]); // restore
+
+        assert_eq!(predicted, actual, "evaluate_flip prediction must match comprehensive");
     }
 }
