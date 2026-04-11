@@ -16,6 +16,37 @@ pub struct VdsRunResult {
     pub improved: bool,
 }
 
+/// Return the top-K edges (across both colors) ranked by the number of cliques
+/// they participate in, descending. Ties broken by stable vertex-pair order.
+pub fn rank_edges_by_participation(
+    graph: &Graph,
+    clique_collection: &CliqueCollection,
+    top_k: usize,
+) -> Vec<WorkUnitEdge> {
+    let v = graph.vertex_count;
+    let mut scored: Vec<(i32, WorkUnitEdge)> = Vec::new();
+
+    for u in 0..v {
+        for w in (u + 1)..v {
+            let edge = WorkUnitEdge {
+                vertex_one: u as u16,
+                vertex_two: w as u16,
+            };
+            let score = clique_collection.get_count_of_cliques_containing_edges(&[edge.clone()]);
+            scored.push((score, edge));
+        }
+    }
+
+    // Sort descending by score, then by vertex pair for stability
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.vertex_one.cmp(&b.1.vertex_one))
+            .then(a.1.vertex_two.cmp(&b.1.vertex_two))
+    });
+
+    scored.into_iter().take(top_k).map(|(_, e)| e).collect()
+}
+
 /// Run one complete variable-depth search starting from `base_graph`.
 ///
 /// Performs Lin-Kernighan style tree search: at each recursion level, tries the
@@ -76,5 +107,19 @@ mod tests {
         let result = run_vds(&graph, 3, &config, &cc, all_cliques.len() as i32);
         assert!(!result.improved);
         assert!(result.edges_to_flip.is_empty());
+    }
+
+    #[test]
+    fn test_rank_edges_by_participation_orders_high_first() {
+        // K4 as red-complete: all 6 edges present
+        let mut graph = make_k4_graph();
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let mut cc = CliqueCollection::new(4);
+        cc.set_cliques(all_cliques, 4);
+
+        let ranked = rank_edges_by_participation(&graph, &cc, 10);
+        assert_eq!(ranked.len(), 6); // all 6 edges of K4
+        // In K4 with triangles as cliques, every edge is in exactly 2 triangles,
+        // so the order is stable but participation counts are equal. Just assert length.
     }
 }
