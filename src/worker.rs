@@ -8,6 +8,7 @@ use crate::model::{
 };
 use crate::redis_client::RedisClient;
 use crate::sa::{SaConfig, run_sa};
+use crate::vds::{VdsConfig, run_vds};
 use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -38,6 +39,9 @@ pub struct Worker {
     // Simulated annealing mode config
     sa_mode: bool,
     sa_config: SaConfig,
+    // Variable-depth search mode config
+    vds_mode: bool,
+    vds_config: VdsConfig,
 }
 
 impl Worker {
@@ -58,6 +62,12 @@ impl Worker {
         sa_cooling_rate: f64,
         sa_min_pairs: usize,
         sa_max_pairs: usize,
+        vds_mode: bool,
+        vds_max_depth: usize,
+        vds_top_first_edges: usize,
+        vds_branching_factor: usize,
+        vds_worsening_tolerance: i32,
+        vds_random_seed: Option<u64>,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -85,6 +95,14 @@ impl Worker {
                 cooling_rate: sa_cooling_rate,
                 min_pairs: sa_min_pairs,
                 max_pairs: sa_max_pairs,
+            },
+            vds_mode,
+            vds_config: VdsConfig {
+                max_depth: vds_max_depth,
+                top_first_edges: vds_top_first_edges,
+                branching_factor: vds_branching_factor,
+                worsening_tolerance: vds_worsening_tolerance,
+                random_seed: vds_random_seed,
             },
         }
     }
