@@ -52,6 +52,30 @@ impl BitMatrix {
         self.data[BITSET_WORDS - 1] &= (1u64 << (BITSET_SIZE % 64)) - 1;
     }
 
+    /// Clear all bits at indices >= `threshold`. No-op if threshold >= BITSET_SIZE.
+    /// Used after `invert_all()` when the active vertex count is smaller than BITSET_SIZE,
+    /// so unused vertex slots don't appear as neighbors.
+    #[inline]
+    pub fn clear_above(&mut self, threshold: usize) {
+        if threshold >= BITSET_SIZE {
+            return;
+        }
+        let word_idx = threshold / 64;
+        let bit_in_word = threshold % 64;
+        if bit_in_word > 0 {
+            // Keep only bits below `bit_in_word` in this word.
+            let mask = (1u64 << bit_in_word) - 1;
+            self.data[word_idx] &= mask;
+            for i in (word_idx + 1)..BITSET_WORDS {
+                self.data[i] = 0;
+            }
+        } else {
+            for i in word_idx..BITSET_WORDS {
+                self.data[i] = 0;
+            }
+        }
+    }
+
     #[inline]
     pub fn cardinality(&self) -> u32 {
         self.data[0].count_ones()

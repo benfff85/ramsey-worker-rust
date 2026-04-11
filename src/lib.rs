@@ -8,4 +8,5 @@ pub mod logging;
 pub mod model;
 pub mod redis_client;
 pub mod sa;
+pub mod vds;
 pub mod worker;

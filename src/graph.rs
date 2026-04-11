@@ -54,6 +54,13 @@ impl Graph {
             self.adjacency[i].invert_all();
             // Clear the self-loop bit (diagonal)
             self.adjacency[i].clear(i);
+            // Clear any "neighbors" beyond vertex_count: a vertex slot that doesn't
+            // exist must not appear as a neighbor of an existing vertex. invert_all()
+            // already cleared the BITSET padding (288..320), so we only need this when
+            // vertex_count < BITSET_SIZE — a no-op for production (vertex_count = 288).
+            if self.vertex_count < BITSET_SIZE {
+                self.adjacency[i].clear_above(self.vertex_count);
+            }
         }
     }
 
