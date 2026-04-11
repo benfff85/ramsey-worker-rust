@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+
 use crate::algorithm::get_new_cliques_with_limit;
 use crate::clique_collection::CliqueCollection;
 use crate::graph::{Graph, WorkUnitEdge};
@@ -99,7 +103,22 @@ pub fn run_vds(
     );
 
     let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
-    let candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
+    let mut candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
+
+    // Shuffle the top-K first-edge candidates so concurrent workers (and successive
+    // calls from the same worker) explore different start points instead of all
+    // hammering the same highest-participation edge first. We still benefit from the
+    // top_first_edges cutoff, which keeps the candidate pool focused on edges that
+    // touch many cliques — shuffling only reorders within that pool.
+    //
+    // Seeding rule:
+    //   Some(seed) → deterministic StdRng (for tests / reproducibility)
+    //   None       → fresh OS entropy each call (production default)
+    let mut rng: StdRng = match config.random_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_os_rng(),
+    };
+    candidates.shuffle(&mut rng);
 
     let mut state = SearchState {
         best_sequence: Vec::new(),
