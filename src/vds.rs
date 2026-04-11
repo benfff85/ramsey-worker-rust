@@ -1,0 +1,80 @@
+use crate::clique_collection::CliqueCollection;
+use crate::graph::{Graph, WorkUnitEdge};
+use crate::log_info;
+
+pub struct VdsConfig {
+    pub max_depth: usize,
+    pub top_first_edges: usize,
+    pub branching_factor: usize,
+    pub worsening_tolerance: i32,
+    pub random_seed: Option<u64>,
+}
+
+pub struct VdsRunResult {
+    pub edges_to_flip: Vec<WorkUnitEdge>,
+    pub final_clique_count: i32,
+    pub improved: bool,
+}
+
+/// Run one complete variable-depth search starting from `base_graph`.
+///
+/// Performs Lin-Kernighan style tree search: at each recursion level, tries the
+/// top-K candidate edge flips and records the best cumulative delta found.
+/// Returns the best improving edge sequence (possibly empty if no improvement).
+///
+/// `clique_collection` must be built from `base_graph`.
+pub fn run_vds(
+    base_graph: &Graph,
+    clique_size: usize,
+    config: &VdsConfig,
+    clique_collection: &CliqueCollection,
+    base_clique_count: i32,
+) -> VdsRunResult {
+    log_info!(
+        "VDS starting: vertex_count={}, clique_size={}, base_cliques={}, \
+         max_depth={}, top_first_edges={}, branching_factor={}, worsening_tolerance={}",
+        base_graph.vertex_count, clique_size, base_clique_count,
+        config.max_depth, config.top_first_edges, config.branching_factor, config.worsening_tolerance
+    );
+
+    let _ = clique_collection;
+
+    // Stub: return no improvement
+    VdsRunResult {
+        edges_to_flip: Vec::new(),
+        final_clique_count: base_clique_count,
+        improved: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithm::get_all_cliques;
+
+    fn make_k4_graph() -> Graph {
+        // K4 complete graph on 4 vertices: all edges red
+        let bitstring = "111111".to_string(); // 6 edges in upper triangle: (0,1)(0,2)(0,3)(1,2)(1,3)(2,3)
+        Graph::from_bitstring(&bitstring, 4)
+    }
+
+    #[test]
+    fn test_run_vds_stub_returns_no_improvement() {
+        let mut graph = make_k4_graph();
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let mut cc = CliqueCollection::new(4);
+        cc.set_cliques(all_cliques.clone(), 4);
+
+        let config = VdsConfig {
+            max_depth: 4,
+            top_first_edges: 10,
+            branching_factor: 5,
+            worsening_tolerance: 100,
+            random_seed: None,
+        };
+
+        let result = run_vds(&graph, 3, &config, &cc, all_cliques.len() as i32);
+        assert!(!result.improved);
+        assert!(result.edges_to_flip.is_empty());
+    }
+}
