@@ -30,11 +30,6 @@ async fn main() {
         .parse()
         .expect("WORK_UNIT_POLL_FREQ must be a number");
 
-    let heartbeat_interval_ms: u64 = env::var("CLIENT_PHONE_HOME_FREQ")
-        .unwrap_or_else(|_| "60000".to_string())
-        .parse()
-        .expect("CLIENT_PHONE_HOME_FREQ must be a number");
-
     let fetch_size: i32 = env::var("WORK_UNIT_FETCH_COUNT")
         .unwrap_or_else(|_| "50000".to_string())
         .parse()
@@ -130,7 +125,6 @@ async fn main() {
         clique_size,
         campaign_id,
         poll_interval_ms,
-        heartbeat_interval_ms,
         fetch_size,
         publish_size,
         publish_results,

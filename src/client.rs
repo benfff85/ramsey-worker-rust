@@ -1,5 +1,5 @@
 use crate::log_error;
-use crate::model::{Campaign, Client, GraphData, WorkResult};
+use crate::model::{Campaign, GraphData, WorkResult};
 use reqwest::Client as HttpClient;
 use std::error::Error;
 use std::time::Duration;
@@ -139,29 +139,4 @@ impl MiddlewareClient {
         .await
     }
 
-    pub async fn create_client(&self, client: &Client) -> Result<Client, Box<dyn Error>> {
-        let url = format!("{}/clients", self.base_url);
-        let response = self.client.post(&url).json(client).send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            log_error!("DEBUG: Server returned error: {} - {}", status, text);
-            return Err(format!("Server error: {} - {}", status, text).into());
-        }
-
-        let created_client = response.json::<Client>().await?;
-        Ok(created_client)
-    }
-
-    pub async fn update_client(&self, client: &Client) -> Result<(), Box<dyn Error>> {
-        if let Some(id) = &client.client_id {
-            let url = format!("{}/clients/{}", self.base_url, id);
-            let response = self.client.put(&url).json(client).send().await?;
-            if !response.status().is_success() {
-                return Err(format!("Failed to update client: {}", response.status()).into());
-            }
-        }
-        Ok(())
-    }
 }

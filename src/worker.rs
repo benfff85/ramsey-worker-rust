@@ -3,9 +3,7 @@ use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, create_enumerator};
 use crate::graph::Graph;
-use crate::model::{
-    Client, ClientStatus, ClientType, StageConfig, WorkResult, WorkUnitAnalysisType,
-};
+use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::RedisClient;
 use crate::sa::{SaConfig, run_sa};
 use crate::vds::{VdsConfig, run_vds};
@@ -13,19 +11,17 @@ use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::error::Error;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::sleep;
 
 pub struct Worker {
     mw_client: MiddlewareClient,
     redis_client: Option<RedisClient>,
-    client_id: Option<i32>,
     clique_size: usize,
     vertex_count: usize,
     graph_cache: HashMap<i32, Graph>,
     clique_collection_cache: HashMap<i32, CliqueCollection>,
     poll_interval: Duration,
-    heartbeat_interval: Duration,
     fetch_size: i32,
     publish_size: i32,
     campaign_id: i32,
@@ -51,7 +47,6 @@ impl Worker {
         clique_size: usize,
         campaign_id: i32,
         poll_interval_ms: u64,
-        heartbeat_interval_ms: u64,
         fetch_size: i32,
         publish_size: i32,
         publish_results: bool,
@@ -72,13 +67,11 @@ impl Worker {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
             redis_client: None,
-            client_id: None,
             vertex_count,
             clique_size,
             graph_cache: HashMap::new(),
             clique_collection_cache: HashMap::new(),
             poll_interval: Duration::from_millis(poll_interval_ms),
-            heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
             fetch_size,
             publish_size,
             campaign_id,
@@ -114,87 +107,27 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn register(&mut self) -> Result<(), Box<dyn Error>> {
-        log_info!("Registering worker with campaign ID: {}", self.campaign_id);
-
-        let client_data = Client {
-            client_id: None,
-            campaign_id: self.campaign_id,
-            type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING }
-                   else if self.vds_mode { ClientType::VARIABLE_DEPTH_SEARCH }
-                   else { ClientType::CLIQUECHECKER },
-            status: ClientStatus::ACTIVE,
-            created_date: Some(
-                Utc::now()
-                    .naive_utc()
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ),
-            last_phone_home_date: Some(
-                Utc::now()
-                    .naive_utc()
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ),
-        };
+    pub async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
+        log_info!("Initializing worker for campaign ID: {}", self.campaign_id);
 
         let campaign = self.mw_client.get_campaign(self.campaign_id).await?;
         log_info!("Campaign Info: {:?}", campaign);
         self.vertex_count = campaign.vertex_count as usize;
         self.clique_size = campaign.subgraph_size as usize;
 
-        let registered_client = self.mw_client.create_client(&client_data).await?;
-        if let Some(id) = registered_client.client_id {
-            self.client_id = Some(id);
-            log_info!("Registered with Client ID: {}", id);
-        }
-
         Ok(())
     }
 
     pub async fn run(&mut self) {
-        if let Err(e) = self.register().await {
-            log_error!("Failed to register: {}", e);
+        if let Err(e) = self.initialize().await {
+            log_error!("Failed to initialize: {}", e);
             return;
         }
 
-        log_info!(
-            "Worker started for client: {}",
-            self.client_id.as_ref().unwrap()
-        );
-
-        let mut last_heartbeat = Instant::now();
+        log_info!("Worker started for campaign: {}", self.campaign_id);
 
         loop {
-            // Heartbeat check
-            if last_heartbeat.elapsed() > self.heartbeat_interval {
-                let hb_client = Client {
-                    client_id: self.client_id,
-                    campaign_id: self.campaign_id,
-                    type_: if self.sa_mode { ClientType::SIMULATED_ANNEALING }
-                           else if self.vds_mode { ClientType::VARIABLE_DEPTH_SEARCH }
-                           else { ClientType::CLIQUECHECKER },
-                    status: ClientStatus::ACTIVE,
-                    created_date: None,
-                    last_phone_home_date: Some(
-                        Utc::now()
-                            .naive_utc()
-                            .format("%Y-%m-%dT%H:%M:%S")
-                            .to_string(),
-                    ),
-                };
-                if let Err(e) = self.mw_client.update_client(&hb_client).await {
-                    eprintln!(
-                        "[{}] Heartbeat failed: {}",
-                        Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                        e
-                    );
-                } else {
-                    last_heartbeat = Instant::now();
-                }
-            }
-
-            let cycle_start = Instant::now();
+            let cycle_start = std::time::Instant::now();
             match self.cycle().await {
                 Ok(count) => {
                     if count == 0 {

@@ -15,7 +15,7 @@ High-performance worker for the Ramsey distributed computing system. Claims work
 
 ## How It Works
 
-1. **Registration**: Worker registers with middleware as a CLIQUECHECKER client
+1. **Initialization**: Worker fetches campaign info from middleware
 2. **Stage Discovery**: Fetches active stage details and validates `stage_config:{id}` exists in Redis
 3. **Work Cycle**:
    - **Claim Work**: Atomically increments `stage_work_index:{id}` to claim a range of indices
@@ -27,7 +27,6 @@ High-performance worker for the Ramsey distributed computing system. Claims work
 4. **Result Handling**:
    - **If result has fewer cliques**: Updates `best_result:{stageId}` in Redis
    - **Result Publishing**: If enabled, batches and submits `WorkResult` to middleware (`POST /api/ramsey/results`)
-   - **Heartbeat**: Periodically updates last phone home time
 
 ## Best Result Tracking
 
@@ -59,7 +58,6 @@ The Queue Manager's `StageProgressionMonitor` polls this key and triggers stage 
 | `WORK_UNIT_FETCH_COUNT` | Work range size to claim per cycle | `50000` |
 | `WORK_UNIT_PUBLISH_COUNT` | Batch size for result submission | `50000` |
 | `WORK_UNIT_POLL_FREQ` | Polling interval (ms) when no work available | `1000` |
-| `CLIENT_PHONE_HOME_FREQ` | Heartbeat interval (ms) | `60000` |
 | `PUBLISH_RESULTS` | Whether to submit results to MySQL | `true` |
 
 ## Building
