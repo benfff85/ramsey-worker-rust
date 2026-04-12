@@ -20,33 +20,6 @@ pub struct GraphData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Client {
-    #[serde(rename = "clientId")]
-    pub client_id: Option<i32>,
-    #[serde(rename = "campaignId")]
-    pub campaign_id: i32,
-    #[serde(rename = "type")]
-    pub type_: ClientType,
-    pub status: ClientStatus,
-    #[serde(rename = "createdDate")]
-    pub created_date: Option<String>, // ISO8601 string
-    #[serde(rename = "lastPhoneHomeDate")]
-    pub last_phone_home_date: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClientType {
-    CLIQUECHECKER,
-    SIMULATED_ANNEALING,
-    VARIABLE_DEPTH_SEARCH,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClientStatus {
-    ACTIVE,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Campaign {
     #[serde(rename = "campaignId")]
     pub campaign_id: i32,
