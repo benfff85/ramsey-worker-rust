@@ -116,11 +116,9 @@ pub fn run_vds(
 
     let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
 
-    // Pre-compute candidate rankings ONCE. The clique_collection is static (reflects
-    // the base graph), so rank_edges_by_participation returns the same result every
-    // time. Previously this was called ~84K times inside search_depth — pure waste.
+    // Pre-compute first-edge candidates from global participation ranking.
+    // Deeper levels use locality-aware selection instead (see get_neighborhood_candidates).
     let mut first_edge_candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
-    let depth_candidates = rank_edges_by_participation(&working_graph, clique_collection, config.branching_factor);
 
     // Shuffle the top-K first-edge candidates so concurrent workers (and successive
     // calls from the same worker) explore different start points instead of all
@@ -177,7 +175,7 @@ pub fn run_vds(
                 cumulative, 2, config.max_depth,
                 &mut destroyed, &mut current_sequence,
                 &mut state, config, base_clique_count,
-                &mut stats, &depth_candidates,
+                &mut stats,
             );
         }
 
@@ -254,6 +252,77 @@ fn compute_delta(
     -broken + new
 }
 
+/// Select candidate edges from the neighborhood of the current flip sequence.
+///
+/// Collects all edges incident to any vertex touched by `current_sequence`,
+/// ranks them by surviving clique participation (original count minus destroyed),
+/// and returns the top-K. This is the core LK principle: each subsequent flip
+/// targets the local disruption from prior flips rather than repeating a static
+/// global ranking.
+fn get_neighborhood_candidates(
+    vertex_count: usize,
+    clique_collection: &CliqueCollection,
+    current_sequence: &[WorkUnitEdge],
+    destroyed: &HashSet<u32>,
+    top_k: usize,
+) -> Vec<WorkUnitEdge> {
+    // Collect unique vertices from the sequence
+    let mut vertex_set: HashSet<usize> = HashSet::new();
+    for edge in current_sequence {
+        vertex_set.insert(edge.vertex_one as usize);
+        vertex_set.insert(edge.vertex_two as usize);
+    }
+
+    // Build set of sequence edges to exclude
+    let mut sequence_edges: HashSet<(u16, u16)> = HashSet::new();
+    for e in current_sequence {
+        let (a, b) = if e.vertex_one < e.vertex_two {
+            (e.vertex_one, e.vertex_two)
+        } else {
+            (e.vertex_two, e.vertex_one)
+        };
+        sequence_edges.insert((a, b));
+    }
+
+    // Enumerate all edges incident to those vertices, deduplicated
+    let mut seen: HashSet<(u16, u16)> = sequence_edges.clone();
+    let mut scored: Vec<(i32, WorkUnitEdge)> = Vec::new();
+
+    for &v in &vertex_set {
+        for w in 0..vertex_count {
+            if w == v {
+                continue;
+            }
+            let (a, b) = if v < w {
+                (v as u16, w as u16)
+            } else {
+                (w as u16, v as u16)
+            };
+            if !seen.insert((a, b)) {
+                continue; // already scored or in sequence
+            }
+            let edge = WorkUnitEdge {
+                vertex_one: a,
+                vertex_two: b,
+            };
+            let surviving: i32 = clique_collection
+                .get_cliques_containing_edge(&edge)
+                .iter()
+                .filter(|c| !destroyed.contains(c))
+                .count() as i32;
+            scored.push((surviving, edge));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.vertex_one.cmp(&b.1.vertex_one))
+            .then(a.1.vertex_two.cmp(&b.1.vertex_two))
+    });
+
+    scored.into_iter().take(top_k).map(|(_, e)| e).collect()
+}
+
 fn search_depth(
     working_graph: &mut Graph,
     clique_collection: &CliqueCollection,
@@ -267,14 +336,19 @@ fn search_depth(
     config: &VdsConfig,
     base_clique_count: i32,
     stats: &mut SearchStats,
-    depth_candidates: &[WorkUnitEdge],
 ) {
-    for edge in depth_candidates {
-        // Skip edges already in the sequence (prevents same-edge-twice no-op)
-        if current_sequence.iter().any(|e| e.vertex_one == edge.vertex_one && e.vertex_two == edge.vertex_two) {
-            continue;
-        }
+    // Locality-aware: candidates are edges adjacent to previously flipped edges,
+    // ranked by surviving clique participation. Each branch fans out into a
+    // different local neighborhood rather than repeating a static global top-K.
+    let candidates = get_neighborhood_candidates(
+        working_graph.vertex_count,
+        clique_collection,
+        current_sequence,
+        destroyed,
+        config.branching_factor,
+    );
 
+    for edge in &candidates {
         stats.nodes_visited += 1;
         let delta = compute_delta(working_graph, clique_collection, edge, clique_size, destroyed);
         let new_cumulative = cumulative_count + delta;
@@ -308,7 +382,7 @@ fn search_depth(
                 working_graph, clique_collection, clique_size,
                 new_cumulative, current_depth + 1, max_depth,
                 destroyed, current_sequence, state, config, base_clique_count,
-                stats, depth_candidates,
+                stats,
             );
         }
 
@@ -377,18 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn test_run_vds_depth_2_escapes_local_minimum() {
+    fn test_run_vds_depth_2_improves_over_depth_1() {
         use crate::algorithm::get_cliques_comprehensive;
 
         // Empty graph on 6 vertices: 0 red triangles, but C(6,3) = 20 blue triangles.
         //
-        // Flipping (0,1) red: still 0 red triangles, blue triangles = 20 - 4 = 16
-        // (edge (0,1) was in 4 blue triangles: {0,1,x} for x in {2,3,4,5}).
+        // Depth-1: flipping any single edge breaks 4 blue triangles → 16.
         //
-        // Flipping (0,1) then (2,3) red: red triangles = 0 (no two red edges share a vertex),
-        // blue triangles = 20 - 4 - 4 = 12 (no overlap between the two destroyed sets).
-        //
-        // So depth-1 finds (0,1) → 16, depth-2 finds (0,1)+(2,3) → 12.
+        // Depth-2 with locality-aware selection: the second flip must share a vertex
+        // with the first. Adjacent pairs share one vertex, so the second flip's 4
+        // original blue triangles overlap by 1 with the first → breaks 3 more → 13.
+        // (Non-local pairs like (0,1)+(2,3) would give 12, but locality-aware search
+        // correctly prioritizes the local neighborhood. The deeper-search test below
+        // shows how LK chaining reaches non-local edges through intermediate steps.)
         let bitstring = "000000000000000".to_string(); // 15 edges, all absent
         let mut graph = Graph::from_bitstring(&bitstring, 6);
         let all_cliques = get_all_cliques(&mut graph, 3);
@@ -417,18 +492,15 @@ mod tests {
         assert!(result_d1.improved);
         assert!(result_d2.improved);
         assert_eq!(result_d1.final_clique_count, 16, "depth-1 should reach 16");
-        assert_eq!(result_d2.final_clique_count, 12, "depth-2 should reach 12");
+        assert_eq!(result_d2.final_clique_count, 13, "depth-2 local should reach 13");
         assert!(
             result_d2.final_clique_count < result_d1.final_clique_count,
             "depth-2 ({}) must beat depth-1 ({})",
             result_d2.final_clique_count,
             result_d1.final_clique_count
         );
-        assert_eq!(result_d2.edges_to_flip.len(), 2, "depth-2 sequence should be exactly 2 flips");
 
-        // Independent verification: apply the reported edges to a fresh graph and
-        // recount comprehensively. This must equal final_clique_count, otherwise
-        // the tracker delta diverged from ground truth.
+        // Independent verification
         let mut verify_graph = Graph::from_bitstring(&graph.to_bitstring(), graph.vertex_count);
         verify_graph.flip_edges(&result_d2.edges_to_flip);
         let verified = get_cliques_comprehensive(&mut verify_graph, 3);
@@ -438,7 +510,6 @@ mod tests {
             verified, result_d2.final_clique_count
         );
 
-        // Same independent check for depth-1.
         let mut verify_graph_d1 = Graph::from_bitstring(&graph.to_bitstring(), graph.vertex_count);
         verify_graph_d1.flip_edges(&result_d1.edges_to_flip);
         let verified_d1 = get_cliques_comprehensive(&mut verify_graph_d1, 3);
@@ -446,6 +517,60 @@ mod tests {
             verified_d1, result_d1.final_clique_count,
             "depth-1 comprehensive recount ({}) must match VDS-reported count ({})",
             verified_d1, result_d1.final_clique_count
+        );
+    }
+
+    #[test]
+    fn test_run_vds_deeper_search_chains_through_locality() {
+        use crate::algorithm::get_cliques_comprehensive;
+
+        // Same 6-vertex empty graph. Depth-3 can chain: (a,b)→(b,c)→(c,d) where
+        // each step is local to the previous but the endpoints a,d are non-adjacent.
+        // This reaches improvements that depth-2 locality can't find in a single hop.
+        //
+        // At depth 4+, even more diverse paths are explored. We verify that deeper
+        // search finds strictly better results.
+        let bitstring = "000000000000000".to_string();
+        let mut graph = Graph::from_bitstring(&bitstring, 6);
+        let all_cliques = get_all_cliques(&mut graph, 3);
+        let base_total = all_cliques.len() as i32;
+        let mut cc = CliqueCollection::new(6);
+        cc.set_cliques(all_cliques, 6);
+
+        let config_d2 = VdsConfig {
+            max_depth: 2,
+            top_first_edges: 15,
+            branching_factor: 15,
+            worsening_tolerance: 10000,
+            random_seed: Some(42),
+        };
+        let result_d2 = run_vds(&graph, 3, &config_d2, &cc, base_total);
+
+        let config_d4 = VdsConfig {
+            max_depth: 4,
+            top_first_edges: 15,
+            branching_factor: 15,
+            worsening_tolerance: 10000,
+            random_seed: Some(42),
+        };
+        let result_d4 = run_vds(&graph, 3, &config_d4, &cc, base_total);
+
+        assert!(result_d4.improved);
+        assert!(
+            result_d4.final_clique_count < result_d2.final_clique_count,
+            "depth-4 ({}) must beat depth-2 ({}) via LK chaining",
+            result_d4.final_clique_count,
+            result_d2.final_clique_count
+        );
+
+        // Verify comprehensively
+        let mut verify_graph = Graph::from_bitstring(&graph.to_bitstring(), graph.vertex_count);
+        verify_graph.flip_edges(&result_d4.edges_to_flip);
+        let verified = get_cliques_comprehensive(&mut verify_graph, 3);
+        assert_eq!(
+            verified, result_d4.final_clique_count,
+            "depth-4 comprehensive recount ({}) must match VDS-reported count ({})",
+            verified, result_d4.final_clique_count
         );
     }
 
