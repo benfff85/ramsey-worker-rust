@@ -115,7 +115,12 @@ pub fn run_vds(
     );
 
     let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
-    let mut candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
+
+    // Pre-compute candidate rankings ONCE. The clique_collection is static (reflects
+    // the base graph), so rank_edges_by_participation returns the same result every
+    // time. Previously this was called ~84K times inside search_depth — pure waste.
+    let mut first_edge_candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
+    let depth_candidates = rank_edges_by_participation(&working_graph, clique_collection, config.branching_factor);
 
     // Shuffle the top-K first-edge candidates so concurrent workers (and successive
     // calls from the same worker) explore different start points instead of all
@@ -130,7 +135,7 @@ pub fn run_vds(
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_os_rng(),
     };
-    candidates.shuffle(&mut rng);
+    first_edge_candidates.shuffle(&mut rng);
 
     let mut state = SearchState {
         best_sequence: Vec::new(),
@@ -141,7 +146,7 @@ pub fn run_vds(
     let mut stats = SearchStats::default();
     let started = Instant::now();
 
-    for first_edge in &candidates {
+    for first_edge in &first_edge_candidates {
         // Compute delta for this first flip
         stats.nodes_visited += 1;
         let delta = compute_delta(&mut working_graph, clique_collection, first_edge, clique_size, &destroyed);
@@ -172,7 +177,7 @@ pub fn run_vds(
                 cumulative, 2, config.max_depth,
                 &mut destroyed, &mut current_sequence,
                 &mut state, config, base_clique_count,
-                &mut stats,
+                &mut stats, &depth_candidates,
             );
         }
 
@@ -262,12 +267,9 @@ fn search_depth(
     config: &VdsConfig,
     base_clique_count: i32,
     stats: &mut SearchStats,
+    depth_candidates: &[WorkUnitEdge],
 ) {
-    // Generate and rank candidates for this level (top branching_factor).
-    // Rank from the ORIGINAL clique_collection (fast); could be refined per-depth.
-    let candidates = rank_edges_by_participation(working_graph, clique_collection, config.branching_factor);
-
-    for edge in &candidates {
+    for edge in depth_candidates {
         // Skip edges already in the sequence (prevents same-edge-twice no-op)
         if current_sequence.iter().any(|e| e.vertex_one == edge.vertex_one && e.vertex_two == edge.vertex_two) {
             continue;
@@ -306,7 +308,7 @@ fn search_depth(
                 working_graph, clique_collection, clique_size,
                 new_cumulative, current_depth + 1, max_depth,
                 destroyed, current_sequence, state, config, base_clique_count,
-                stats,
+                stats, depth_candidates,
             );
         }
 
