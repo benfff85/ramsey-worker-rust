@@ -104,6 +104,11 @@ async fn main() {
 
     let vds_random_seed: Option<u64> = env::var("VDS_RANDOM_SEED").ok().and_then(|s| s.parse().ok());
 
+    let vds_start_depth: usize = env::var("VDS_START_DEPTH")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .expect("VDS_START_DEPTH must be a number");
+
     log_info!("Publish results to MySQL: {}", publish_results);
     log_info!("Tracking top {} results per stage", top_results_count);
 
@@ -113,8 +118,8 @@ async fn main() {
             sa_max_iterations, sa_initial_temp, sa_cooling_rate, sa_min_pairs, sa_max_pairs);
     } else if vds_mode {
         log_info!("Worker mode: VARIABLE_DEPTH_SEARCH");
-        log_info!("  max_depth={}, top_first_edges={}, branching_factor={}, worsening_tolerance={}, random_seed={:?}",
-            vds_max_depth, vds_top_first_edges, vds_branching_factor, vds_worsening_tolerance, vds_random_seed);
+        log_info!("  max_depth={}, top_first_edges={}, branching_factor={}, worsening_tolerance={}, start_depth={}, random_seed={:?}",
+            vds_max_depth, vds_top_first_edges, vds_branching_factor, vds_worsening_tolerance, vds_start_depth, vds_random_seed);
     } else {
         log_info!("Worker mode: EXHAUSTIVE");
     }
@@ -141,6 +146,7 @@ async fn main() {
         vds_branching_factor,
         vds_worsening_tolerance,
         vds_random_seed,
+        vds_start_depth,
     );
 
     // Connect to Redis

@@ -32,6 +32,11 @@ pub struct VdsConfig {
     pub branching_factor: usize,
     pub worsening_tolerance: i32,
     pub random_seed: Option<u64>,
+    /// Minimum number of flips before the search begins branching.
+    /// With start_depth=3, VDS randomly picks 2 prefix edges (depth 1-2)
+    /// then branches from depth 3 onward. This skips the 1- and 2-flip
+    /// space that exhaustive workers already cover.
+    pub start_depth: usize,
 }
 
 pub struct VdsRunResult {
@@ -95,9 +100,12 @@ pub fn rank_edges_by_participation(
 
 /// Run one complete variable-depth search starting from `base_graph`.
 ///
-/// Performs Lin-Kernighan style tree search: at each recursion level, tries the
-/// top-K candidate edge flips and records the best cumulative delta found.
-/// Returns the best improving edge sequence (possibly empty if no improvement).
+/// When `config.start_depth > 1`, a random prefix of `start_depth - 1` edges
+/// is applied before branching begins, so the search starts in N-flip space
+/// that exhaustive workers can't reach. Worsening tolerance is measured from
+/// the prefix state (not the original base) so the search can explore around
+/// the random starting point. Improvements are still tracked against the
+/// original `base_clique_count`.
 ///
 /// `clique_collection` must be built from `base_graph`.
 pub fn run_vds(
@@ -109,23 +117,17 @@ pub fn run_vds(
 ) -> VdsRunResult {
     log_info!(
         "VDS starting: vertex_count={}, clique_size={}, base_cliques={}, \
-         max_depth={}, top_first_edges={}, branching_factor={}, worsening_tolerance={}",
+         max_depth={}, top_first_edges={}, branching_factor={}, worsening_tolerance={}, start_depth={}",
         base_graph.vertex_count, clique_size, base_clique_count,
-        config.max_depth, config.top_first_edges, config.branching_factor, config.worsening_tolerance
+        config.max_depth, config.top_first_edges, config.branching_factor,
+        config.worsening_tolerance, config.start_depth
     );
 
     let mut working_graph = Graph::from_bitstring(&base_graph.to_bitstring(), base_graph.vertex_count);
 
     // Pre-compute first-edge candidates from global participation ranking.
-    // Deeper levels use locality-aware selection instead (see get_neighborhood_candidates).
     let mut first_edge_candidates = rank_edges_by_participation(&working_graph, clique_collection, config.top_first_edges);
 
-    // Shuffle the top-K first-edge candidates so concurrent workers (and successive
-    // calls from the same worker) explore different start points instead of all
-    // hammering the same highest-participation edge first. We still benefit from the
-    // top_first_edges cutoff, which keeps the candidate pool focused on edges that
-    // touch many cliques — shuffling only reorders within that pool.
-    //
     // Seeding rule:
     //   Some(seed) → deterministic StdRng (for tests / reproducibility)
     //   None       → fresh OS entropy each call (production default)
@@ -134,6 +136,9 @@ pub fn run_vds(
         None => StdRng::from_os_rng(),
     };
     first_edge_candidates.shuffle(&mut rng);
+    // Sample branching_factor edges from the shuffled pool (or fewer if pool is smaller)
+    let sample_size = config.branching_factor.min(first_edge_candidates.len());
+    let first_edges_this_run = &first_edge_candidates[..sample_size];
 
     let mut state = SearchState {
         best_sequence: Vec::new(),
@@ -144,7 +149,7 @@ pub fn run_vds(
     let mut stats = SearchStats::default();
     let started = Instant::now();
 
-    for first_edge in &first_edge_candidates {
+    for first_edge in first_edges_this_run {
         // Compute delta for this first flip
         stats.nodes_visited += 1;
         let delta = compute_delta(&mut working_graph, clique_collection, first_edge, clique_size, &destroyed);
@@ -163,19 +168,32 @@ pub fn run_vds(
         current_sequence.push(first_edge.clone());
 
         let cumulative = base_clique_count + delta;
-        if cumulative < state.best_count {
+
+        // Only record improvements at or beyond start_depth
+        if config.start_depth <= 1 && cumulative < state.best_count {
             state.best_count = cumulative;
             state.best_sequence = current_sequence.clone();
         }
 
-        // Recurse into deeper levels
-        if config.max_depth >= 2 {
+        // Build random prefix for depths 2..start_depth (no branching, one
+        // random neighbor at each level). This walks to the start_depth starting
+        // point before the branching search begins.
+        if config.start_depth > 1 && config.max_depth >= 2 {
+            build_prefix_and_search(
+                &mut working_graph, clique_collection, clique_size,
+                cumulative, 2,
+                &mut destroyed, &mut current_sequence,
+                &mut state, config, base_clique_count,
+                &mut stats, &mut rng,
+            );
+        } else if config.max_depth >= 2 {
             search_depth(
                 &mut working_graph, clique_collection, clique_size,
                 cumulative, 2, config.max_depth,
                 &mut destroyed, &mut current_sequence,
                 &mut state, config, base_clique_count,
-                &mut stats,
+                cumulative, // tolerance_base = cumulative after depth 1
+                &mut stats, &mut rng,
             );
         }
 
@@ -256,15 +274,16 @@ fn compute_delta(
 ///
 /// Collects all edges incident to any vertex touched by `current_sequence`,
 /// ranks them by surviving clique participation (original count minus destroyed),
-/// and returns the top-K. This is the core LK principle: each subsequent flip
-/// targets the local disruption from prior flips rather than repeating a static
-/// global ranking.
+/// takes the top 3*K as a quality-filtered pool, shuffles that pool, then returns
+/// K candidates. This balances focus (only high-participation edges) with
+/// exploration (different subset each run).
 fn get_neighborhood_candidates(
     vertex_count: usize,
     clique_collection: &CliqueCollection,
     current_sequence: &[WorkUnitEdge],
     destroyed: &HashSet<u32>,
     top_k: usize,
+    rng: &mut StdRng,
 ) -> Vec<WorkUnitEdge> {
     // Collect unique vertices from the sequence
     let mut vertex_set: HashSet<usize> = HashSet::new();
@@ -320,7 +339,95 @@ fn get_neighborhood_candidates(
             .then(a.1.vertex_two.cmp(&b.1.vertex_two))
     });
 
-    scored.into_iter().take(top_k).map(|(_, e)| e).collect()
+    // Take a larger pool (3x), shuffle it, then return top_k.
+    // This keeps candidates quality-filtered while ensuring each run
+    // explores different subtrees.
+    let pool_size = (top_k * 3).min(scored.len());
+    let mut pool: Vec<WorkUnitEdge> = scored.into_iter().take(pool_size).map(|(_, e)| e).collect();
+    pool.shuffle(rng);
+    pool.into_iter().take(top_k).collect()
+}
+
+/// Build a random prefix path from the current depth up to `start_depth`,
+/// picking one random neighborhood edge at each level (no branching).
+/// Once at `start_depth`, begins the branching search.
+fn build_prefix_and_search(
+    working_graph: &mut Graph,
+    clique_collection: &CliqueCollection,
+    clique_size: usize,
+    cumulative_count: i32,
+    current_depth: usize,
+    destroyed: &mut HashSet<u32>,
+    current_sequence: &mut Vec<WorkUnitEdge>,
+    state: &mut SearchState,
+    config: &VdsConfig,
+    base_clique_count: i32,
+    stats: &mut SearchStats,
+    rng: &mut StdRng,
+) {
+    if current_depth >= config.start_depth {
+        // We've reached start_depth — begin branching search from here.
+        // Tolerance is measured from the cumulative count at the start of
+        // branching so the search explores around this prefix state.
+        if current_depth <= config.max_depth {
+            search_depth(
+                working_graph, clique_collection, clique_size,
+                cumulative_count, current_depth, config.max_depth,
+                destroyed, current_sequence, state, config, base_clique_count,
+                cumulative_count, // tolerance_base = count at prefix end
+                stats, rng,
+            );
+        }
+        return;
+    }
+
+    // Still building prefix: pick one random neighbor and continue
+    let candidates = get_neighborhood_candidates(
+        working_graph.vertex_count,
+        clique_collection,
+        current_sequence,
+        destroyed,
+        config.branching_factor,
+        rng,
+    );
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Pick one random candidate (candidates are already shuffled from a ranked pool)
+    let edge = &candidates[0];
+
+    stats.nodes_visited += 1;
+    let delta = compute_delta(working_graph, clique_collection, edge, clique_size, destroyed);
+
+    let destroyed_now: Vec<u32> = clique_collection
+        .get_cliques_containing_edge(edge)
+        .iter()
+        .filter(|c| !destroyed.contains(c))
+        .copied()
+        .collect();
+    working_graph.flip_edges(&[edge.clone()]);
+    for c in &destroyed_now {
+        destroyed.insert(*c);
+    }
+    current_sequence.push(edge.clone());
+
+    let new_cumulative = cumulative_count + delta;
+
+    build_prefix_and_search(
+        working_graph, clique_collection, clique_size,
+        new_cumulative, current_depth + 1,
+        destroyed, current_sequence, state, config, base_clique_count,
+        stats, rng,
+    );
+
+    // Backtrack
+    working_graph.flip_edges(&[edge.clone()]);
+    for c in &destroyed_now {
+        destroyed.remove(c);
+    }
+    current_sequence.pop();
 }
 
 fn search_depth(
@@ -335,17 +442,22 @@ fn search_depth(
     state: &mut SearchState,
     config: &VdsConfig,
     base_clique_count: i32,
+    // The clique count at the point where branching began (after the prefix).
+    // Worsening tolerance is measured from this value, not from base_clique_count.
+    tolerance_base: i32,
     stats: &mut SearchStats,
+    rng: &mut StdRng,
 ) {
     // Locality-aware: candidates are edges adjacent to previously flipped edges,
-    // ranked by surviving clique participation. Each branch fans out into a
-    // different local neighborhood rather than repeating a static global top-K.
+    // ranked by surviving clique participation then randomly sampled from the
+    // top pool. Each branch fans out into a different local neighborhood.
     let candidates = get_neighborhood_candidates(
         working_graph.vertex_count,
         clique_collection,
         current_sequence,
         destroyed,
         config.branching_factor,
+        rng,
     );
 
     for edge in &candidates {
@@ -353,8 +465,9 @@ fn search_depth(
         let delta = compute_delta(working_graph, clique_collection, edge, clique_size, destroyed);
         let new_cumulative = cumulative_count + delta;
 
-        // Worsening tolerance: prune branches that go too far above baseline
-        if new_cumulative - base_clique_count > config.worsening_tolerance {
+        // Worsening tolerance: prune branches that go too far above the
+        // tolerance baseline (the count at the start of branching)
+        if new_cumulative - tolerance_base > config.worsening_tolerance {
             stats.branches_pruned += 1;
             continue;
         }
@@ -382,7 +495,7 @@ fn search_depth(
                 working_graph, clique_collection, clique_size,
                 new_cumulative, current_depth + 1, max_depth,
                 destroyed, current_sequence, state, config, base_clique_count,
-                stats,
+                tolerance_base, stats, rng,
             );
         }
 
@@ -441,6 +554,7 @@ mod tests {
             branching_factor: 10,
             worsening_tolerance: 10000,
             random_seed: Some(42),
+            start_depth: 1,
         };
 
         let result = run_vds(&graph, 3, &config, &cc, base_total);
@@ -477,6 +591,7 @@ mod tests {
             branching_factor: 15,
             worsening_tolerance: 10000,
             random_seed: Some(42),
+            start_depth: 1,
         };
         let result_d1 = run_vds(&graph, 3, &config_d1, &cc, base_total);
 
@@ -486,6 +601,7 @@ mod tests {
             branching_factor: 15,
             worsening_tolerance: 10000,
             random_seed: Some(42),
+            start_depth: 1,
         };
         let result_d2 = run_vds(&graph, 3, &config_d2, &cc, base_total);
 
@@ -543,6 +659,7 @@ mod tests {
             branching_factor: 15,
             worsening_tolerance: 10000,
             random_seed: Some(42),
+            start_depth: 1,
         };
         let result_d2 = run_vds(&graph, 3, &config_d2, &cc, base_total);
 
@@ -552,6 +669,7 @@ mod tests {
             branching_factor: 15,
             worsening_tolerance: 10000,
             random_seed: Some(42),
+            start_depth: 1,
         };
         let result_d4 = run_vds(&graph, 3, &config_d4, &cc, base_total);
 

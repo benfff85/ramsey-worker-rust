@@ -63,6 +63,7 @@ impl Worker {
         vds_branching_factor: usize,
         vds_worsening_tolerance: i32,
         vds_random_seed: Option<u64>,
+        vds_start_depth: usize,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -96,6 +97,7 @@ impl Worker {
                 branching_factor: vds_branching_factor,
                 worsening_tolerance: vds_worsening_tolerance,
                 random_seed: vds_random_seed,
+                start_depth: vds_start_depth,
             },
         }
     }
