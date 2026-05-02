@@ -133,7 +133,7 @@ pub fn run_vds(
     //   None       → fresh OS entropy each call (production default)
     let mut rng: StdRng = match config.random_seed {
         Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::from_os_rng(),
+        None => StdRng::from_rng(&mut rand::rng()),
     };
     first_edge_candidates.shuffle(&mut rng);
     // Sample branching_factor edges from the shuffled pool (or fewer if pool is smaller)
