@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::algorithm::get_cliques_comprehensive;
 use crate::clique_collection::CliqueCollection;

@@ -217,6 +217,8 @@ impl RedisClient {
     /// Uses Redis sorted set with score = clique_count.
     /// Atomically adds and trims to keep only the best N results (lowest clique counts).
     /// Returns true if this result is currently in the top N, false otherwise.
+    /// Returns `(kept, new_threshold)` where `new_threshold` is the current worst score
+    /// in the set after the operation (None if the set is not yet full).
     pub async fn add_to_top_results(
         &mut self,
         stage_id: i32,
@@ -224,7 +226,7 @@ impl RedisClient {
         edges_to_flip: &[WorkUnitEdge],
         clique_count: i32,
         max_results: usize,
-    ) -> Result<bool, Box<dyn Error>> {
+    ) -> Result<(bool, Option<i32>), Box<dyn Error>> {
         let key = format!("best_results:{}", stage_id);
 
         let result = BestResult {
@@ -235,30 +237,41 @@ impl RedisClient {
         };
         let json = serde_json::to_string(&result)?;
 
-        // Lua script: ZADD, then ZREMRANGEBYRANK to keep only top N (lowest scores)
-        // Returns 1 if this result is still in the set after trim, 0 otherwise
+        // Lua script: ZADD + trim to top N + check rank.
+        // Returns {kept, worst_score}: worst_score is the score at position max_results-1
+        // (the current threshold), or -1 if the set is not yet full.
         let script = redis::Script::new(
             r#"
             redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
             redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[3], -1)
             local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
-            if rank then
-                return 1
+            local kept = 0
+            if rank then kept = 1 end
+            local size = redis.call('ZCARD', KEYS[1])
+            if tonumber(size) >= tonumber(ARGV[3]) then
+                local worst = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[3])-1, tonumber(ARGV[3])-1, 'WITHSCORES')
+                return {kept, tonumber(worst[2])}
             else
-                return 0
+                return {kept, -1}
             end
             "#,
         );
 
-        let kept: i32 = script
+        let raw: Vec<redis::Value> = script
             .key(&key)
             .arg(clique_count)
             .arg(&json)
-            .arg(max_results as i64) // Keep indices 0 to max_results-1, remove from max_results onward
+            .arg(max_results as i64)
             .invoke_async(&mut self.connection)
             .await?;
 
-        if kept == 1 {
+        let kept = matches!(raw.first(), Some(redis::Value::Int(1)));
+        let new_threshold = match raw.get(1) {
+            Some(redis::Value::Int(n)) if *n >= 0 => Some(*n as i32),
+            _ => None,
+        };
+
+        if kept {
             log_info!(
                 "Added to top-{} results for stage {}: clique_count={}",
                 max_results,
@@ -267,7 +280,7 @@ impl RedisClient {
             );
         }
 
-        Ok(kept == 1)
+        Ok((kept, new_threshold))
     }
 
     /// Add an SA result to the top-N sorted set for a stage.
@@ -280,7 +293,7 @@ impl RedisClient {
         graph_bitstring: &str,
         clique_count: i32,
         max_results: usize,
-    ) -> Result<bool, Box<dyn Error>> {
+    ) -> Result<(bool, Option<i32>), Box<dyn Error>> {
         let key = format!("best_results:{}", stage_id);
 
         let result = SaBestResult {
@@ -291,21 +304,25 @@ impl RedisClient {
         };
         let json = serde_json::to_string(&result)?;
 
-        // Same Lua script as add_to_top_results: ZADD + trim + check rank
+        // Same Lua script as add_to_top_results: ZADD + trim + check rank + return threshold
         let script = redis::Script::new(
             r#"
             redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
             redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[3], -1)
             local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
-            if rank then
-                return 1
+            local kept = 0
+            if rank then kept = 1 end
+            local size = redis.call('ZCARD', KEYS[1])
+            if tonumber(size) >= tonumber(ARGV[3]) then
+                local worst = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[3])-1, tonumber(ARGV[3])-1, 'WITHSCORES')
+                return {kept, tonumber(worst[2])}
             else
-                return 0
+                return {kept, -1}
             end
             "#,
         );
 
-        let kept: i32 = script
+        let raw: Vec<redis::Value> = script
             .key(&key)
             .arg(clique_count)
             .arg(&json)
@@ -313,7 +330,13 @@ impl RedisClient {
             .invoke_async(&mut self.connection)
             .await?;
 
-        if kept == 1 {
+        let kept = matches!(raw.first(), Some(redis::Value::Int(1)));
+        let new_threshold = match raw.get(1) {
+            Some(redis::Value::Int(n)) if *n >= 0 => Some(*n as i32),
+            _ => None,
+        };
+
+        if kept {
             log_info!(
                 "SA: Added to top-{} results for stage {}: clique_count={}",
                 max_results,
@@ -322,7 +345,7 @@ impl RedisClient {
             );
         }
 
-        Ok(kept == 1)
+        Ok((kept, new_threshold))
     }
 
     /// Get the threshold score (worst/highest score in top-N) for a stage.

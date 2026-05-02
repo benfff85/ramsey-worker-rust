@@ -254,8 +254,10 @@ impl Worker {
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
 
-        // Fetch the current threshold for top-N results (None = accept anything)
-        let top_threshold: Option<i32> = {
+        // Fetch the current threshold for top-N results (None = accept anything).
+        // Declared mut so it can be tightened in-loop as the sorted set fills up,
+        // eliminating the burst of unfiltered submissions when a fresh stage starts.
+        let mut top_threshold: Option<i32> = {
             let redis = self.redis_client.as_mut().ok_or("Redis not connected")?;
             redis
                 .get_top_results_threshold(stage_id, self.top_results_count)
@@ -316,7 +318,7 @@ impl Worker {
             };
             if should_submit {
                 if let Some(redis) = self.redis_client.as_mut() {
-                    let _ = redis
+                    if let Ok((_, new_threshold)) = redis
                         .add_to_top_results(
                             stage_id,
                             base_graph_id,
@@ -324,7 +326,17 @@ impl Worker {
                             count,
                             self.top_results_count,
                         )
-                        .await;
+                        .await
+                    {
+                        // Update threshold in-place so early termination tightens
+                        // within this batch rather than staying stale for all 250K units.
+                        if let Some(t) = new_threshold {
+                            top_threshold = Some(match top_threshold {
+                                Some(current) => current.min(t),
+                                None => t,
+                            });
+                        }
+                    }
                 }
             }
 
