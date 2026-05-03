@@ -151,3 +151,130 @@ impl BitMatrix {
         indices
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_get_clear_at_word_boundaries() {
+        let mut b = BitMatrix::new();
+        for &i in &[0usize, 1, 63, 64, 65, 127, 128, 191, 192, 255, 256, 281, 287] {
+            assert!(!b.get(i));
+            b.set(i);
+            assert!(b.get(i));
+            b.clear(i);
+            assert!(!b.get(i));
+        }
+    }
+
+    #[test]
+    fn flip_toggles_bit() {
+        let mut b = BitMatrix::new();
+        b.flip(64);
+        assert!(b.get(64));
+        b.flip(64);
+        assert!(!b.get(64));
+    }
+
+    #[test]
+    fn cardinality_counts_bits_across_words() {
+        let mut b = BitMatrix::new();
+        assert_eq!(b.cardinality(), 0);
+        for &i in &[0usize, 63, 64, 100, 191, 192, 287] {
+            b.set(i);
+        }
+        assert_eq!(b.cardinality(), 7);
+    }
+
+    #[test]
+    fn next_set_bit_finds_across_word_boundaries() {
+        let mut b = BitMatrix::new();
+        b.set(63);
+        b.set(64);
+        b.set(127);
+        b.set(287);
+        assert_eq!(b.next_set_bit(0), Some(63));
+        assert_eq!(b.next_set_bit(63), Some(63));
+        assert_eq!(b.next_set_bit(64), Some(64));
+        assert_eq!(b.next_set_bit(65), Some(127));
+        assert_eq!(b.next_set_bit(128), Some(287));
+        assert_eq!(b.next_set_bit(288), None);
+    }
+
+    #[test]
+    fn next_set_bit_empty_returns_none() {
+        let b = BitMatrix::new();
+        assert_eq!(b.next_set_bit(0), None);
+        assert_eq!(b.next_set_bit(287), None);
+    }
+
+    #[test]
+    fn and_assign_intersects() {
+        let mut a = BitMatrix::new();
+        let mut c = BitMatrix::new();
+        for &i in &[0usize, 64, 100, 287] {
+            a.set(i);
+        }
+        for &i in &[0usize, 65, 100, 200] {
+            c.set(i);
+        }
+        a.and_assign(&c);
+        assert!(a.get(0));
+        assert!(!a.get(64));
+        assert!(!a.get(65));
+        assert!(a.get(100));
+        assert!(!a.get(200));
+        assert!(!a.get(287));
+        assert_eq!(a.cardinality(), 2);
+    }
+
+    #[test]
+    fn invert_all_complements_and_clears_padding() {
+        let mut b = BitMatrix::new();
+        b.set(5);
+        b.set(287);
+        b.invert_all();
+        assert!(!b.get(5));
+        assert!(!b.get(287));
+        assert!(b.get(0));
+        // Bits beyond BITSET_SIZE must not be set after invert_all
+        assert_eq!(b.cardinality(), (BITSET_SIZE as u32) - 2);
+    }
+
+    #[test]
+    fn clear_above_removes_high_bits() {
+        let mut b = BitMatrix::new();
+        for i in 0..BITSET_SIZE {
+            b.set(i);
+        }
+        b.clear_above(282);
+        assert!(b.get(0));
+        assert!(b.get(281));
+        assert!(!b.get(282));
+        assert!(!b.get(287));
+        assert_eq!(b.cardinality(), 282);
+    }
+
+    #[test]
+    fn clear_above_at_word_boundary() {
+        let mut b = BitMatrix::new();
+        for i in 0..BITSET_SIZE {
+            b.set(i);
+        }
+        b.clear_above(192);
+        assert!(b.get(191));
+        assert!(!b.get(192));
+        assert_eq!(b.cardinality(), 192);
+    }
+
+    #[test]
+    fn is_empty_distinguishes_zero_from_nonzero() {
+        let mut b = BitMatrix::new();
+        assert!(b.is_empty());
+        b.set(287);
+        assert!(!b.is_empty());
+        b.clear(287);
+        assert!(b.is_empty());
+    }
+}
