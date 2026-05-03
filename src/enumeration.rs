@@ -213,3 +213,60 @@ pub fn create_enumerator(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// 6-vertex graph with mixed red/blue edges (15 edges total).
+    /// Bitstring "110101101010101" → 8 red bits, 7 blue. Pair count = 8 * 7 = 56.
+    const FIXTURE_BITS: &str = "110101101010101";
+
+    fn normalize_pair(a: WorkUnitEdge, b: WorkUnitEdge) -> ((u16, u16), (u16, u16)) {
+        let na = if a.vertex_one < a.vertex_two {
+            (a.vertex_one, a.vertex_two)
+        } else {
+            (a.vertex_two, a.vertex_one)
+        };
+        let nb = if b.vertex_one < b.vertex_two {
+            (b.vertex_one, b.vertex_two)
+        } else {
+            (b.vertex_two, b.vertex_one)
+        };
+        (na, nb)
+    }
+
+    fn assert_enumerator_bijective(enumerator: &dyn WorkEnumerator) {
+        let total = enumerator.total_pairs();
+        assert!(total > 0);
+        let mut seen: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
+        for i in 0..total {
+            let (red, blue) = enumerator.index_to_edge_pair(i);
+            let key = normalize_pair(red, blue);
+            assert!(seen.insert(key), "duplicate at index {i}");
+        }
+        assert_eq!(seen.len() as i64, total, "no gaps allowed in enumeration");
+    }
+
+    #[test]
+    fn basic_enumerator_index_to_edge_pair_is_bijective() {
+        let g = Graph::from_bitstring(FIXTURE_BITS, 6);
+        assert_enumerator_bijective(&BasicEnumerator::new(&g));
+    }
+
+    #[test]
+    fn dual_cardinality_enumerator_is_bijective() {
+        let g = Graph::from_bitstring(FIXTURE_BITS, 6);
+        assert_enumerator_bijective(&DualCardinalityEnumerator::new(&g));
+    }
+
+    #[test]
+    fn basic_enumerator_total_pairs_matches_red_times_blue() {
+        let g = Graph::from_bitstring(FIXTURE_BITS, 6);
+        let red_count: i64 = FIXTURE_BITS.chars().filter(|c| *c == '1').count() as i64;
+        let blue_count: i64 = FIXTURE_BITS.chars().filter(|c| *c == '0').count() as i64;
+        let enumerator = BasicEnumerator::new(&g);
+        assert_eq!(enumerator.total_pairs(), red_count * blue_count);
+    }
+}

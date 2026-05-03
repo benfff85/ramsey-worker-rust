@@ -332,3 +332,76 @@ fn bron_kerbosch_count_no_x_with_limit(
 
     (count, false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Graph;
+
+    #[test]
+    fn k5_has_exactly_one_monochromatic_5_clique() {
+        let bits = "1".repeat(10);
+        let mut g = Graph::from_bitstring(&bits, 5);
+        let cliques = get_all_cliques(&mut g, 5);
+        // K5 has 1 red 5-clique; complement has 0 5-cliques.
+        assert_eq!(cliques.len(), 1);
+        let count = get_cliques_comprehensive(&mut g, 5);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn empty_5v_graph_has_one_blue_5_clique() {
+        let bits = "0".repeat(10);
+        let mut g = Graph::from_bitstring(&bits, 5);
+        // No red edges, but the complement is K5 → 1 blue 5-clique.
+        let cliques = get_all_cliques(&mut g, 5);
+        assert_eq!(cliques.len(), 1);
+        let count = get_cliques_comprehensive(&mut g, 5);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn k4_has_zero_5_cliques_either_color() {
+        // K4 (4 vertices, all 6 edges set). Cannot contain any 5-clique
+        // because there are only 4 vertices.
+        let bits = "1".repeat(6);
+        let mut g = Graph::from_bitstring(&bits, 4);
+        let cliques = get_all_cliques(&mut g, 5);
+        assert_eq!(cliques.len(), 0);
+        assert_eq!(get_cliques_comprehensive(&mut g, 5), 0);
+    }
+
+    #[test]
+    fn get_all_cliques_matches_comprehensive_count_on_small_random_graphs() {
+        // Each bitstring is exhaustively chosen for n=6 (15 edges → 15-bit strings).
+        // Sample a handful of fixed seeds; both algorithms must agree on count.
+        let cases = [
+            "000000000000000",
+            "111111111111111",
+            "101010101010101",
+            "110011001100110",
+            "111000111000111",
+            "010101010101010",
+        ];
+        for bits in cases {
+            let mut g = Graph::from_bitstring(bits, 6);
+            let by_collect = get_all_cliques(&mut g, 4).len() as i32;
+            let by_count = get_cliques_comprehensive(&mut g, 4);
+            assert_eq!(
+                by_collect, by_count,
+                "mismatch on bits={bits} for clique_size=4: collect={by_collect}, count={by_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn flipping_edge_changes_clique_count() {
+        // K5 has 1 red 5-clique. Flip one edge → no monochromatic 5-clique
+        // (4 red edges + 1 blue edge means neither color has a K5).
+        let bits = "1".repeat(10);
+        let mut g = Graph::from_bitstring(&bits, 5);
+        assert_eq!(get_cliques_comprehensive(&mut g, 5), 1);
+        g.flip_edges(&[crate::graph::WorkUnitEdge { vertex_one: 0, vertex_two: 1 }]);
+        assert_eq!(get_cliques_comprehensive(&mut g, 5), 0);
+    }
+}
