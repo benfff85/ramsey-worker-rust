@@ -6,6 +6,7 @@ use crate::graph::Graph;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::RedisClient;
 use crate::sa::{SaConfig, run_sa};
+use crate::tabu::{TabuConfig, run_tabu};
 use crate::vds::{VdsConfig, run_vds};
 use crate::{log_error, log_info};
 use chrono::Utc;
@@ -38,6 +39,9 @@ pub struct Worker {
     // Variable-depth search mode config
     vds_mode: bool,
     vds_config: VdsConfig,
+    // Tabu search mode config
+    tabu_mode: bool,
+    tabu_config: TabuConfig,
 }
 
 impl Worker {
@@ -64,6 +68,14 @@ impl Worker {
         vds_worsening_tolerance: i32,
         vds_random_seed: Option<u64>,
         vds_start_depth: usize,
+        tabu_mode: bool,
+        tabu_max_iterations: u64,
+        tabu_base_tenure: usize,
+        tabu_max_tenure: usize,
+        tabu_restart_after: u64,
+        tabu_candidate_pool_size: usize,
+        tabu_diversification_pairs: usize,
+        tabu_random_seed: Option<u64>,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -98,6 +110,16 @@ impl Worker {
                 worsening_tolerance: vds_worsening_tolerance,
                 random_seed: vds_random_seed,
                 start_depth: vds_start_depth,
+            },
+            tabu_mode,
+            tabu_config: TabuConfig {
+                max_iterations: tabu_max_iterations,
+                base_tabu_tenure: tabu_base_tenure,
+                max_tabu_tenure: tabu_max_tenure,
+                restart_after: tabu_restart_after,
+                candidate_pool_size: tabu_candidate_pool_size,
+                diversification_pair_count: tabu_diversification_pairs,
+                random_seed: tabu_random_seed,
             },
         }
     }
@@ -174,9 +196,71 @@ impl Worker {
             self.cycle_simulated_annealing(stage_id).await
         } else if self.vds_mode {
             self.cycle_variable_depth_search(stage_id).await
+        } else if self.tabu_mode {
+            self.cycle_tabu_search(stage_id).await
         } else {
             self.cycle_counter_based(stage_id).await
         }
+    }
+
+    async fn cycle_tabu_search(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
+        if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
+            let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            if let Some(config) = redis_client.get_stage_config(stage_id).await? {
+                log_info!(
+                    "Tabu: Loaded stage config: baseGraphId={}, strategy={:?}",
+                    config.base_graph_id, config.strategy
+                );
+                self.stage_config = Some(config);
+            } else {
+                return Err(format!("Stage config not found in Redis for stage {}", stage_id).into());
+            }
+        }
+
+        let config = self.stage_config.as_ref().unwrap();
+        let base_graph_id = config.base_graph_id;
+
+        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
+        let mut clique_collection = CliqueCollection::new(self.vertex_count);
+        clique_collection.set_cliques(all_cliques, self.vertex_count);
+        get_cliques_comprehensive(&mut base_graph, self.clique_size);
+
+        let threshold: Option<i32> = {
+            let redis = self.redis_client.as_mut().ok_or("Redis not connected")?;
+            redis
+                .get_top_results_threshold(stage_id, self.top_results_count)
+                .await
+                .unwrap_or(None)
+        };
+
+        let result = run_tabu(&base_graph, self.clique_size, &self.tabu_config, &clique_collection, threshold);
+
+        // Submit if it beats the threshold (matches SA pattern: bitstring submission).
+        let should_submit = match threshold {
+            None => true,
+            Some(t) => result.best_clique_count < t,
+        };
+
+        if should_submit {
+            if let Some(redis) = self.redis_client.as_mut() {
+                let _ = redis
+                    .add_sa_result_to_top_results(
+                        stage_id,
+                        base_graph_id,
+                        &result.best_graph_bitstring,
+                        result.best_clique_count,
+                        self.top_results_count,
+                    )
+                    .await;
+            }
+        }
+
+        if let Some(redis) = self.redis_client.as_mut() {
+            let _ = redis.increment_processed_count(stage_id, 1).await;
+        }
+
+        Ok(1)
     }
 
     /// Counter-based work cycle: claim index ranges and enumerate locally
