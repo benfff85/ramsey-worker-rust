@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use crate::algorithm::get_cliques_comprehensive;
+use crate::algorithm::{get_cliques_comprehensive, get_new_cliques};
 use crate::clique_collection::CliqueCollection;
 use crate::graph::{Graph, WorkUnitEdge};
 use crate::log_info;
@@ -222,19 +222,25 @@ fn generate_candidates(
 
 /// Evaluate the delta in monochromatic clique count if the given pair were flipped
 /// from the current graph. Negative = improvement. Internally restores graph state.
+///
+/// Uses edge-seeded Bron-Kerbosch via `get_new_cliques`: counts only cliques
+/// containing the flipped edges in their pre-flip color (destroyed) and post-flip
+/// color (created). This is the same primitive the exhaustive engine uses, and is
+/// orders of magnitude cheaper than `get_cliques_comprehensive` on a graph with
+/// hundreds of thousands of cliques. Operates on the current graph state directly
+/// — no dependency on a static CliqueCollection.
 fn evaluate_pair_delta(
     graph: &mut Graph,
     clique_size: usize,
     red: &WorkUnitEdge,
     blue: &WorkUnitEdge,
-    current_count: i32,
 ) -> i32 {
-    // Apply the flips, count, restore.
     let edges = [red.clone(), blue.clone()];
+    let destroyed = get_new_cliques(graph, clique_size, &edges);
     graph.flip_edges(&edges);
-    let new_count = get_cliques_comprehensive(graph, clique_size);
+    let created = get_new_cliques(graph, clique_size, &edges);
     graph.flip_edges(&edges);
-    new_count - current_count
+    created - destroyed
 }
 
 /// Pick the best (red, blue) pair from the candidate pools by minimum delta.
@@ -244,7 +250,6 @@ fn pick_best_move(
     clique_size: usize,
     red_pool: &[WorkUnitEdge],
     blue_pool: &[WorkUnitEdge],
-    current_count: i32,
 ) -> Option<(WorkUnitEdge, WorkUnitEdge, i32)> {
     if red_pool.is_empty() || blue_pool.is_empty() {
         return None;
@@ -252,7 +257,7 @@ fn pick_best_move(
     let mut best: Option<(WorkUnitEdge, WorkUnitEdge, i32)> = None;
     for r in red_pool {
         for b in blue_pool {
-            let delta = evaluate_pair_delta(graph, clique_size, r, b, current_count);
+            let delta = evaluate_pair_delta(graph, clique_size, r, b);
             match &best {
                 None => best = Some((r.clone(), b.clone(), delta)),
                 Some((_, _, d)) if delta < *d => best = Some((r.clone(), b.clone(), delta)),
@@ -386,7 +391,7 @@ pub fn run_tabu(
         }
 
         let move_choice = pick_best_move(
-            &mut graph, clique_size, &red_pool, &blue_pool, current_count,
+            &mut graph, clique_size, &red_pool, &blue_pool,
         );
 
         let (red, blue, delta) = match move_choice {
@@ -538,21 +543,36 @@ mod tests {
 
     #[test]
     fn evaluate_pair_delta_restores_graph_state() {
-        // K5 with one edge flipped to red+blue mix. Eval delta of flipping
-        // (0,1) and (2,3); verify graph state restored.
+        // Make a graph with both red and blue edges, then verify evaluate_pair_delta
+        // doesn't mutate state.
         let mut g = Graph::from_bitstring(&k5_bitstring(), 5);
-        let before = g.to_bitstring();
-        let red = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };
-        // (2,3) is also red in K5; we need a "blue" edge. Flip (0,1) first to make it blue.
-        g.flip_edges(&[red.clone()]);
-        let blue = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };
-        // Now blue edge is (0,1); pick another red edge.
-        let red2 = WorkUnitEdge { vertex_one: 2, vertex_two: 3 };
+        let prep_flip = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };
+        g.flip_edges(&[prep_flip]); // (0,1) is now blue
         let mid = g.to_bitstring();
-        let current = get_cliques_comprehensive(&mut g, 5);
-        let _delta = evaluate_pair_delta(&mut g, 5, &red2, &blue, current);
+        let blue = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };
+        let red = WorkUnitEdge { vertex_one: 2, vertex_two: 3 };
+        let _delta = evaluate_pair_delta(&mut g, 5, &red, &blue);
         assert_eq!(g.to_bitstring(), mid, "evaluate_pair_delta must restore graph state");
-        let _ = before; // unused, kept for clarity
+    }
+
+    #[test]
+    fn evaluate_pair_delta_matches_full_recount() {
+        // Sanity: incremental delta should equal (count after flip) - (count before).
+        let bits = "1110011010";  // 5-vertex, mixed colors
+        let mut g = Graph::from_bitstring(bits, 5);
+        let red = WorkUnitEdge { vertex_one: 0, vertex_two: 1 };  // currently red
+        let blue = WorkUnitEdge { vertex_one: 0, vertex_two: 4 }; // currently blue
+        assert!(g.adjacency[0].get(1));
+        assert!(!g.adjacency[0].get(4));
+
+        let before_count = get_cliques_comprehensive(&mut g, 4);
+        let delta = evaluate_pair_delta(&mut g, 4, &red, &blue);
+        g.flip_edges(&[red.clone(), blue.clone()]);
+        let after_count = get_cliques_comprehensive(&mut g, 4);
+        g.flip_edges(&[red, blue]);  // restore for cleanliness
+
+        assert_eq!(delta, after_count - before_count,
+            "incremental delta must equal full-recount delta");
     }
 
     #[test]
