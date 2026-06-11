@@ -78,6 +78,7 @@ pub enum WorkEnumerationStrategy {
     BASIC,
     SINGLE_EDGE_CARDINALITY,
     DUAL_EDGE_CARDINALITY,
+    DUAL_EDGE_CARDINALITY_WITH_SINGLES,
 }
 
 /// Stage configuration stored in Redis for counter-based work

@@ -1,8 +1,8 @@
-use crate::bitset::{BITSET_SIZE, BitMatrix};
+use crate::bitset::{BitMatrix, BITSET_SIZE};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WorkUnitEdge {
     #[serde(rename = "vertexOne")]
     pub vertex_one: u16,
@@ -139,14 +139,17 @@ mod tests {
         g.invert();
         for i in 0..5 {
             for j in 0..5 {
-                assert!(!g.adjacency[i].get(j), "edge ({i},{j}) should be cleared after invert");
+                assert!(
+                    !g.adjacency[i].get(j),
+                    "edge ({i},{j}) should be cleared after invert"
+                );
             }
         }
     }
 
     #[test]
     fn invert_is_self_inverse() {
-        let original = "101100110100";  // arbitrary 6-vertex graph (15 edges)
+        let original = "101100110100"; // arbitrary 6-vertex graph (15 edges)
         let bits = format!("{}{}", original, "0".repeat(15 - original.len()));
         let mut g = Graph::from_bitstring(&bits, 6);
         let before = g.to_bitstring();
@@ -158,10 +161,16 @@ mod tests {
     #[test]
     fn flip_edges_toggles_both_directions() {
         let mut g = Graph::new(5);
-        g.flip_edges(&[WorkUnitEdge { vertex_one: 1, vertex_two: 3 }]);
+        g.flip_edges(&[WorkUnitEdge {
+            vertex_one: 1,
+            vertex_two: 3,
+        }]);
         assert!(g.adjacency[1].get(3));
         assert!(g.adjacency[3].get(1));
-        g.flip_edges(&[WorkUnitEdge { vertex_one: 1, vertex_two: 3 }]);
+        g.flip_edges(&[WorkUnitEdge {
+            vertex_one: 1,
+            vertex_two: 3,
+        }]);
         assert!(!g.adjacency[1].get(3));
         assert!(!g.adjacency[3].get(1));
     }

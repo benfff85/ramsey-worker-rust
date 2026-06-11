@@ -10,7 +10,8 @@ mod common;
 
 use common::{random_bitstring, red_count};
 use ramsey_worker_rust::enumeration::{
-    create_enumerator, BasicEnumerator, DualCardinalityEnumerator, WorkEnumerator,
+    BasicEnumerator, DualCardinalityEnumerator, DualCardinalityWithSinglesEnumerator,
+    WorkEnumerator, WorkUnit, create_enumerator,
 };
 use ramsey_worker_rust::graph::Graph;
 use ramsey_worker_rust::model::WorkEnumerationStrategy;
@@ -52,10 +53,12 @@ fn both_enumerators_are_bijective_at_scale() {
         Box::new(BasicEnumerator::new(&g)) as Box<dyn WorkEnumerator>,
         Box::new(DualCardinalityEnumerator::new(&g)) as Box<dyn WorkEnumerator>,
     ] {
-        assert_eq!(enumerator.total_pairs(), red * blue);
+        assert_eq!(enumerator.total_work_units(), red * blue);
         let mut seen: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
-        for i in 0..enumerator.total_pairs() {
-            let (r, b) = enumerator.index_to_edge_pair(i);
+        for i in 0..enumerator.total_work_units() {
+            let WorkUnit::PairFlip(r, b) = enumerator.index_to_work_unit(i) else {
+                panic!("expected pair at index {i}");
+            };
             assert!(
                 seen.insert((pair_key(&r), pair_key(&b))),
                 "duplicate pair at index {i}"
@@ -77,19 +80,27 @@ fn enumerators_are_deterministic_across_independent_instances() {
 
     let a = DualCardinalityEnumerator::new(&g1);
     let b = DualCardinalityEnumerator::new(&g2);
-    assert_eq!(a.total_pairs(), b.total_pairs());
-    for i in 0..a.total_pairs() {
-        let (ar, ab) = a.index_to_edge_pair(i);
-        let (br, bb) = b.index_to_edge_pair(i);
+    assert_eq!(a.total_work_units(), b.total_work_units());
+    for i in 0..a.total_work_units() {
+        let WorkUnit::PairFlip(ar, ab) = a.index_to_work_unit(i) else {
+            panic!("expected pair at index {i}");
+        };
+        let WorkUnit::PairFlip(br, bb) = b.index_to_work_unit(i) else {
+            panic!("expected pair at index {i}");
+        };
         assert_eq!(pair_key(&ar), pair_key(&br), "red mismatch at index {i}");
         assert_eq!(pair_key(&ab), pair_key(&bb), "blue mismatch at index {i}");
     }
 
     let a = BasicEnumerator::new(&g1);
     let b = BasicEnumerator::new(&g2);
-    for i in 0..a.total_pairs() {
-        let (ar, ab) = a.index_to_edge_pair(i);
-        let (br, bb) = b.index_to_edge_pair(i);
+    for i in 0..a.total_work_units() {
+        let WorkUnit::PairFlip(ar, ab) = a.index_to_work_unit(i) else {
+            panic!("expected pair at index {i}");
+        };
+        let WorkUnit::PairFlip(br, bb) = b.index_to_work_unit(i) else {
+            panic!("expected pair at index {i}");
+        };
         assert_eq!(pair_key(&ar), pair_key(&br), "red mismatch at index {i}");
         assert_eq!(pair_key(&ab), pair_key(&bb), "blue mismatch at index {i}");
     }
@@ -101,8 +112,10 @@ fn emitted_pairs_have_correct_colors() {
     let bits = random_bitstring(SEED, N);
     let g = Graph::from_bitstring(&bits, N);
     let enumerator = DualCardinalityEnumerator::new(&g);
-    for i in 0..enumerator.total_pairs() {
-        let (r, b) = enumerator.index_to_edge_pair(i);
+    for i in 0..enumerator.total_work_units() {
+        let WorkUnit::PairFlip(r, b) = enumerator.index_to_work_unit(i) else {
+            panic!("expected pair at index {i}");
+        };
         assert!(
             g.adjacency[r.vertex_one as usize].get(r.vertex_two as usize),
             "index {i}: first edge not red"
@@ -126,8 +139,10 @@ fn dual_cardinality_orders_red_edges_by_descending_cardinality() {
     // non-increasing.
     let mut prev = i32::MAX;
     let mut idx = 0;
-    while idx < enumerator.total_pairs() {
-        let (r, _) = enumerator.index_to_edge_pair(idx);
+    while idx < enumerator.total_work_units() {
+        let WorkUnit::PairFlip(r, _) = enumerator.index_to_work_unit(idx) else {
+            panic!("expected pair at index {idx}");
+        };
         let c = cardinality(&g, r.vertex_one as usize, r.vertex_two as usize, true);
         assert!(
             c <= prev,
@@ -152,9 +167,63 @@ fn create_enumerator_dispatches_all_strategies_with_consistent_totals() {
     ] {
         let enumerator = create_enumerator(&strategy, &g);
         assert_eq!(
-            enumerator.total_pairs(),
+            enumerator.total_work_units(),
             red * blue,
             "strategy {strategy:?}"
         );
     }
+
+    let singles = if red == blue {
+        red + blue
+    } else {
+        red.max(blue)
+    };
+    let hybrid = create_enumerator(
+        &WorkEnumerationStrategy::DUAL_EDGE_CARDINALITY_WITH_SINGLES,
+        &g,
+    );
+    assert_eq!(hybrid.total_work_units(), singles + red * blue);
+}
+
+#[test]
+fn hybrid_enumerator_is_bijective_and_deterministic_at_scale() {
+    let bits = random_bitstring(SEED, N);
+    let g1 = Graph::from_bitstring(&bits, N);
+    let g2 = Graph::from_bitstring(&bits, N);
+    let a = DualCardinalityWithSinglesEnumerator::new(&g1);
+    let b = DualCardinalityWithSinglesEnumerator::new(&g2);
+
+    let red = red_count(&bits) as i64;
+    let blue = (bits.len() - red_count(&bits)) as i64;
+    let singles = if red == blue {
+        red + blue
+    } else {
+        red.max(blue)
+    };
+    assert_eq!(a.total_work_units(), singles + red * blue);
+
+    // Bijectivity over the full index space, treating singles and pairs as
+    // distinct key spaces; plus instance determinism at every index.
+    let mut seen_singles: HashSet<(u16, u16)> = HashSet::new();
+    let mut seen_pairs: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
+    for i in 0..a.total_work_units() {
+        let ua = a.index_to_work_unit(i);
+        let ub = b.index_to_work_unit(i);
+        assert_eq!(ua, ub, "instances diverge at index {i}");
+        match ua {
+            WorkUnit::SingleFlip(e) => {
+                assert!(i < singles, "single appeared in pair region at {i}");
+                assert!(seen_singles.insert(pair_key(&e)), "dup single at {i}");
+            }
+            WorkUnit::PairFlip(r, bl) => {
+                assert!(i >= singles, "pair appeared in singles region at {i}");
+                assert!(
+                    seen_pairs.insert((pair_key(&r), pair_key(&bl))),
+                    "dup pair at {i}"
+                );
+            }
+        }
+    }
+    assert_eq!(seen_singles.len() as i64, singles);
+    assert_eq!(seen_pairs.len() as i64, red * blue);
 }
