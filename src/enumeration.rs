@@ -5,13 +5,21 @@
 
 use crate::graph::{Graph, WorkUnitEdge};
 
+/// A unit of work: either a single edge flip or a (red, blue) pair flip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkUnit {
+    SingleFlip(WorkUnitEdge),
+    /// (red_edge, blue_edge)
+    PairFlip(WorkUnitEdge, WorkUnitEdge),
+}
+
 /// Trait for work enumeration strategies
 pub trait WorkEnumerator {
-    /// Convert a work index to the corresponding edge pair
-    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge);
+    /// Convert a work index to the corresponding work unit
+    fn index_to_work_unit(&self, index: i64) -> WorkUnit;
 
     /// Get total number of work units
-    fn total_pairs(&self) -> i64;
+    fn total_work_units(&self) -> i64;
 }
 
 /// Edge with computed cardinality for sorting
@@ -65,7 +73,7 @@ impl BasicEnumerator {
 }
 
 impl WorkEnumerator for BasicEnumerator {
-    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge) {
+    fn index_to_work_unit(&self, index: i64) -> WorkUnit {
         let blue_count = self.blue_edges.len() as i64;
         let red_idx = (index / blue_count) as usize;
         let blue_idx = (index % blue_count) as usize;
@@ -73,7 +81,7 @@ impl WorkEnumerator for BasicEnumerator {
         let red_edge = &self.red_edges[red_idx];
         let blue_edge = &self.blue_edges[blue_idx];
 
-        (
+        WorkUnit::PairFlip(
             WorkUnitEdge {
                 vertex_one: red_edge.vertex_one,
                 vertex_two: red_edge.vertex_two,
@@ -85,7 +93,7 @@ impl WorkEnumerator for BasicEnumerator {
         )
     }
 
-    fn total_pairs(&self) -> i64 {
+    fn total_work_units(&self) -> i64 {
         self.total_pairs
     }
 }
@@ -172,7 +180,7 @@ impl DualCardinalityEnumerator {
 }
 
 impl WorkEnumerator for DualCardinalityEnumerator {
-    fn index_to_edge_pair(&self, index: i64) -> (WorkUnitEdge, WorkUnitEdge) {
+    fn index_to_work_unit(&self, index: i64) -> WorkUnit {
         let blue_count = self.blue_edges.len() as i64;
         let red_idx = (index / blue_count) as usize;
         let blue_idx = (index % blue_count) as usize;
@@ -180,7 +188,7 @@ impl WorkEnumerator for DualCardinalityEnumerator {
         let red_edge = &self.red_edges[red_idx];
         let blue_edge = &self.blue_edges[blue_idx];
 
-        (
+        WorkUnit::PairFlip(
             WorkUnitEdge {
                 vertex_one: red_edge.vertex_one,
                 vertex_two: red_edge.vertex_two,
@@ -192,7 +200,7 @@ impl WorkEnumerator for DualCardinalityEnumerator {
         )
     }
 
-    fn total_pairs(&self) -> i64 {
+    fn total_work_units(&self) -> i64 {
         self.total_pairs
     }
 }
@@ -238,11 +246,13 @@ mod tests {
     }
 
     fn assert_enumerator_bijective(enumerator: &dyn WorkEnumerator) {
-        let total = enumerator.total_pairs();
+        let total = enumerator.total_work_units();
         assert!(total > 0);
         let mut seen: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
         for i in 0..total {
-            let (red, blue) = enumerator.index_to_edge_pair(i);
+            let WorkUnit::PairFlip(red, blue) = enumerator.index_to_work_unit(i) else {
+                panic!("pair-only enumerator emitted a non-pair unit at index {i}");
+            };
             let key = normalize_pair(red, blue);
             assert!(seen.insert(key), "duplicate at index {i}");
         }
@@ -250,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_enumerator_index_to_edge_pair_is_bijective() {
+    fn basic_enumerator_index_to_work_unit_is_bijective() {
         let g = Graph::from_bitstring(FIXTURE_BITS, 6);
         assert_enumerator_bijective(&BasicEnumerator::new(&g));
     }
@@ -262,11 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn basic_enumerator_total_pairs_matches_red_times_blue() {
+    fn basic_enumerator_total_work_units_matches_red_times_blue() {
         let g = Graph::from_bitstring(FIXTURE_BITS, 6);
         let red_count: i64 = FIXTURE_BITS.chars().filter(|c| *c == '1').count() as i64;
         let blue_count: i64 = FIXTURE_BITS.chars().filter(|c| *c == '0').count() as i64;
         let enumerator = BasicEnumerator::new(&g);
-        assert_eq!(enumerator.total_pairs(), red_count * blue_count);
+        assert_eq!(enumerator.total_work_units(), red_count * blue_count);
     }
 }

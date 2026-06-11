@@ -1,13 +1,13 @@
 use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
-use crate::enumeration::{WorkEnumerator, create_enumerator};
+use crate::enumeration::{create_enumerator, WorkEnumerator, WorkUnit};
 use crate::graph::Graph;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::RedisClient;
-use crate::sa::{SaConfig, run_sa};
-use crate::tabu::{TabuConfig, run_tabu};
-use crate::vds::{VdsConfig, run_vds};
+use crate::sa::{run_sa, SaConfig};
+use crate::tabu::{run_tabu, TabuConfig};
+use crate::vds::{run_vds, VdsConfig};
 use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -209,18 +209,22 @@ impl Worker {
             if let Some(config) = redis_client.get_stage_config(stage_id).await? {
                 log_info!(
                     "Tabu: Loaded stage config: baseGraphId={}, strategy={:?}",
-                    config.base_graph_id, config.strategy
+                    config.base_graph_id,
+                    config.strategy
                 );
                 self.stage_config = Some(config);
             } else {
-                return Err(format!("Stage config not found in Redis for stage {}", stage_id).into());
+                return Err(
+                    format!("Stage config not found in Redis for stage {}", stage_id).into(),
+                );
             }
         }
 
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
 
-        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let mut base_graph =
+            Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
         let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
         let mut clique_collection = CliqueCollection::new(self.vertex_count);
         clique_collection.set_cliques(all_cliques, self.vertex_count);
@@ -234,7 +238,13 @@ impl Worker {
                 .unwrap_or(None)
         };
 
-        let result = run_tabu(&base_graph, self.clique_size, &self.tabu_config, &clique_collection, threshold);
+        let result = run_tabu(
+            &base_graph,
+            self.clique_size,
+            &self.tabu_config,
+            &clique_collection,
+            threshold,
+        );
 
         // Submit if it beats the threshold (matches SA pattern: bitstring submission).
         let should_submit = match threshold {
@@ -353,8 +363,10 @@ impl Worker {
 
         // Process each work unit in the range
         for idx in start_index..end_index {
-            let (red_edge, blue_edge) = enumerator.index_to_edge_pair(idx);
-            let edges_to_flip = vec![red_edge, blue_edge];
+            let edges_to_flip = match enumerator.index_to_work_unit(idx) {
+                WorkUnit::SingleFlip(edge) => vec![edge],
+                WorkUnit::PairFlip(red_edge, blue_edge) => vec![red_edge, blue_edge],
+            };
 
             let broken = clique_collection.get_count_of_cliques_containing_edges(&edges_to_flip);
             let base_total = clique_collection.total() as i32;
@@ -368,7 +380,11 @@ impl Worker {
                     Some(threshold) => {
                         let max_count = threshold - 1; // Must be strictly less
                         let max_new = max_count - base_total + broken;
-                        if max_new < 0 { 0 } else { max_new }
+                        if max_new < 0 {
+                            0
+                        } else {
+                            max_new
+                        }
                     }
                     None => i32::MAX, // No threshold, count everything
                 };
@@ -483,7 +499,8 @@ impl Worker {
 
         // Build graph and CliqueCollection from stage config.
         // The clique collection provides per-edge participation scores for guided edge selection.
-        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let mut base_graph =
+            Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
         let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
         let mut clique_collection = CliqueCollection::new(self.vertex_count);
         clique_collection.set_cliques(all_cliques, self.vertex_count);
@@ -501,7 +518,13 @@ impl Worker {
         };
 
         // Run one complete SA schedule
-        let result = run_sa(&base_graph, self.clique_size, &self.sa_config, &clique_collection, threshold);
+        let result = run_sa(
+            &base_graph,
+            self.clique_size,
+            &self.sa_config,
+            &clique_collection,
+            threshold,
+        );
 
         // Submit best result to Redis if it's worth tracking
         let should_submit = match threshold {
@@ -532,7 +555,10 @@ impl Worker {
         Ok(1)
     }
 
-    async fn cycle_variable_depth_search(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
+    async fn cycle_variable_depth_search(
+        &mut self,
+        stage_id: i32,
+    ) -> Result<usize, Box<dyn Error>> {
         // Ensure we have stage config cached
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
             let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
@@ -554,7 +580,8 @@ impl Worker {
         let base_graph_id = config.base_graph_id;
 
         // Build graph and CliqueCollection from stage config.
-        let mut base_graph = Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
+        let mut base_graph =
+            Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
         let all_cliques = get_all_cliques(&mut base_graph, self.clique_size);
         let base_clique_count = all_cliques.len() as i32;
         let mut clique_collection = CliqueCollection::new(self.vertex_count);
@@ -582,10 +609,11 @@ impl Worker {
         );
 
         // Submit best result to Redis if it improved and beats the threshold
-        let should_submit = result.improved && match threshold {
-            None => true,
-            Some(t) => result.final_clique_count < t,
-        };
+        let should_submit = result.improved
+            && match threshold {
+                None => true,
+                Some(t) => result.final_clique_count < t,
+            };
 
         if should_submit {
             if let Some(redis) = self.redis_client.as_mut() {
