@@ -1,13 +1,13 @@
 use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
-use crate::enumeration::{create_enumerator, WorkEnumerator, WorkUnit};
+use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::Graph;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::RedisClient;
-use crate::sa::{run_sa, SaConfig};
-use crate::tabu::{run_tabu, TabuConfig};
-use crate::vds::{run_vds, VdsConfig};
+use crate::sa::{SaConfig, run_sa};
+use crate::tabu::{TabuConfig, run_tabu};
+use crate::vds::{VdsConfig, run_vds};
 use crate::{log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -313,7 +313,18 @@ impl Worker {
 
                 // Create enumerator for this stage (uses cached graph)
                 let graph = self.graph_cache.get(&config.base_graph_id).unwrap();
-                self.enumerator = Some(create_enumerator(&config.strategy, graph));
+                let enumerator = create_enumerator(&config.strategy, graph);
+                if enumerator.total_work_units() != config.total_pairs {
+                    return Err(format!(
+                        "Enumerator total_work_units {} != stage config totalPairs {} for stage {} (strategy {:?}) — worker and queue manager disagree on the work space; refusing to process",
+                        enumerator.total_work_units(),
+                        config.total_pairs,
+                        stage_id,
+                        config.strategy
+                    )
+                    .into());
+                }
+                self.enumerator = Some(enumerator);
                 self.stage_config = Some(config);
             } else {
                 return Err(
@@ -380,11 +391,7 @@ impl Worker {
                     Some(threshold) => {
                         let max_count = threshold - 1; // Must be strictly less
                         let max_new = max_count - base_total + broken;
-                        if max_new < 0 {
-                            0
-                        } else {
-                            max_new
-                        }
+                        if max_new < 0 { 0 } else { max_new }
                     }
                     None => i32::MAX, // No threshold, count everything
                 };
