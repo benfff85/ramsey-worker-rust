@@ -10,7 +10,8 @@ mod common;
 
 use common::{random_bitstring, red_count};
 use ramsey_worker_rust::enumeration::{
-    create_enumerator, BasicEnumerator, DualCardinalityEnumerator, WorkEnumerator, WorkUnit,
+    BasicEnumerator, DualCardinalityEnumerator, DualCardinalityWithSinglesEnumerator,
+    WorkEnumerator, WorkUnit, create_enumerator,
 };
 use ramsey_worker_rust::graph::Graph;
 use ramsey_worker_rust::model::WorkEnumerationStrategy;
@@ -171,4 +172,58 @@ fn create_enumerator_dispatches_all_strategies_with_consistent_totals() {
             "strategy {strategy:?}"
         );
     }
+
+    let singles = if red == blue {
+        red + blue
+    } else {
+        red.max(blue)
+    };
+    let hybrid = create_enumerator(
+        &WorkEnumerationStrategy::DUAL_EDGE_CARDINALITY_WITH_SINGLES,
+        &g,
+    );
+    assert_eq!(hybrid.total_work_units(), singles + red * blue);
+}
+
+#[test]
+fn hybrid_enumerator_is_bijective_and_deterministic_at_scale() {
+    let bits = random_bitstring(SEED, N);
+    let g1 = Graph::from_bitstring(&bits, N);
+    let g2 = Graph::from_bitstring(&bits, N);
+    let a = DualCardinalityWithSinglesEnumerator::new(&g1);
+    let b = DualCardinalityWithSinglesEnumerator::new(&g2);
+
+    let red = red_count(&bits) as i64;
+    let blue = (bits.len() - red_count(&bits)) as i64;
+    let singles = if red == blue {
+        red + blue
+    } else {
+        red.max(blue)
+    };
+    assert_eq!(a.total_work_units(), singles + red * blue);
+
+    // Bijectivity over the full index space, treating singles and pairs as
+    // distinct key spaces; plus instance determinism at every index.
+    let mut seen_singles: HashSet<(u16, u16)> = HashSet::new();
+    let mut seen_pairs: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
+    for i in 0..a.total_work_units() {
+        let ua = a.index_to_work_unit(i);
+        let ub = b.index_to_work_unit(i);
+        assert_eq!(ua, ub, "instances diverge at index {i}");
+        match ua {
+            WorkUnit::SingleFlip(e) => {
+                assert!(i < singles, "single appeared in pair region at {i}");
+                assert!(seen_singles.insert(pair_key(&e)), "dup single at {i}");
+            }
+            WorkUnit::PairFlip(r, bl) => {
+                assert!(i >= singles, "pair appeared in singles region at {i}");
+                assert!(
+                    seen_pairs.insert((pair_key(&r), pair_key(&bl))),
+                    "dup pair at {i}"
+                );
+            }
+        }
+    }
+    assert_eq!(seen_singles.len() as i64, singles);
+    assert_eq!(seen_pairs.len() as i64, red * blue);
 }
