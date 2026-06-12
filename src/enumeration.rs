@@ -205,14 +205,18 @@ impl WorkEnumerator for DualCardinalityEnumerator {
     }
 }
 
-/// DUAL_EDGE_CARDINALITY_WITH_SINGLES: single flips of the majority color
-/// first (indices [0, S), cardinality-descending), then the full
-/// DUAL_EDGE_CARDINALITY pair space shifted by S.
+/// DUAL_EDGE_CARDINALITY_WITH_SINGLES: single flips of every edge first
+/// (indices [0, S) with S = red + blue: the red block then the blue block,
+/// each cardinality-descending), then the full DUAL_EDGE_CARDINALITY pair
+/// space shifted by S.
 ///
-/// Majority-color-only singles keep |red − blue| ∈ {0, 1} across stage
-/// advancement: flipping a majority edge flips the sign of the imbalance but
-/// never grows it. When red and blue are exactly tied, both colors are
-/// enumerated (red block first, matching the pair ordering convention).
+/// Both colors are enumerated, so a single-flip improvement can move
+/// |red − blue| by 2 per stage advance. Balance is self-policing through the
+/// objective: heavily unbalanced colorings carry more monochromatic cliques,
+/// so improving flips cannot drift the balance far. (The earlier
+/// majority-color-only rule kept |red − blue| ≤ 1 but locked out
+/// minority-color improvers for whole stages, because pair flips preserve the
+/// imbalance sign.)
 pub struct DualCardinalityWithSinglesEnumerator {
     singles: Vec<ScoredEdge>,
     pairs: DualCardinalityEnumerator,
@@ -222,19 +226,11 @@ pub struct DualCardinalityWithSinglesEnumerator {
 impl DualCardinalityWithSinglesEnumerator {
     pub fn new(graph: &Graph) -> Self {
         let pairs = DualCardinalityEnumerator::new(graph);
-        let red_len = pairs.red_edges.len();
-        let blue_len = pairs.blue_edges.len();
 
-        // Reuse the already cardinality-sorted lists from the pair enumerator.
-        let singles: Vec<ScoredEdge> = if red_len > blue_len {
-            pairs.red_edges.clone()
-        } else if blue_len > red_len {
-            pairs.blue_edges.clone()
-        } else {
-            let mut both = pairs.red_edges.clone();
-            both.extend(pairs.blue_edges.iter().cloned());
-            both
-        };
+        // Reuse the already cardinality-sorted lists from the pair enumerator:
+        // red block first, matching the pair ordering convention.
+        let mut singles = pairs.red_edges.clone();
+        singles.extend(pairs.blue_edges.iter().cloned());
 
         let total = singles.len() as i64 + pairs.total_work_units();
         DualCardinalityWithSinglesEnumerator {
@@ -293,9 +289,9 @@ mod tests {
     /// Bitstring "110101101010101" → 9 red bits, 6 blue. Pair count = 9 * 6 = 54.
     const FIXTURE_BITS: &str = "110101101010101";
 
-    /// 6-vertex fixture: 9 red, 6 blue → majority red, singles = 9, pairs = 54.
+    /// 6-vertex fixture: 9 red, 6 blue → singles = 15 (red block then blue), pairs = 54.
     const HYBRID_FIXTURE: &str = "110101101010101";
-    /// 5-vertex tie fixture (10 edges): 5 red, 5 blue → singles = 10 (both colors), pairs = 25.
+    /// 5-vertex tie fixture (10 edges): 5 red, 5 blue → singles = 10, pairs = 25.
     const TIE_FIXTURE: &str = "1110011000";
 
     fn normalize_pair(a: WorkUnitEdge, b: WorkUnitEdge) -> ((u16, u16), (u16, u16)) {
@@ -348,21 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_singles_prefix_is_majority_color_each_exactly_once() {
+    fn hybrid_singles_prefix_covers_every_edge_exactly_once_red_block_first() {
         let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
         let e = DualCardinalityWithSinglesEnumerator::new(&g);
-        let singles_count: i64 = 9; // red majority (9 red, 6 blue)
-        assert_eq!(e.total_work_units(), singles_count + 9 * 6);
+        let red_count: i64 = 9;
+        let blue_count: i64 = 6;
+        let singles_count = red_count + blue_count;
+        assert_eq!(e.total_work_units(), singles_count + red_count * blue_count);
 
         let mut seen: HashSet<(u16, u16)> = HashSet::new();
         for i in 0..singles_count {
             match e.index_to_work_unit(i) {
                 WorkUnit::SingleFlip(edge) => {
-                    // Majority color is red: every single must be a red edge.
-                    assert!(
-                        g.adjacency[edge.vertex_one as usize].get(edge.vertex_two as usize),
-                        "single at index {i} is not red"
-                    );
+                    let is_red =
+                        g.adjacency[edge.vertex_one as usize].get(edge.vertex_two as usize);
+                    if i < red_count {
+                        assert!(is_red, "red block must come first (index {i})");
+                    } else {
+                        assert!(!is_red, "blue block must follow red block (index {i})");
+                    }
                     let key = if edge.vertex_one < edge.vertex_two {
                         (edge.vertex_one, edge.vertex_two)
                     } else {
@@ -373,6 +373,7 @@ mod tests {
                 other => panic!("expected SingleFlip at index {i}, got {other:?}"),
             }
         }
+        // Every edge of the graph appears exactly once across both blocks.
         assert_eq!(seen.len() as i64, singles_count);
     }
 
@@ -381,7 +382,7 @@ mod tests {
         let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
         let hybrid = DualCardinalityWithSinglesEnumerator::new(&g);
         let plain = DualCardinalityEnumerator::new(&g);
-        let singles_count: i64 = 9; // red majority (9 red, 6 blue)
+        let singles_count: i64 = 15; // 9 red + 6 blue
         for k in 0..plain.total_work_units() {
             assert_eq!(
                 hybrid.index_to_work_unit(singles_count + k),
@@ -392,28 +393,37 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_singles_are_sorted_by_cardinality_descending() {
+    fn hybrid_singles_blocks_are_sorted_by_cardinality_descending() {
         let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
         let e = DualCardinalityWithSinglesEnumerator::new(&g);
-        let mut prev = i32::MAX;
-        for i in 0..9 {
-            // 9 red majority singles
-            let WorkUnit::SingleFlip(edge) = e.index_to_work_unit(i) else {
-                panic!("expected single at {i}");
-            };
-            // Recompute cardinality independently (red edge: same-colored
-            // neighbors of both endpoints, excluding the edge's own vertices).
+
+        // Cardinality is recomputed independently per color: same-colored
+        // neighbors of both endpoints, excluding the edge's own vertices.
+        let cardinality = |edge: &WorkUnitEdge, is_red: bool| -> i32 {
             let (v1, v2) = (edge.vertex_one as usize, edge.vertex_two as usize);
             let mut c = 0;
             for endpoint in [v1, v2] {
                 for k in 0..g.vertex_count {
-                    if k != v1 && k != v2 && g.adjacency[endpoint].get(k) {
+                    if k != v1 && k != v2 && g.adjacency[endpoint].get(k) == is_red {
                         c += 1;
                     }
                 }
             }
-            assert!(c <= prev, "cardinality increased at index {i}");
-            prev = c;
+            c
+        };
+
+        // Ordering is descending within each color block independently; the
+        // boundary between the red block (0..9) and blue block (9..15) resets.
+        for (range, is_red) in [(0..9, true), (9..15, false)] {
+            let mut prev = i32::MAX;
+            for i in range {
+                let WorkUnit::SingleFlip(edge) = e.index_to_work_unit(i) else {
+                    panic!("expected single at {i}");
+                };
+                let c = cardinality(&edge, is_red);
+                assert!(c <= prev, "cardinality increased at index {i}");
+                prev = c;
+            }
         }
     }
 
@@ -429,10 +439,7 @@ mod tests {
             };
             let is_red = g.adjacency[edge.vertex_one as usize].get(edge.vertex_two as usize);
             if i < 5 {
-                assert!(
-                    is_red,
-                    "tied singles must enumerate red block first (index {i})"
-                );
+                assert!(is_red, "red block must come first (index {i})");
             } else {
                 assert!(!is_red, "blue block must follow red block (index {i})");
             }
