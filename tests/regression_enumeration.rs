@@ -173,11 +173,7 @@ fn create_enumerator_dispatches_all_strategies_with_consistent_totals() {
         );
     }
 
-    let singles = if red == blue {
-        red + blue
-    } else {
-        red.max(blue)
-    };
+    let singles = red + blue;
     let hybrid = create_enumerator(
         &WorkEnumerationStrategy::DUAL_EDGE_CARDINALITY_WITH_SINGLES,
         &g,
@@ -195,11 +191,7 @@ fn hybrid_enumerator_is_bijective_and_deterministic_at_scale() {
 
     let red = red_count(&bits) as i64;
     let blue = (bits.len() - red_count(&bits)) as i64;
-    let singles = if red == blue {
-        red + blue
-    } else {
-        red.max(blue)
-    };
+    let singles = red + blue;
     assert_eq!(a.total_work_units(), singles + red * blue);
 
     // Bijectivity over the full index space, treating singles and pairs as
