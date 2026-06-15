@@ -18,9 +18,16 @@ jobs:
           - platform: linux/arm64
             target_cpu: neoverse-v2
             tag_suffix: "-neoverse-v2"
+          # amd64: x86-64-v2 (POPCNT, safe on any realistic CPU) and x86-64-v3
+          # (+AVX2/BMI, Haswell+ / all EPYC). The bare x86-64 baseline is dropped —
+          # it lacks POPCNT and no Vast.ai-era CPU needs it. Select per host with
+          #   grep -q avx2 /proc/cpuinfo && tag=-amd64-v3 || tag=-amd64-v2
           - platform: linux/amd64
-            target_cpu: x86-64
-            tag_suffix: "-amd64"
+            target_cpu: x86-64-v2
+            tag_suffix: "-amd64-v2"
+          - platform: linux/amd64
+            target_cpu: x86-64-v3
+            tag_suffix: "-amd64-v3"
 
     steps:
       - uses: actions/checkout@v6
