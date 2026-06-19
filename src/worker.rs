@@ -337,6 +337,11 @@ impl Worker {
         let batch_size = self.fetch_size as i64;
         let total_pairs = config.total_pairs;
         let base_graph_id = config.base_graph_id;
+        // Base graph bitstring + vertex count for derived-graph hashing (the novelty
+        // filter). Captured once per batch — constant for the stage's base graph.
+        // vertex_count must equal the QM's (config value) so the hashes agree.
+        let base_bitstring = config.graph.edge_data.clone();
+        let derived_vertex_count = config.graph.vertex_count;
 
         // Claim work range
         let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
@@ -424,6 +429,13 @@ impl Worker {
                 Some(threshold) => count < threshold,
             };
             if should_submit {
+                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
+                // Only computed for record-breakers (count < best novel), so it's rare.
+                let hash = crate::hash::derived_graph_hash(
+                    &base_bitstring,
+                    derived_vertex_count,
+                    &edges_to_flip,
+                );
                 if let Some(redis) = self.redis_client.as_mut() {
                     if let Ok((_, new_threshold)) = redis
                         .add_to_top_results(
@@ -431,6 +443,7 @@ impl Worker {
                             base_graph_id,
                             &edges_to_flip,
                             count,
+                            &hash,
                             self.top_results_count,
                         )
                         .await
@@ -585,6 +598,8 @@ impl Worker {
 
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
+        let base_bitstring = config.graph.edge_data.clone();
+        let derived_vertex_count = config.graph.vertex_count;
 
         // Build graph and CliqueCollection from stage config.
         let mut base_graph =
@@ -623,6 +638,11 @@ impl Worker {
             };
 
         if should_submit {
+            let hash = crate::hash::derived_graph_hash(
+                &base_bitstring,
+                derived_vertex_count,
+                &result.edges_to_flip,
+            );
             if let Some(redis) = self.redis_client.as_mut() {
                 let _ = redis
                     .add_to_top_results(
@@ -630,6 +650,7 @@ impl Worker {
                         base_graph_id,
                         &result.edges_to_flip,
                         result.final_clique_count,
+                        &hash,
                         self.top_results_count,
                     )
                     .await;
