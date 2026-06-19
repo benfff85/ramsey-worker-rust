@@ -28,7 +28,7 @@ jobs:
             tag_suffix: "-amd64-v3"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Rust Version Check
         run: rustc --version && cargo --version
