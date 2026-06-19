@@ -215,16 +215,19 @@ impl RedisClient {
 
     /// Add a result to the top-N sorted set for a stage.
     /// Uses Redis sorted set with score = clique_count.
-    /// Atomically adds and trims to keep only the best N results (lowest clique counts).
-    /// Returns true if this result is currently in the top N, false otherwise.
-    /// Returns `(kept, new_threshold)` where `new_threshold` is the current worst score
-    /// in the set after the operation (None if the set is not yet full).
+    /// Atomically add a result to the per-stage best-results set, **filtering out
+    /// graphs already in `processed_graph_hashes`** (visited / cycle-prevention) so
+    /// the set holds only progressable graphs. Trims to the best `max_results`.
+    /// Returns `(kept, best_novel)` where `best_novel` is the slot-0 (lowest) score —
+    /// the best novel result so far and the tightest early-exit threshold — or None
+    /// if the set is empty. `hash` is the derived-graph SHA-256 (see `crate::hash`).
     pub async fn add_to_top_results(
         &mut self,
         stage_id: i32,
         base_graph_id: i32,
         edges_to_flip: &[WorkUnitEdge],
         clique_count: i32,
+        hash: &str,
         max_results: usize,
     ) -> Result<(bool, Option<i32>), Box<dyn Error>> {
         let key = format!("best_results:{}", stage_id);
@@ -237,30 +240,34 @@ impl RedisClient {
         };
         let json = serde_json::to_string(&result)?;
 
-        // Lua script: ZADD + trim to top N + check rank.
-        // Returns {kept, worst_score}: worst_score is the score at position max_results-1
-        // (the current threshold), or -1 if the set is not yet full.
+        // KEYS[1] = best_results:{stage}, KEYS[2] = processed_graph_hashes.
+        // ARGV[1] = score, ARGV[2] = json, ARGV[3] = derived hash, ARGV[4] = max_results.
+        // If the graph is already visited, reject (don't insert) but still return the
+        // current best so the caller's threshold stays fresh. Otherwise ZADD + trim to
+        // the best max_results. Returns {kept, best_score} where best_score is slot 0
+        // (the best novel result), or -1 if the set is empty.
         let script = redis::Script::new(
             r#"
+            if redis.call('SISMEMBER', KEYS[2], ARGV[3]) == 1 then
+                local b = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+                if b[2] then return {0, tonumber(b[2])} else return {0, -1} end
+            end
             redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
-            redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[3], -1)
+            redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[4], -1)
             local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
             local kept = 0
             if rank then kept = 1 end
-            local size = redis.call('ZCARD', KEYS[1])
-            if tonumber(size) >= tonumber(ARGV[3]) then
-                local worst = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[3])-1, tonumber(ARGV[3])-1, 'WITHSCORES')
-                return {kept, tonumber(worst[2])}
-            else
-                return {kept, -1}
-            end
+            local b = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+            if b[2] then return {kept, tonumber(b[2])} else return {kept, -1} end
             "#,
         );
 
         let raw: Vec<redis::Value> = script
             .key(&key)
+            .key("processed_graph_hashes")
             .arg(clique_count)
             .arg(&json)
+            .arg(hash)
             .arg(max_results as i64)
             .invoke_async(&mut self.connection)
             .await?;
@@ -273,7 +280,7 @@ impl RedisClient {
 
         if kept {
             log_info!(
-                "Added to top-{} results for stage {}: clique_count={}",
+                "Added to top-{} novel results for stage {}: clique_count={}",
                 max_results,
                 stage_id,
                 clique_count
@@ -348,32 +355,23 @@ impl RedisClient {
         Ok((kept, new_threshold))
     }
 
-    /// Get the threshold score (worst/highest score in top-N) for a stage.
-    /// Returns None if there are fewer than max_results entries (any result would be accepted).
-    /// Returns Some(threshold) if the set is "full" - only results better than this should be submitted.
+    /// Threshold score for early termination = the best NOVEL result (slot 0, the
+    /// lowest clique count). Active as soon as the set is non-empty, so early-exit
+    /// kicks in after the first novel result instead of the max_results-th — the
+    /// tightest correct threshold. `max_results` is unused here (the set is already
+    /// novel-only and trimmed by `add_to_top_results`); kept for call-site parity.
     pub async fn get_top_results_threshold(
         &mut self,
         stage_id: i32,
-        max_results: usize,
+        _max_results: usize,
     ) -> Result<Option<i32>, Box<dyn Error>> {
         let key = format!("best_results:{}", stage_id);
 
-        // Get the count of entries in the set
-        let count: i64 = redis::cmd("ZCARD")
-            .arg(&key)
-            .query_async(&mut self.connection)
-            .await?;
-
-        if (count as usize) < max_results {
-            // Set isn't full yet - accept any result
-            return Ok(None);
-        }
-
-        // Get the score of the last (worst) entry: index max_results-1
+        // Slot 0 = lowest score = best novel result currently in the set.
         let scores: Vec<(String, f64)> = redis::cmd("ZRANGE")
             .arg(&key)
-            .arg((max_results - 1) as i64)
-            .arg((max_results - 1) as i64)
+            .arg(0)
+            .arg(0)
             .arg("WITHSCORES")
             .query_async(&mut self.connection)
             .await?;
