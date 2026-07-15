@@ -227,6 +227,20 @@ fn bron_kerbosch_count_inplace(
         return 0;
     }
 
+    // Second-to-last level inline: each child would immediately take the leaf
+    // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
+    if depth == clique_size - 2 {
+        let mut count = 0;
+        let candidates = *p;
+        for v in candidates.iter_set_bits() {
+            let mut pv = *p;
+            pv.and_assign(&adjacency[v]);
+            count += pv.cardinality() as i32;
+            p.clear(v);
+        }
+        return count;
+    }
+
     let mut count = 0;
     let candidates = *p;
     for v in candidates.iter_set_bits() {
@@ -275,6 +289,25 @@ fn bron_kerbosch_count_no_x_with_limit(
     // Subsumes the empty-P check (depth < clique_size - 1 here).
     if depth + p_card < clique_size {
         return (0, false);
+    }
+
+    // Second-to-last level inline: each child would immediately take the leaf
+    // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
+    // The exceeded condition (count > limit) is exactly what the child's
+    // `found > remaining` plus the parent's post-child check reduce to.
+    if depth == clique_size - 2 {
+        let mut count = 0;
+        let candidates = *p;
+        for v in candidates.iter_set_bits() {
+            let mut pv = *p;
+            pv.and_assign(&adjacency[v]);
+            count += pv.cardinality() as i32;
+            if count > limit {
+                return (count, true);
+            }
+            p.clear(v);
+        }
+        return (count, false);
     }
 
     let mut count = 0;
