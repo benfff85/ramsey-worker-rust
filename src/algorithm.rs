@@ -241,6 +241,15 @@ fn bron_kerbosch_count_inplace(
         return 1;
     }
 
+    // Leaf shortcut: P is by construction the set of common neighbors of every
+    // vertex in R, so when exactly one vertex is missing, each candidate in P
+    // completes exactly one k-clique — one popcount replaces |P| recursions.
+    // Valid only because this counts ALL k-cliques (no pivoting; X is not
+    // consulted for membership, only for duplicate prevention above this level).
+    if r.cardinality() as usize == clique_size - 1 {
+        return p.cardinality() as i32;
+    }
+
     if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
         return 0;
     }
@@ -294,6 +303,16 @@ fn bron_kerbosch_count_no_x_with_limit(
             return (1, true);
         }
         return (1, false);
+    }
+
+    // Leaf shortcut: P is the set of common neighbors of every vertex in R, so
+    // when one vertex is missing each candidate completes exactly one k-clique —
+    // one popcount replaces |P| recursions. When the count exceeds the limit the
+    // returned value may be larger than the old level-by-level cutoff produced,
+    // but callers only use the count when `exceeded` is false (documented above).
+    if r.cardinality() as usize == clique_size - 1 {
+        let found = p.cardinality() as i32;
+        return (found, found > limit);
     }
 
     if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
@@ -392,6 +411,52 @@ mod tests {
                 "mismatch on bits={bits} for clique_size=4: collect={by_collect}, count={by_count}"
             );
         }
+    }
+
+    #[test]
+    fn k8_has_56_red_5_cliques_plus_blue() {
+        // K8: C(8,5) = 56 red 5-cliques, 0 blue — heavy leaf fan-out through the
+        // with-X counting path; collect (no shortcut) is the reference.
+        let bits = "1".repeat(28);
+        let mut g = Graph::from_bitstring(&bits, 8);
+        assert_eq!(get_all_cliques(&mut g, 5).len(), 56);
+        assert_eq!(get_cliques_comprehensive(&mut g, 5), 56);
+    }
+
+    #[test]
+    fn count_matches_collect_on_dense_7v_graphs_small_k() {
+        // clique_size 3 puts almost every node at the leaf level; the collect
+        // variant has no shortcut and cross-checks the counting variants.
+        let cases = [
+            "111111111111111111111", // K7
+            "110111011101110111011",
+            "101101101101101101101",
+            "111100011110001111000",
+        ];
+        for bits in cases {
+            for k in [3usize, 4] {
+                let mut g = Graph::from_bitstring(bits, 7);
+                let by_collect = get_all_cliques(&mut g, k).len() as i32;
+                let by_count = get_cliques_comprehensive(&mut g, k);
+                assert_eq!(by_collect, by_count, "bits={bits} k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn limit_zero_reports_exceeded_when_cliques_form() {
+        // K5 with edge (0,1) flipped away has no mono 5-clique; flipping it back
+        // creates one. With limit 0 the seeded search must report exceeded.
+        let mut bits: Vec<u8> = "1".repeat(10).into_bytes();
+        bits[0] = b'0'; // edge (0,1) blue
+        let mut g = Graph::from_bitstring(std::str::from_utf8(&bits).unwrap(), 5);
+        let flip = [crate::graph::WorkUnitEdge { vertex_one: 0, vertex_two: 1 }];
+        g.flip_edges(&flip); // now K5 again; new red clique contains (0,1)
+        let (_, exceeded) = get_new_cliques_with_limit(&mut g, 5, &flip, 0);
+        assert!(exceeded);
+        let (count, exceeded) = get_new_cliques_with_limit(&mut g, 5, &flip, 10);
+        assert!(!exceeded);
+        assert_eq!(count, 1);
     }
 
     #[test]
