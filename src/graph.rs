@@ -13,19 +13,23 @@ pub struct WorkUnitEdge {
 pub struct Graph {
     pub vertex_count: usize,
     pub adjacency: Vec<BitMatrix>,
+    /// The complement color's adjacency, maintained in lockstep with `adjacency`
+    /// by `from_bitstring`/`flip_edges` so `invert()` is an O(1) swap instead of
+    /// an O(n·words) rebuild (it used to run twice per work unit). Code that
+    /// mutates `adjacency` directly must call `resync_complement()` afterwards.
+    pub complement_adjacency: Vec<BitMatrix>,
 }
 
 impl Graph {
     pub fn new(vertex_count: usize) -> Self {
         debug_assert!(vertex_count <= BITSET_SIZE);
-        let mut adjacency = Vec::with_capacity(vertex_count);
-        for _ in 0..vertex_count {
-            adjacency.push(BitMatrix::new());
-        }
-        Graph {
+        let mut graph = Graph {
             vertex_count,
-            adjacency,
-        }
+            adjacency: vec![BitMatrix::new(); vertex_count],
+            complement_adjacency: vec![BitMatrix::new(); vertex_count],
+        };
+        graph.resync_complement();
+        graph
     }
 
     pub fn from_bitstring(bit_string: &str, vertex_count: usize) -> Self {
@@ -38,6 +42,8 @@ impl Graph {
                 if edge_index < chars.len() && chars[edge_index] == '1' {
                     graph.adjacency[i].set(j);
                     graph.adjacency[j].set(i);
+                    graph.complement_adjacency[i].clear(j);
+                    graph.complement_adjacency[j].clear(i);
                 }
                 edge_index += 1;
             }
@@ -45,23 +51,26 @@ impl Graph {
         graph
     }
 
-    /// Inverts the adjacency matrix using word-level XOR operations.
-    /// This is O(n * words) instead of O(n²) individual bit flips.
+    /// Recompute `complement_adjacency` from `adjacency`. Only needed after
+    /// mutating `adjacency` directly (tools/experiments); the supported mutators
+    /// (`from_bitstring`, `flip_edges`, `invert`) keep the two in lockstep.
+    pub fn resync_complement(&mut self) {
+        for i in 0..self.vertex_count {
+            let mut row = self.adjacency[i];
+            row.invert_all();
+            row.clear(i);
+            if self.vertex_count < BITSET_SIZE {
+                row.clear_above(self.vertex_count);
+            }
+            self.complement_adjacency[i] = row;
+        }
+    }
+
+    /// Swaps which color `adjacency` refers to. O(1): both colors' matrices are
+    /// maintained continuously, so this is a pointer swap, not a rebuild.
     #[inline]
     pub fn invert(&mut self) {
-        for i in 0..self.vertex_count {
-            // Invert all bits at word level
-            self.adjacency[i].invert_all();
-            // Clear the self-loop bit (diagonal)
-            self.adjacency[i].clear(i);
-            // Clear any "neighbors" beyond vertex_count: a vertex slot that doesn't
-            // exist must not appear as a neighbor of an existing vertex. invert_all()
-            // already cleared the BITSET padding (288..320), so we only need this when
-            // vertex_count < BITSET_SIZE — a no-op for production (vertex_count = 288).
-            if self.vertex_count < BITSET_SIZE {
-                self.adjacency[i].clear_above(self.vertex_count);
-            }
-        }
+        std::mem::swap(&mut self.adjacency, &mut self.complement_adjacency);
     }
 
     /// Convert graph adjacency matrix back to bitstring format.
@@ -88,6 +97,8 @@ impl Graph {
             let v = edge.vertex_two as usize;
             self.adjacency[u].flip(v);
             self.adjacency[v].flip(u);
+            self.complement_adjacency[u].flip(v);
+            self.complement_adjacency[v].flip(u);
         }
     }
 }
@@ -156,6 +167,69 @@ mod tests {
         g.invert();
         g.invert();
         assert_eq!(g.to_bitstring(), before);
+    }
+
+    fn assert_complement_in_lockstep(g: &Graph) {
+        for i in 0..g.vertex_count {
+            for j in 0..g.vertex_count {
+                if i == j {
+                    assert!(!g.adjacency[i].get(j), "self-loop in adjacency at {i}");
+                    assert!(
+                        !g.complement_adjacency[i].get(j),
+                        "self-loop in complement at {i}"
+                    );
+                } else {
+                    assert_ne!(
+                        g.adjacency[i].get(j),
+                        g.complement_adjacency[i].get(j),
+                        "complement out of lockstep at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complement_stays_in_lockstep_through_all_mutators() {
+        let mut g = Graph::from_bitstring("101100110100110", 6);
+        assert_complement_in_lockstep(&g);
+        g.flip_edges(&[
+            WorkUnitEdge { vertex_one: 0, vertex_two: 3 },
+            WorkUnitEdge { vertex_one: 2, vertex_two: 5 },
+        ]);
+        assert_complement_in_lockstep(&g);
+        g.invert();
+        assert_complement_in_lockstep(&g);
+        g.flip_edges(&[WorkUnitEdge { vertex_one: 1, vertex_two: 4 }]);
+        assert_complement_in_lockstep(&g);
+        g.invert();
+        assert_complement_in_lockstep(&g);
+    }
+
+    #[test]
+    fn resync_complement_repairs_direct_mutation() {
+        let mut g = Graph::new(5);
+        g.adjacency[0].set(1);
+        g.adjacency[1].set(0);
+        g.resync_complement();
+        assert_complement_in_lockstep(&g);
+    }
+
+    #[test]
+    fn invert_matches_resynced_complement_semantics() {
+        // The O(1) swap must be indistinguishable from the old O(n) rebuild.
+        let bits = "101100110100110";
+        let mut swapped = Graph::from_bitstring(bits, 6);
+        swapped.invert();
+        let mut rebuilt = Graph::from_bitstring(bits, 6);
+        let complement: Vec<BitMatrix> = rebuilt.complement_adjacency.clone();
+        rebuilt.adjacency = complement;
+        rebuilt.resync_complement();
+        for i in 0..6 {
+            for j in 0..6 {
+                assert_eq!(swapped.adjacency[i].get(j), rebuilt.adjacency[i].get(j));
+            }
+        }
     }
 
     #[test]
