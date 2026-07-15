@@ -135,6 +135,15 @@ impl BitMatrix {
         self.data[4] &= other.data[4];
     }
 
+    /// Iterator over set-bit indices. Consumes a snapshot word-by-word with
+    /// clear-lowest-set-bit — cheaper in hot loops than repeated
+    /// `next_set_bit(v + 1)` calls, which re-derive the word index and mask
+    /// on every step.
+    #[inline]
+    pub fn iter_set_bits(&self) -> SetBits {
+        SetBits { data: self.data, word_idx: 0 }
+    }
+
     pub fn to_indices(&self) -> Vec<usize> {
         let mut indices = Vec::with_capacity(8); // Cliques are size 8
         for (i, &word) in self.data.iter().enumerate() {
@@ -152,9 +161,55 @@ impl BitMatrix {
     }
 }
 
+pub struct SetBits {
+    data: [u64; BITSET_WORDS],
+    word_idx: usize,
+}
+
+impl Iterator for SetBits {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.word_idx < BITSET_WORDS {
+            let w = self.data[self.word_idx];
+            if w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                self.data[self.word_idx] = w & (w - 1);
+                return Some(self.word_idx * 64 + bit);
+            }
+            self.word_idx += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iter_set_bits_matches_to_indices() {
+        let mut b = BitMatrix::new();
+        for &i in &[0usize, 1, 63, 64, 65, 127, 128, 191, 192, 255, 256, 281, 287] {
+            b.set(i);
+        }
+        let via_iter: Vec<usize> = b.iter_set_bits().collect();
+        assert_eq!(via_iter, b.to_indices());
+    }
+
+    #[test]
+    fn iter_set_bits_empty_and_full() {
+        assert_eq!(BitMatrix::new().iter_set_bits().count(), 0);
+        let mut b = BitMatrix::new();
+        for i in 0..BITSET_SIZE {
+            b.set(i);
+        }
+        let all: Vec<usize> = b.iter_set_bits().collect();
+        assert_eq!(all.len(), BITSET_SIZE);
+        assert_eq!(all[0], 0);
+        assert_eq!(all[BITSET_SIZE - 1], BITSET_SIZE - 1);
+    }
 
     #[test]
     fn set_get_clear_at_word_boundaries() {
