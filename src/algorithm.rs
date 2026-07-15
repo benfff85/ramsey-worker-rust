@@ -25,24 +25,16 @@ pub fn get_new_cliques_with_limit(
         let v2 = edge.vertex_two as usize;
 
         if graph.adjacency[v1].get(v2) {
-            let mut r = BitMatrix::new();
-            r.set(v1);
-            r.set(v2);
-
             let mut p = graph.adjacency[v1];
             p.and_assign(&graph.adjacency[v2]);
             p.clear(v1);
             p.clear(v2);
 
-            // Use the no-X variant with limit for targeted search
+            // Use the no-X variant with limit for targeted search; the two seed
+            // vertices are accounted for by starting at depth 2.
             let remaining = threshold - new_clique_count;
-            let (count, over) = bron_kerbosch_count_no_x_with_limit(
-                &mut r,
-                &mut p,
-                &graph.adjacency,
-                clique_size,
-                remaining,
-            );
+            let (count, over) =
+                bron_kerbosch_count_no_x_with_limit(2, &mut p, &graph.adjacency, clique_size, remaining);
             new_clique_count += count;
             if over {
                 exceeded = true;
@@ -60,23 +52,14 @@ pub fn get_new_cliques_with_limit(
         let v2 = edge.vertex_two as usize;
 
         if graph.adjacency[v1].get(v2) {
-            let mut r = BitMatrix::new();
-            r.set(v1);
-            r.set(v2);
-
             let mut p = graph.adjacency[v1];
             p.and_assign(&graph.adjacency[v2]);
             p.clear(v1);
             p.clear(v2);
 
             let remaining = threshold - new_clique_count;
-            let (count, over) = bron_kerbosch_count_no_x_with_limit(
-                &mut r,
-                &mut p,
-                &graph.adjacency,
-                clique_size,
-                remaining,
-            );
+            let (count, over) =
+                bron_kerbosch_count_no_x_with_limit(2, &mut p, &graph.adjacency, clique_size, remaining);
             new_clique_count += count;
             if over {
                 exceeded = true;
@@ -195,109 +178,98 @@ pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     let mut clique_count = 0;
 
     // RED
-    let mut r = BitMatrix::new();
     let mut p = BitMatrix::new();
-    let mut x = BitMatrix::new();
-
     for i in 0..graph.vertex_count {
         p.set(i);
     }
-
-    clique_count +=
-        bron_kerbosch_count_inplace(&mut r, &mut p, &mut x, &graph.adjacency, clique_size);
+    clique_count += bron_kerbosch_count_inplace(0, &mut p, &graph.adjacency, clique_size);
 
     // BLUE
     graph.invert();
 
-    let mut r_blue = BitMatrix::new();
     let mut p_blue = BitMatrix::new();
-    let mut x_blue = BitMatrix::new();
     for i in 0..graph.vertex_count {
         p_blue.set(i);
     }
-
-    clique_count += bron_kerbosch_count_inplace(
-        &mut r_blue,
-        &mut p_blue,
-        &mut x_blue,
-        &graph.adjacency,
-        clique_size,
-    );
+    clique_count += bron_kerbosch_count_inplace(0, &mut p_blue, &graph.adjacency, clique_size);
     graph.invert(); // Restore
 
     clique_count
 }
 
-/// Bron-Kerbosch counting with X tracking (for comprehensive search to avoid duplicates).
+/// Bron-Kerbosch counting of ALL k-cliques. Duplicates are prevented by the
+/// shrinking candidate set (each level only extends with later candidates), so
+/// no R set is needed (its size is `depth`) and no X set is needed (X exists to
+/// detect maximality, which all-k-clique counting never checks).
 #[inline]
 fn bron_kerbosch_count_inplace(
-    r: &mut BitMatrix,
+    depth: usize,
     p: &mut BitMatrix,
-    x: &mut BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,
 ) -> i32 {
-    if r.cardinality() as usize == clique_size {
+    if depth == clique_size {
         return 1;
     }
 
-    // Leaf shortcut: P is by construction the set of common neighbors of every
-    // vertex in R, so when exactly one vertex is missing, each candidate in P
-    // completes exactly one k-clique — one popcount replaces |P| recursions.
-    // Valid only because this counts ALL k-cliques (no pivoting; X is not
-    // consulted for membership, only for duplicate prevention above this level).
-    if r.cardinality() as usize == clique_size - 1 {
-        return p.cardinality() as i32;
+    let p_card = p.cardinality() as usize;
+
+    // Leaf shortcut: P is the set of common neighbors of every committed
+    // vertex, so with one slot left each candidate completes exactly one
+    // k-clique — one popcount replaces |P| recursions.
+    if depth == clique_size - 1 {
+        return p_card as i32;
     }
 
-    if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
+    // Subsumes the empty-P check: depth < clique_size - 1 here, so p_card = 0
+    // always fails this bound.
+    if depth + p_card < clique_size {
         return 0;
     }
 
-    if p.is_empty() {
-        return 0;
+    // Second-to-last level inline: each child would immediately take the leaf
+    // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
+    if depth == clique_size - 2 {
+        let mut count = 0;
+        let candidates = *p;
+        for v in candidates.iter_set_bits() {
+            let mut pv = *p;
+            pv.and_assign(&adjacency[v]);
+            count += pv.cardinality() as i32;
+            p.clear(v);
+        }
+        return count;
     }
 
     let mut count = 0;
     let candidates = *p;
-
-    let mut v_opt = candidates.next_set_bit(0);
-    while let Some(v) = v_opt {
-        r.set(v);
-
+    for v in candidates.iter_set_bits() {
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
-
-        let mut new_x = *x;
-        new_x.and_assign(&adjacency[v]);
-
-        count += bron_kerbosch_count_inplace(r, &mut new_p, &mut new_x, adjacency, clique_size);
-
-        r.clear(v);
+        count += bron_kerbosch_count_inplace(depth + 1, &mut new_p, adjacency, clique_size);
         p.clear(v);
-        x.set(v);
-
-        v_opt = candidates.next_set_bit(v + 1);
     }
 
     count
 }
 
-/// Optimized Bron-Kerbosch counting WITHOUT X tracking.
-/// Used for targeted/seeded search where X starts empty and we don't need
-/// to prevent duplicate cliques (each edge seeds a unique search space).
-/// Bron-Kerbosch counting with early termination when limit is exceeded.
-/// Returns (count, exceeded) - if exceeded is true, count may be incomplete
-/// but we know it's greater than the limit.
+/// Seeded Bron-Kerbosch counting with early termination when `limit` is
+/// exceeded. `depth` is the number of vertices already committed to the clique
+/// (the caller seeds an edge, so it starts at 2); no R or X set is carried —
+/// R's only observable property is its size, and X is never consulted when
+/// counting all k-cliques.
+/// Returns (count, exceeded) — if exceeded is true, count may be incomplete
+/// (or overshoot the old level-by-level cutoff) but is known to beat `limit`;
+/// callers discard it.
 #[inline]
 fn bron_kerbosch_count_no_x_with_limit(
-    r: &mut BitMatrix,
+    depth: usize,
     p: &mut BitMatrix,
     adjacency: &[BitMatrix],
     clique_size: usize,
     limit: i32,
 ) -> (i32, bool) {
-    if r.cardinality() as usize == clique_size {
+    if depth == clique_size {
         // Found a clique - check if we've exceeded limit
         if limit <= 0 {
             return (1, true);
@@ -305,48 +277,55 @@ fn bron_kerbosch_count_no_x_with_limit(
         return (1, false);
     }
 
-    // Leaf shortcut: P is the set of common neighbors of every vertex in R, so
-    // when one vertex is missing each candidate completes exactly one k-clique —
-    // one popcount replaces |P| recursions. When the count exceeds the limit the
-    // returned value may be larger than the old level-by-level cutoff produced,
-    // but callers only use the count when `exceeded` is false (documented above).
-    if r.cardinality() as usize == clique_size - 1 {
-        let found = p.cardinality() as i32;
+    let p_card = p.cardinality() as usize;
+
+    // Leaf shortcut: with one slot left, each candidate in P completes exactly
+    // one k-clique (P is the common neighborhood of everything committed).
+    if depth == clique_size - 1 {
+        let found = p_card as i32;
         return (found, found > limit);
     }
 
-    if ((r.cardinality() + p.cardinality()) as usize) < clique_size {
+    // Subsumes the empty-P check (depth < clique_size - 1 here).
+    if depth + p_card < clique_size {
         return (0, false);
     }
 
-    if p.is_empty() {
-        return (0, false);
+    // Second-to-last level inline: each child would immediately take the leaf
+    // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
+    // The exceeded condition (count > limit) is exactly what the child's
+    // `found > remaining` plus the parent's post-child check reduce to.
+    if depth == clique_size - 2 {
+        let mut count = 0;
+        let candidates = *p;
+        for v in candidates.iter_set_bits() {
+            let mut pv = *p;
+            pv.and_assign(&adjacency[v]);
+            count += pv.cardinality() as i32;
+            if count > limit {
+                return (count, true);
+            }
+            p.clear(v);
+        }
+        return (count, false);
     }
 
     let mut count = 0;
     let candidates = *p;
-
-    let mut v_opt = candidates.next_set_bit(0);
-    while let Some(v) = v_opt {
-        r.set(v);
-
+    for v in candidates.iter_set_bits() {
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
 
         let remaining = limit - count;
         let (sub_count, exceeded) =
-            bron_kerbosch_count_no_x_with_limit(r, &mut new_p, adjacency, clique_size, remaining);
+            bron_kerbosch_count_no_x_with_limit(depth + 1, &mut new_p, adjacency, clique_size, remaining);
         count += sub_count;
 
         if exceeded || count > limit {
-            r.clear(v);
             return (count, true);
         }
 
-        r.clear(v);
         p.clear(v);
-
-        v_opt = candidates.next_set_bit(v + 1);
     }
 
     (count, false)
