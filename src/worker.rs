@@ -26,6 +26,10 @@ pub struct Worker {
     fetch_size: i32,
     publish_size: i32,
     campaign_id: i32,
+    /// Fleet abstraction: when Some(platform), the worker resolves its stage via
+    /// GET /fleets/{platform}/active-stage each cycle (repoint/pause is a DB
+    /// update, no redeploy). When None, falls back to the pinned campaign_id.
+    fleet: Option<String>,
     stage_id: Option<i32>,
     base_graph_clique_count: Option<i32>,
     publish_results: bool,
@@ -50,6 +54,7 @@ impl Worker {
         vertex_count: usize,
         clique_size: usize,
         campaign_id: i32,
+        fleet: Option<String>,
         poll_interval_ms: u64,
         fetch_size: i32,
         publish_size: i32,
@@ -88,6 +93,7 @@ impl Worker {
             fetch_size,
             publish_size,
             campaign_id,
+            fleet,
             stage_id: None,
             base_graph_clique_count: None,
             publish_results,
@@ -132,6 +138,14 @@ impl Worker {
     }
 
     pub async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
+        // Fleet mode: campaign is resolved dynamically from the fleet mapping, so
+        // vertex_count/clique_size are set lazily the first time a stage is seen
+        // (see get_or_fetch_stage_id). Nothing to fetch up front.
+        if let Some(fleet) = &self.fleet {
+            log_info!("Initializing worker for fleet: {}", fleet);
+            return Ok(());
+        }
+
         log_info!("Initializing worker for campaign ID: {}", self.campaign_id);
 
         let campaign = self.mw_client.get_campaign(self.campaign_id).await?;
@@ -174,8 +188,12 @@ impl Worker {
     }
 
     async fn cycle(&mut self) -> Result<usize, Box<dyn Error>> {
-        // Get stage_id first
-        let stage_id = self.get_or_fetch_stage_id().await?;
+        // Get stage_id first. None => nothing to work (fleet paused / unmapped /
+        // no active stage) => idle via the poll interval.
+        let stage_id = match self.get_or_fetch_stage_id().await? {
+            Some(id) => id,
+            None => return Ok(0),
+        };
 
         // Verify counter-based mode is available
         let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
@@ -675,9 +693,52 @@ impl Worker {
         self.clique_collection_cache.clear();
     }
 
-    async fn get_or_fetch_stage_id(&mut self) -> Result<i32, Box<dyn Error>> {
+    /// Resolve the stage to work. Ok(None) means "nothing to do right now"
+    /// (fleet paused / unmapped / no active stage) so the caller should idle.
+    async fn get_or_fetch_stage_id(&mut self) -> Result<Option<i32>, Box<dyn Error>> {
+        // ---- Fleet mode: re-resolve each cycle so repoints/pauses take effect
+        // within one poll, with no redeploy. ----
+        if let Some(fleet) = self.fleet.clone() {
+            let stage = match self.mw_client.get_fleet_active_stage(&fleet).await? {
+                None => {
+                    // Paused / unmapped / no active stage. Drop any cached stage
+                    // so we re-init cleanly when work reappears, then idle.
+                    if self.stage_id.is_some() {
+                        log_info!("Fleet {} has no active stage — idling", fleet);
+                        self.clear_stage_cache();
+                    }
+                    return Ok(None);
+                }
+                Some(s) => s,
+            };
+
+            if self.stage_id != Some(stage.stage_id) {
+                // Fleet repointed or the stage progressed → reset per-stage state.
+                self.clear_stage_cache();
+                // Different campaign → refresh vertex/clique params (as initialize
+                // does in campaign mode), so CliqueCollection sizing stays correct.
+                if self.campaign_id != stage.campaign_id {
+                    self.campaign_id = stage.campaign_id;
+                    if let Ok(campaign) = self.mw_client.get_campaign(stage.campaign_id).await {
+                        self.vertex_count = campaign.vertex_count as usize;
+                        self.clique_size = campaign.subgraph_size as usize;
+                    }
+                }
+                self.stage_id = Some(stage.stage_id);
+                log_info!(
+                    "Fleet {} → stage {} (campaign {}, base_graph_id {})",
+                    fleet,
+                    stage.stage_id,
+                    stage.campaign_id,
+                    stage.base_graph_id
+                );
+            }
+            return Ok(Some(stage.stage_id));
+        }
+
+        // ---- Campaign mode (legacy fallback, RAMSEY_CAMPAIGN_ID) ----
         if let Some(stage_id) = self.stage_id {
-            return Ok(stage_id);
+            return Ok(Some(stage_id));
         }
 
         let stages = self
@@ -712,6 +773,6 @@ impl Worker {
         );
 
         self.stage_id = Some(stage.stage_id);
-        Ok(stage.stage_id)
+        Ok(Some(stage.stage_id))
     }
 }

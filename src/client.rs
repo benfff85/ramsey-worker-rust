@@ -139,4 +139,37 @@ impl MiddlewareClient {
         .await
     }
 
+    /// Resolve a fleet's active stage (fleet abstraction — see
+    /// docs/investigations/fleet-abstraction-plan.md in ramsey-mw).
+    /// 200 -> Some(stage); 204 -> None (paused / unmapped / no active stage -> idle);
+    /// other -> error.
+    pub async fn get_fleet_active_stage(
+        &self,
+        platform: &str,
+    ) -> Result<Option<crate::model::Stage>, Box<dyn Error>> {
+        let url = format!("{}/fleets/{}/active-stage", self.base_url, platform);
+        let client = self.client.clone();
+
+        self.retry_async("get_fleet_active_stage", || {
+            let url = url.clone();
+            let client = client.clone();
+            async move {
+                let response = client.get(&url).send().await?;
+                let status = response.status();
+                if status.as_u16() == 204 {
+                    return Ok(None);
+                }
+                if !status.is_success() {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(
+                        format!("Failed to resolve fleet stage: {} - {}", status, text).into(),
+                    );
+                }
+                let stage = response.json::<crate::model::Stage>().await?;
+                Ok(Some(stage))
+            }
+        })
+        .await
+    }
+
 }
