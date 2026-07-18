@@ -25,6 +25,15 @@ async fn main() {
         .parse()
         .expect("CAMPAIGN_ID must be a number");
 
+    // Fleet abstraction: when RAMSEY_FLEET is set (e.g. m4-max/m1/vast-ai) the
+    // worker resolves its stage via the fleet mapping and RAMSEY_CAMPAIGN_ID is
+    // ignored. When unset, it falls back to the pinned campaign (legacy).
+    let fleet = env::var("RAMSEY_FLEET").ok().filter(|s| !s.is_empty());
+    match &fleet {
+        Some(f) => log_info!("Targeting mode: FLEET '{}'", f),
+        None => log_info!("Targeting mode: CAMPAIGN {} (legacy, no RAMSEY_FLEET set)", campaign_id),
+    }
+
     let poll_interval_ms: u64 = env::var("WORK_UNIT_POLL_FREQ")
         .unwrap_or_else(|_| "1000".to_string())
         .parse()
@@ -167,6 +176,7 @@ async fn main() {
         vertex_count,
         clique_size,
         campaign_id,
+        fleet,
         poll_interval_ms,
         fetch_size,
         publish_size,
