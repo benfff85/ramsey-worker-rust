@@ -465,4 +465,65 @@ impl RedisClient {
         let new_count: i64 = self.connection.incr(&key, count).await?;
         Ok(new_count)
     }
+
+    // ========== Shared per-edge clique counts ==========
+    //
+    // Every worker otherwise recomputes the SAME per-edge clique cardinalities for each new
+    // stage's base graph (the "new graph tax": a full Bron-Kerbosch traversal whose cost scales
+    // with the clique count — ~1s on a 1.6M-clique graph, paid by every worker in parallel on
+    // the same box). The first worker to build them shares them here; peers fetch and skip the
+    // traversal. Keyed by GRAPH id (immutable content) with a short TTL so Redis stays bounded.
+    //
+    // Blob layout: [0..8) total clique count (u64 LE), then vertex_count^2 i32 LE counts.
+
+    fn edge_counts_key(graph_id: i32) -> String {
+        format!("clique_edge_counts:{}", graph_id)
+    }
+
+    /// Fetch shared per-edge clique counts for a graph. Returns (counts, total_clique_count).
+    pub async fn get_shared_edge_counts(
+        &mut self,
+        graph_id: i32,
+    ) -> Result<Option<(Vec<i32>, usize)>, Box<dyn Error>> {
+        let key = Self::edge_counts_key(graph_id);
+        let blob: Option<Vec<u8>> = self.connection.get(&key).await?;
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        if blob.len() < 8 || (blob.len() - 8) % 4 != 0 {
+            log_error!(
+                "Shared edge counts for graph {} malformed ({} bytes); ignoring",
+                graph_id,
+                blob.len()
+            );
+            return Ok(None);
+        }
+        let total = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
+        let counts = blob[8..]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Ok(Some((counts, total)))
+    }
+
+    /// Share per-edge clique counts for a graph with a TTL. Best-effort: on failure peers
+    /// simply rebuild locally, so callers may ignore the error.
+    pub async fn set_shared_edge_counts(
+        &mut self,
+        graph_id: i32,
+        counts: &[i32],
+        total_clique_count: usize,
+        ttl_seconds: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let key = Self::edge_counts_key(graph_id);
+        let mut blob = Vec::with_capacity(8 + counts.len() * 4);
+        blob.extend_from_slice(&(total_clique_count as u64).to_le_bytes());
+        for c in counts {
+            blob.extend_from_slice(&c.to_le_bytes());
+        }
+        self.connection
+            .set_ex::<_, _, ()>(&key, blob, ttl_seconds)
+            .await?;
+        Ok(())
+    }
 }

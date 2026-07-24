@@ -15,6 +15,11 @@ use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// TTL for shared per-edge clique counts. Only needs to outlive the window in which the fleet
+/// picks up a given stage (seconds), so a few minutes is generous; the short life keeps Redis
+/// bounded — at ~318 KB per 282-vertex graph only the last handful of stages are ever resident.
+const SHARED_EDGE_COUNTS_TTL_SECONDS: u64 = 300;
+
 pub struct Worker {
     mw_client: MiddlewareClient,
     redis_client: Option<RedisClient>,
@@ -314,13 +319,52 @@ impl Worker {
                         Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
                     self.graph_cache.insert(config.base_graph_id, graph);
 
-                    // Build clique collection for this graph
-                    let graph = self.graph_cache.get_mut(&config.base_graph_id).unwrap();
-                    let all_cliques = get_all_cliques(graph, self.clique_size);
-                    let mut cc = CliqueCollection::new(self.vertex_count);
-                    cc.set_cliques(all_cliques, self.vertex_count);
-                    self.clique_collection_cache
-                        .insert(config.base_graph_id, cc);
+                    // Per-edge clique cardinalities for this graph. This path reads only the
+                    // per-edge counts and the total (see `broken` / `base_total` below), so we
+                    // build counts-only — no clique list, no edge->cliques index. Cost scales
+                    // with the clique count (~1s at 1.6M cliques), and every worker would
+                    // otherwise pay it for the SAME graph on every stage, so the first one to
+                    // build it shares it via Redis and the rest skip the traversal entirely.
+                    let graph_id = config.base_graph_id;
+                    let shared = match self.redis_client.as_mut() {
+                        Some(redis) => redis.get_shared_edge_counts(graph_id).await.unwrap_or(None),
+                        None => None,
+                    };
+                    let cc = match shared {
+                        Some((counts, total)) => {
+                            log_info!(
+                                "Reusing shared edge counts for graph {} (total cliques {})",
+                                graph_id,
+                                total
+                            );
+                            CliqueCollection::from_shared_counts(self.vertex_count, counts, total)
+                        }
+                        None => {
+                            let graph = self.graph_cache.get_mut(&graph_id).unwrap();
+                            let mut cc = CliqueCollection::new(self.vertex_count);
+                            cc.build_counts_only(graph, self.clique_size);
+                            log_info!(
+                                "Built edge counts for graph {} (total cliques {}); sharing",
+                                graph_id,
+                                cc.total()
+                            );
+                            if let Some(redis) = self.redis_client.as_mut() {
+                                if let Err(e) = redis
+                                    .set_shared_edge_counts(
+                                        graph_id,
+                                        cc.edge_counts(),
+                                        cc.total(),
+                                        SHARED_EDGE_COUNTS_TTL_SECONDS,
+                                    )
+                                    .await
+                                {
+                                    log_error!("Could not share edge counts for graph {graph_id}: {e}");
+                                }
+                            }
+                            cc
+                        }
+                    };
+                    self.clique_collection_cache.insert(graph_id, cc);
                 } else {
                     log_info!(
                         "Reusing cached graph {} for new stage {}",
