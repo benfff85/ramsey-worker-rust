@@ -543,7 +543,7 @@ impl Worker {
                     &edges_to_flip,
                 );
                 if let Some(redis) = self.redis_client.as_mut() {
-                    if let Ok((_, new_threshold)) = redis
+                    if let Ok((kept, new_threshold)) = redis
                         .add_to_top_results(
                             stage_id,
                             base_graph_id,
@@ -554,6 +554,12 @@ impl Worker {
                         )
                         .await
                     {
+                        // Only a real insert is news; a rejected (already-visited) candidate
+                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
+                        // fallback, so a dropped message costs latency, not correctness.
+                        if kept {
+                            let _ = redis.publish_best_result(stage_id, count).await;
+                        }
                         // Update threshold in-place so early termination tightens
                         // within this batch rather than staying stale for all 250K units.
                         if let Some(t) = new_threshold {

@@ -6,6 +6,11 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
+/// Pub/sub channel workers announce new best results on. The queue manager subscribes and arms
+/// a settle timer, so it neither polls blindly nor adopts the very first (usually weakest)
+/// improvement. Must match the QM's RedisListenerConfig.BEST_RESULT_CHANNEL.
+pub const BEST_RESULT_CHANNEL: &str = "best_result_events";
+
 /// Best result for a stage - stored in Redis for stage progression
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BestResult {
@@ -504,6 +509,26 @@ impl RedisClient {
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         Ok(Some((counts, total)))
+    }
+
+    /// Announce that a new best (novel, record-breaking) result landed for a stage, so the queue
+    /// manager can start its settle timer immediately instead of discovering the improvement on
+    /// its next poll. Fire-and-forget: Redis pub/sub has no delivery guarantee and the QM keeps a
+    /// polling fallback, so a dropped message costs a little latency, never correctness.
+    pub async fn publish_best_result(
+        &mut self,
+        stage_id: i32,
+        clique_count: i32,
+    ) -> Result<(), Box<dyn Error>> {
+        let payload = format!(
+            "{{\"stageId\":{},\"cliqueCount\":{}}}",
+            stage_id, clique_count
+        );
+        let _: i64 = self
+            .connection
+            .publish(BEST_RESULT_CHANNEL, payload)
+            .await?;
+        Ok(())
     }
 
     /// Elect a single builder for a graph's edge counts: returns true for the one caller that
