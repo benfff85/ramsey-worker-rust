@@ -27,9 +27,19 @@ const EDGE_COUNTS_BUILD_LOCK_TTL_SECONDS: u64 = 30;
 /// How peers wait for the elected builder's result: poll interval and max polls (~3s total).
 const EDGE_COUNTS_POLL_INTERVAL_MS: u64 = 25;
 const EDGE_COUNTS_WAIT_POLLS: usize = 120;
-/// Most flips we will chase incrementally. Stage-to-stage moves are 1 edge (singles) or 2 (pairs);
-/// anything larger (a perturbation kick) is cheaper to rebuild than to walk edge by edge.
-const MAX_INCREMENTAL_FLIPS: usize = 2;
+/// Most flips we will chase incrementally rather than rebuilding the per-edge counts.
+///
+/// The bound is against the worker's OWN cached graph, not the previous stage, so it has to cover
+/// however many stages a worker skipped — not just the 1-2 edges a single advance moves. During a
+/// post-kick descent stages turn over ~2.7x/sec while a worker's cycle is ~0.7-1.1s, so skipping
+/// 2-5 stages is routine and a cap of 2 sent half of all setups down the rebuild path: measured
+/// 51% fallback, 19% of them full rebuilds, ~6% of total worker CPU.
+///
+/// A flip costs 0.82ms against 509ms for a full rebuild, so break-even is ~620 flips; 16 stays far
+/// below that while still being far below a perturbation kick (1,920 pairs = 3,840 flips), which
+/// genuinely is cheaper to rebuild. The derive verifies the reconstructed bitstring against the
+/// stage's and falls back on any mismatch, so a wrong guess here costs time, never correctness.
+const MAX_INCREMENTAL_FLIPS: usize = 16;
 /// Graphs/collections retained per worker. The incremental path needs only the previous one.
 const GRAPH_CACHE_MAX: usize = 3;
 /// Units a worker must have EVALUATED in the current stage before it starts using the hoisted
