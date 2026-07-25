@@ -525,7 +525,14 @@ impl Worker {
                     Some(threshold) => {
                         let max_count = threshold - 1; // Must be strictly less
                         let max_new = max_count - base_total + broken;
-                        if max_new < 0 { 0 } else { max_new }
+                        if max_new < 0 {
+                            // base_total - broken >= threshold: this flip cannot beat the
+                            // threshold even if it creates ZERO new cliques, so the kernel can
+                            // only confirm what the per-edge counts already prove. Skip it
+                            // outright instead of paying two flip_edges plus a seeded traversal.
+                            continue;
+                        }
+                        max_new
                     }
                     None => i32::MAX, // No threshold, count everything
                 };
