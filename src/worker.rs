@@ -44,7 +44,40 @@ const GRAPH_CACHE_MAX: usize = 3;
 /// rejected from the per-edge counts alone, so the same gate needs ~8M claimed units — far more
 /// than a descent stage lives for, and the worker correctly never starts filling a table it would
 /// not get to use.
-const HOIST_MIN_STAGE_UNITS: u64 = 1_000_000;
+const HOIST_MIN_STAGE_UNITS: u64 = 250_000;
+
+/// Wall-clock work to aim for per cycle. Every cycle carries a fixed cost — one fleet
+/// active-stage HTTP call plus three Redis round trips, measured at ~22 ms — so a batch much
+/// smaller than this spends most of the cycle on overhead. Bigger is not free either: a worker
+/// cannot notice a stage change until its batch ends.
+const TARGET_BATCH_LOOP_MILLIS: u128 = 200;
+/// Ceiling on the adaptive batch, so one cycle can never run away.
+const MAX_FETCH_SIZE: i32 = 1_000_000;
+/// Most the batch may grow in a single step, so one unusually fast batch cannot overshoot.
+const MAX_FETCH_GROWTH: i64 = 4;
+
+/// Next batch size, from the previous batch's measured cost.
+///
+/// One setting cannot serve both regimes: a hoisted unit costs ~0.26 us and an unhoisted one
+/// ~4 us, a 15x spread. Sizing by measured throughput instead of a constant resolves it — the
+/// same target duration yields ~800k units once the hoisted path is live, and ~50k during a
+/// stage's warmup or a fast post-kick descent (where it never engages), which is exactly where a
+/// worker needs to stay responsive to stage changes.
+fn next_fetch_size(current: i32, floor: i32, units: i64, loop_nanos: u128) -> i32 {
+    if units <= 0 || loop_nanos == 0 {
+        return current;
+    }
+    let ceiling = (current as i64)
+        .saturating_mul(MAX_FETCH_GROWTH)
+        .min(MAX_FETCH_SIZE as i64);
+    let per_unit_nanos = loop_nanos / units as u128;
+    let ideal = if per_unit_nanos == 0 {
+        ceiling // immeasurably fast: grow by the max step
+    } else {
+        (TARGET_BATCH_LOOP_MILLIS * 1_000_000 / per_unit_nanos) as i64
+    };
+    ideal.min(ceiling).clamp(floor as i64, MAX_FETCH_SIZE as i64) as i32
+}
 
 pub struct Worker {
     mw_client: MiddlewareClient,
@@ -63,6 +96,9 @@ pub struct Worker {
     /// Work units this worker has EVALUATED (i.e. that survived the bound-skip) in the current
     /// stage, gating the hoisted path against HOIST_MIN_STAGE_UNITS. Reset on every stage change.
     stage_units_processed: u64,
+    /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
+    /// `fetch_size` is its floor and its reset value on a stage change.
+    current_fetch_size: i32,
     /// Base graph of the stage we most recently set up, so the next stage (one flip away) can be
     /// derived from it instead of rebuilt.
     last_base_graph_id: Option<i32>,
@@ -137,6 +173,7 @@ impl Worker {
             hoist_cache: HashMap::new(),
             hoist_enabled,
             stage_units_processed: 0,
+            current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
             fetch_size,
@@ -491,7 +528,7 @@ impl Worker {
         }
 
         let config = self.stage_config.as_ref().unwrap();
-        let batch_size = self.fetch_size as i64;
+        let batch_size = self.current_fetch_size as i64;
         let total_pairs = config.total_pairs;
         let base_graph_id = config.base_graph_id;
         // Base graph bitstring + vertex count for derived-graph hashing (the novelty
@@ -558,6 +595,7 @@ impl Worker {
         let mut evaluated_units: u64 = 0;
 
         // Process each work unit in the range
+        let loop_started = std::time::Instant::now();
         for idx in start_index..end_index {
             let unit = enumerator.index_to_work_unit(idx);
             let edges_to_flip = match &unit {
@@ -694,7 +732,14 @@ impl Worker {
             }
         }
 
+        let loop_elapsed = loop_started.elapsed();
         self.stage_units_processed += evaluated_units;
+        self.current_fetch_size = next_fetch_size(
+            self.current_fetch_size,
+            self.fetch_size,
+            work_count as i64,
+            loop_elapsed.as_nanos(),
+        );
 
         // Submit remaining results
         if self.publish_results && !processed_results.is_empty() {
@@ -966,6 +1011,9 @@ impl Worker {
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
         self.stage_units_processed = 0;
+        // A new stage starts unhoisted, so shrink back to the responsive size rather than
+        // carrying the previous stage's hoisted batch into its warmup.
+        self.current_fetch_size = self.fetch_size;
         self.base_graph_clique_count = None;
         self.stage_config = None;
         self.enumerator = None;
@@ -1068,5 +1116,70 @@ impl Worker {
 
         self.stage_id = Some(stage.stage_id);
         Ok(Some(stage.stage_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: u128 = 1_000_000;
+
+    /// Hoisted units (~0.26us) should drive the batch toward ~200ms of work, i.e. ~770k units,
+    /// but only 4x per step so one fast batch cannot overshoot.
+    #[test]
+    fn grows_toward_the_target_when_units_are_cheap() {
+        let floor = 25_000;
+        let mut size = floor;
+        // 0.26us/unit: a batch of `size` takes size * 260ns.
+        for _ in 0..6 {
+            let nanos = size as u128 * 260;
+            size = next_fetch_size(size, floor, size as i64, nanos);
+        }
+        assert!(size > 700_000 && size <= MAX_FETCH_SIZE, "settled at {size}");
+    }
+
+    #[test]
+    fn growth_is_capped_at_four_x_per_step() {
+        let floor = 25_000;
+        // Absurdly fast batch: still only 4x.
+        assert_eq!(next_fetch_size(25_000, floor, 25_000, 1), 100_000);
+    }
+
+    /// Unhoisted units (~4us) belong in small batches so a worker stays responsive to stage
+    /// changes — this is the fast-descent case.
+    #[test]
+    fn shrinks_when_units_are_expensive() {
+        let floor = 25_000;
+        let size = 1_000_000;
+        // 4us/unit
+        let next = next_fetch_size(size, floor, size as i64, size as u128 * 4_000);
+        assert_eq!(next, 50_000, "200ms / 4us = 50k units");
+    }
+
+    #[test]
+    fn never_leaves_the_floor_ceiling_band() {
+        let floor = 25_000;
+        // Extremely slow units would ask for < floor.
+        assert_eq!(next_fetch_size(500_000, floor, 1_000, 1_000 * MS), floor);
+        // Extremely fast units are capped by MAX_FETCH_SIZE, not just the growth step.
+        assert_eq!(next_fetch_size(MAX_FETCH_SIZE, floor, 1_000_000, 1), MAX_FETCH_SIZE);
+    }
+
+    #[test]
+    fn degenerate_inputs_leave_the_size_untouched() {
+        let floor = 25_000;
+        assert_eq!(next_fetch_size(123_456, floor, 0, 5 * MS), 123_456);
+        assert_eq!(next_fetch_size(123_456, floor, 100, 0), 123_456);
+    }
+
+    /// A batch already at the target duration should stay put rather than oscillate.
+    #[test]
+    fn holds_steady_at_the_target_duration() {
+        let floor = 25_000;
+        let size = 800_000;
+        let nanos = TARGET_BATCH_LOOP_MILLIS * MS; // exactly the target
+        let next = next_fetch_size(size, floor, size as i64, nanos);
+        assert_eq!(next, size, "should not move when already on target");
     }
 }
