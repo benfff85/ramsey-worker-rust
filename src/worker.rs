@@ -26,6 +26,11 @@ const EDGE_COUNTS_BUILD_LOCK_TTL_SECONDS: u64 = 30;
 /// How peers wait for the elected builder's result: poll interval and max polls (~3s total).
 const EDGE_COUNTS_POLL_INTERVAL_MS: u64 = 25;
 const EDGE_COUNTS_WAIT_POLLS: usize = 120;
+/// Most flips we will chase incrementally. Stage-to-stage moves are 1 edge (singles) or 2 (pairs);
+/// anything larger (a perturbation kick) is cheaper to rebuild than to walk edge by edge.
+const MAX_INCREMENTAL_FLIPS: usize = 2;
+/// Graphs/collections retained per worker. The incremental path needs only the previous one.
+const GRAPH_CACHE_MAX: usize = 3;
 
 pub struct Worker {
     mw_client: MiddlewareClient,
@@ -34,6 +39,9 @@ pub struct Worker {
     vertex_count: usize,
     graph_cache: HashMap<i32, Graph>,
     clique_collection_cache: HashMap<i32, CliqueCollection>,
+    /// Base graph of the stage we most recently set up, so the next stage (one flip away) can be
+    /// derived from it instead of rebuilt.
+    last_base_graph_id: Option<i32>,
     poll_interval: Duration,
     fetch_size: i32,
     publish_size: i32,
@@ -101,6 +109,7 @@ impl Worker {
             clique_size,
             graph_cache: HashMap::new(),
             clique_collection_cache: HashMap::new(),
+            last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
             fetch_size,
             publish_size,
@@ -318,6 +327,18 @@ impl Worker {
 
                 // Check if we already have this graph cached (reuse across stages!)
                 if !self.graph_cache.contains_key(&config.base_graph_id) {
+                    let graph_id = config.base_graph_id;
+
+                    // FAST PATH: consecutive stages differ by a single edge flip, so derive this
+                    // stage's graph AND counts from the previous stage's cached ones — a seeded
+                    // traversal of one edge's neighbourhood (~0.4ms) instead of a whole-graph pass
+                    // (~420ms at 800k cliques; measured 1075x). This matters because the counts are
+                    // the serialized head of every stage: until they exist no worker can evaluate
+                    // anything, so it set the floor on stage duration for the whole fleet.
+                    if self.derive_from_previous_stage(&config) {
+                        self.last_base_graph_id = Some(graph_id);
+                        self.prune_graph_caches(graph_id);
+                    } else {
                     log_info!(
                         "Building graph from stage_config (first time for graph {})",
                         config.base_graph_id
@@ -332,7 +353,6 @@ impl Worker {
                     // with the clique count (~1s at 1.6M cliques), and every worker would
                     // otherwise pay it for the SAME graph on every stage, so the first one to
                     // build it shares it via Redis and the rest skip the traversal entirely.
-                    let graph_id = config.base_graph_id;
                     let mut shared = match self.redis_client.as_mut() {
                         Some(redis) => redis.get_shared_edge_counts(graph_id).await.unwrap_or(None),
                         None => None,
@@ -409,6 +429,9 @@ impl Worker {
                         }
                     };
                     self.clique_collection_cache.insert(graph_id, cc);
+                    self.last_base_graph_id = Some(graph_id);
+                    self.prune_graph_caches(graph_id);
+                    }
                 } else {
                     log_info!(
                         "Reusing cached graph {} for new stage {}",
@@ -777,14 +800,102 @@ impl Worker {
         Ok(1)
     }
 
+    /// Try to derive this stage's graph and per-edge clique counts from the previous stage's,
+    /// which differ by only the edge(s) the search just flipped. Returns false when there is
+    /// nothing to derive from (cold start) or the graphs are too far apart, leaving the caller to
+    /// do a full build.
+    fn derive_from_previous_stage(&mut self, config: &StageConfig) -> bool {
+        let graph_id = config.base_graph_id;
+        let Some(prev_id) = self.last_base_graph_id else {
+            return false;
+        };
+        if prev_id == graph_id
+            || !self.graph_cache.contains_key(&prev_id)
+            || !self.clique_collection_cache.contains_key(&prev_id)
+        {
+            return false;
+        }
+
+        let new_bits = &config.graph.edge_data;
+        let prev_bits = self.graph_cache[&prev_id].to_bitstring();
+        if prev_bits.len() != new_bits.len() {
+            return false;
+        }
+        let flipped: Vec<usize> = prev_bits
+            .chars()
+            .zip(new_bits.chars())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        if flipped.is_empty() || flipped.len() > MAX_INCREMENTAL_FLIPS {
+            return false;
+        }
+
+        let mut graph = self.graph_cache[&prev_id].clone();
+        let mut cc = self.clique_collection_cache[&prev_id].clone();
+        for &bit in &flipped {
+            match Graph::edge_for_bit_index(bit, config.graph.vertex_count) {
+                Some((u, v)) => cc.apply_edge_flip(&mut graph, self.clique_size, u, v),
+                None => return false,
+            }
+        }
+        // Cheap belt-and-braces: the derived graph must be exactly the stage's graph. If this ever
+        // fails we fall back to a full build rather than search a wrong graph.
+        if graph.to_bitstring() != *new_bits {
+            log_error!(
+                "Derived graph {} does not match stage config; falling back to full build",
+                graph_id
+            );
+            return false;
+        }
+
+        log_info!(
+            "Derived edge counts for graph {} from {} via {} flip(s) (total cliques {})",
+            graph_id,
+            prev_id,
+            flipped.len(),
+            cc.total()
+        );
+        self.graph_cache.insert(graph_id, graph);
+        self.clique_collection_cache.insert(graph_id, cc);
+        true
+    }
+
+    /// Keep only the newest few graphs/collections. Without this the caches grow by ~360 KB per
+    /// stage forever (thousands of stages per descent), and the incremental path only ever needs
+    /// the immediately preceding one.
+    fn prune_graph_caches(&mut self, keep: i32) {
+        if self.graph_cache.len() <= GRAPH_CACHE_MAX {
+            return;
+        }
+        let mut ids: Vec<i32> = self.graph_cache.keys().copied().collect();
+        ids.sort_unstable();
+        let drop_count = ids.len().saturating_sub(GRAPH_CACHE_MAX);
+        for id in ids.into_iter().take(drop_count) {
+            if id != keep {
+                self.graph_cache.remove(&id);
+                self.clique_collection_cache.remove(&id);
+            }
+        }
+    }
+
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
         self.base_graph_clique_count = None;
         self.stage_config = None;
         self.enumerator = None;
         // Clear graph caches to prevent memory leak on stage progression
+    }
+
+    /// Drop the cross-stage graph/collection caches. These are keyed by GRAPH id and are exactly
+    /// what lets the next stage be derived from the previous one, so they must survive an ordinary
+    /// stage advance — only a campaign change (different vertex_count/clique_size, which would
+    /// make cached collections the wrong shape) or going idle should clear them.
+    fn clear_graph_caches(&mut self) {
         self.graph_cache.clear();
         self.clique_collection_cache.clear();
+        self.last_base_graph_id = None;
     }
 
     /// Resolve the stage to work. Ok(None) means "nothing to do right now"
@@ -800,6 +911,7 @@ impl Worker {
                     if self.stage_id.is_some() {
                         log_info!("Fleet {} has no active stage — idling", fleet);
                         self.clear_stage_cache();
+                        self.clear_graph_caches();
                     }
                     return Ok(None);
                 }
@@ -807,11 +919,14 @@ impl Worker {
             };
 
             if self.stage_id != Some(stage.stage_id) {
-                // Fleet repointed or the stage progressed → reset per-stage state.
+                // Fleet repointed or the stage progressed → reset per-stage state. NOTE: the
+                // graph/collection caches deliberately survive, so the new stage (one flip away)
+                // can be derived from the previous one instead of rebuilt from scratch.
                 self.clear_stage_cache();
                 // Different campaign → refresh vertex/clique params (as initialize
                 // does in campaign mode), so CliqueCollection sizing stays correct.
                 if self.campaign_id != stage.campaign_id {
+                    self.clear_graph_caches(); // cached collections are sized for the old campaign
                     self.campaign_id = stage.campaign_id;
                     if let Ok(campaign) = self.mw_client.get_campaign(stage.campaign_id).await {
                         self.vertex_count = campaign.vertex_count as usize;

@@ -195,6 +195,34 @@ fn bron_kerbosch_walk_inplace<F: FnMut(&BitMatrix)>(
 /// Maximum clique size supported by the stack buffer in [`accumulate_edge_clique_counts`].
 const MAX_CLIQUE_SIZE: usize = 32;
 
+/// Enumerate every monochromatic `clique_size`-clique that contains edge (u,v) in the CURRENT
+/// adjacency (i.e. that edge's own color), handing each to `sink` as the live R bitset.
+///
+/// This is the seeded counterpart of the full traversal: it explores only the common
+/// neighbourhood of u and v, so it costs a tiny fraction of a whole-graph pass. It is what makes
+/// incremental per-edge count updates possible — when one edge flips, only cliques containing
+/// BOTH its endpoints can change.
+pub fn for_each_clique_through_edge<F: FnMut(&BitMatrix)>(
+    adjacency: &[BitMatrix],
+    u: usize,
+    v: usize,
+    clique_size: usize,
+    sink: &mut F,
+) {
+    if clique_size < 2 || !adjacency[u].get(v) {
+        return; // edge absent in this color: it is in no clique of this color
+    }
+    let mut r = BitMatrix::new();
+    r.set(u);
+    r.set(v);
+    let mut p = adjacency[u];
+    p.and_assign(&adjacency[v]);
+    p.clear(u);
+    p.clear(v);
+    let mut x = BitMatrix::new();
+    bron_kerbosch_walk_inplace(&mut r, &mut p, &mut x, adjacency, clique_size, sink);
+}
+
 /// Accumulate, for every vertex pair, how many monochromatic `clique_size`-cliques contain
 /// it — WITHOUT materializing the clique list. Returns the total clique count.
 ///
