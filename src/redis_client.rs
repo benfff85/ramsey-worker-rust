@@ -506,6 +506,28 @@ impl RedisClient {
         Ok(Some((counts, total)))
     }
 
+    /// Elect a single builder for a graph's edge counts: returns true for the one caller that
+    /// wins the SET NX. Losers wait for the winner's result instead of all doing the same
+    /// traversal at once (without this, every worker sees a new stage within milliseconds, all
+    /// miss the cache, and all build in parallel — no sharing at all). The TTL means a builder
+    /// that dies only delays peers, who then fall back to building locally.
+    pub async fn try_acquire_edge_counts_build_lock(
+        &mut self,
+        graph_id: i32,
+        ttl_seconds: u64,
+    ) -> Result<bool, Box<dyn Error>> {
+        let key = format!("clique_edge_counts_lock:{}", graph_id);
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_seconds)
+            .query_async(&mut self.connection)
+            .await?;
+        Ok(acquired.is_some())
+    }
+
     /// Share per-edge clique counts for a graph with a TTL. Best-effort: on failure peers
     /// simply rebuild locally, so callers may ignore the error.
     pub async fn set_shared_edge_counts(

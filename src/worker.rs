@@ -19,6 +19,13 @@ use tokio::time::sleep;
 /// picks up a given stage (seconds), so a few minutes is generous; the short life keeps Redis
 /// bounded — at ~318 KB per 282-vertex graph only the last handful of stages are ever resident.
 const SHARED_EDGE_COUNTS_TTL_SECONDS: u64 = 300;
+/// Lifetime of the "I am building the counts" election lock. Comfortably longer than a build
+/// (~0.6s on a 1.7M-clique graph) so peers wait rather than duplicating, but short enough that
+/// a crashed builder doesn't stall the next stage.
+const EDGE_COUNTS_BUILD_LOCK_TTL_SECONDS: u64 = 30;
+/// How peers wait for the elected builder's result: poll interval and max polls (~3s total).
+const EDGE_COUNTS_POLL_INTERVAL_MS: u64 = 25;
+const EDGE_COUNTS_WAIT_POLLS: usize = 120;
 
 pub struct Worker {
     mw_client: MiddlewareClient,
@@ -326,10 +333,47 @@ impl Worker {
                     // otherwise pay it for the SAME graph on every stage, so the first one to
                     // build it shares it via Redis and the rest skip the traversal entirely.
                     let graph_id = config.base_graph_id;
-                    let shared = match self.redis_client.as_mut() {
+                    let mut shared = match self.redis_client.as_mut() {
                         Some(redis) => redis.get_shared_edge_counts(graph_id).await.unwrap_or(None),
                         None => None,
                     };
+                    // On a miss, elect ONE builder: every worker sees a new stage within
+                    // milliseconds, so without this they all miss and all traverse in parallel
+                    // (no sharing at all). Losers wait for the winner — they would have been
+                    // busy building anyway, and freeing those cores lets the winner finish
+                    // sooner. If the winner dies or is slow, the lock TTL expires / the wait
+                    // times out and they build locally.
+                    if shared.is_none() {
+                        let i_build = match self.redis_client.as_mut() {
+                            Some(redis) => redis
+                                .try_acquire_edge_counts_build_lock(
+                                    graph_id,
+                                    EDGE_COUNTS_BUILD_LOCK_TTL_SECONDS,
+                                )
+                                .await
+                                .unwrap_or(true),
+                            None => true,
+                        };
+                        if !i_build {
+                            for _ in 0..EDGE_COUNTS_WAIT_POLLS {
+                                sleep(Duration::from_millis(EDGE_COUNTS_POLL_INTERVAL_MS)).await;
+                                if let Some(redis) = self.redis_client.as_mut() {
+                                    if let Some(v) =
+                                        redis.get_shared_edge_counts(graph_id).await.unwrap_or(None)
+                                    {
+                                        shared = Some(v);
+                                        break;
+                                    }
+                                }
+                            }
+                            if shared.is_none() {
+                                log_info!(
+                                    "Waited for shared edge counts for graph {} without success; building locally",
+                                    graph_id
+                                );
+                            }
+                        }
+                    }
                     let cc = match shared {
                         Some((counts, total)) => {
                             log_info!(
