@@ -526,6 +526,13 @@ impl Worker {
         // that advances after a fraction of a sweep pays only for what it touched.
         let graph_vertex_count = graph.vertex_count;
         let mut hoist = if self.hoist_enabled && self.stage_units_processed >= HOIST_MIN_STAGE_UNITS {
+            if !self.hoist_cache.contains_key(&base_graph_id) {
+                log_info!(
+                    "Hoist ENGAGED for graph {} after {} evaluated units in this stage",
+                    base_graph_id,
+                    self.stage_units_processed
+                );
+            }
             Some(
                 self.hoist_cache
                     .entry(base_graph_id)
