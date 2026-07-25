@@ -461,13 +461,27 @@ impl RedisClient {
     // ========== Progress Tracking ==========
 
     /// Increment the processed work unit count for a stage
+    /// Record work done, both against the stage and against the campaign.
+    ///
+    /// The per-stage counter is deleted when a stage advances, so anything differencing it loses
+    /// every unit across a turnover — near the floor stages now advance faster than once a second,
+    /// which made fleet throughput read as ~0. The campaign-scoped total never resets, so it can be
+    /// differenced across stage boundaries. Both are pipelined into one round trip, so this stays
+    /// as cheap as the single increment it replaces.
     pub async fn increment_processed_count(
         &mut self,
         stage_id: i32,
+        campaign_id: i32,
         count: i64,
     ) -> Result<i64, Box<dyn Error>> {
-        let key = format!("processed_count:{}", stage_id);
-        let new_count: i64 = self.connection.incr(&key, count).await?;
+        let stage_key = format!("processed_count:{}", stage_id);
+        let campaign_key = format!("processed_total:{}", campaign_id);
+        let (new_count, _): (i64, i64) = redis::pipe()
+            .atomic()
+            .incr(&stage_key, count)
+            .incr(&campaign_key, count)
+            .query_async(&mut self.connection)
+            .await?;
         Ok(new_count)
     }
 

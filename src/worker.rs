@@ -326,6 +326,7 @@ impl Worker {
 
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
+        let campaign_id_for_counter = self.campaign_id;
 
         let mut base_graph =
             Graph::from_bitstring(&config.graph.edge_data, config.graph.vertex_count);
@@ -371,7 +372,7 @@ impl Worker {
         }
 
         if let Some(redis) = self.redis_client.as_mut() {
-            let _ = redis.increment_processed_count(stage_id, 1).await;
+            let _ = redis.increment_processed_count(stage_id, campaign_id_for_counter, 1).await;
         }
 
         Ok(1)
@@ -557,6 +558,7 @@ impl Worker {
 
         let clique_size = self.clique_size;
         let publish_results = self.publish_results;
+        let campaign_id_for_counter = self.campaign_id;
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
         // Hoisted `created` evaluation for this base graph. Lazily memoised per edge, so a stage
@@ -750,7 +752,7 @@ impl Worker {
         if work_count > 0 {
             if let Some(redis) = self.redis_client.as_mut() {
                 let _ = redis
-                    .increment_processed_count(stage_id, work_count as i64)
+                    .increment_processed_count(stage_id, campaign_id_for_counter, work_count as i64)
                     .await;
             }
         }
@@ -778,6 +780,7 @@ impl Worker {
 
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
+        let campaign_id_for_counter = self.campaign_id;
 
         // Build graph and CliqueCollection from stage config.
         // The clique collection provides per-edge participation scores for guided edge selection.
@@ -830,7 +833,7 @@ impl Worker {
 
         // Update processed count (1 per SA run)
         if let Some(redis) = self.redis_client.as_mut() {
-            let _ = redis.increment_processed_count(stage_id, 1).await;
+            let _ = redis.increment_processed_count(stage_id, campaign_id_for_counter, 1).await;
         }
 
         // Return 1 to indicate work was done (avoids poll sleep)
@@ -860,6 +863,7 @@ impl Worker {
 
         let config = self.stage_config.as_ref().unwrap();
         let base_graph_id = config.base_graph_id;
+        let campaign_id_for_counter = self.campaign_id;
         let base_bitstring = config.graph.edge_data.clone();
         let derived_vertex_count = config.graph.vertex_count;
 
@@ -921,7 +925,7 @@ impl Worker {
 
         // Update processed count (1 per VDS run)
         if let Some(redis) = self.redis_client.as_mut() {
-            let _ = redis.increment_processed_count(stage_id, 1).await;
+            let _ = redis.increment_processed_count(stage_id, campaign_id_for_counter, 1).await;
         }
 
         Ok(1)
