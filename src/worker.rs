@@ -3,6 +3,7 @@ use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::Graph;
+use crate::hoist::HoistTables;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::RedisClient;
 use crate::sa::{SaConfig, run_sa};
@@ -31,6 +32,19 @@ const EDGE_COUNTS_WAIT_POLLS: usize = 120;
 const MAX_INCREMENTAL_FLIPS: usize = 2;
 /// Graphs/collections retained per worker. The incremental path needs only the previous one.
 const GRAPH_CACHE_MAX: usize = 3;
+/// Units a worker must have EVALUATED in the current stage before it starts using the hoisted
+/// evaluation. Filling one edge's entry costs an UNCAPPED traversal, ~7x an early-aborted one, and
+/// is repaid only once that edge is reused enough times. A worker meets every blue edge within its
+/// first ~19,810 units but reuses each only once per red edge it reaches, so the fill turns a
+/// profit after roughly 19,810 x 7 evaluated units — and not before.
+///
+/// Counting EVALUATED units (not claimed ones) is what makes this regime-independent. Near the
+/// floor nothing is bound-skipped, so the gate opens after ~1M units and the rest of the ~28M-unit
+/// sweep runs hoisted. Mid-descent the threshold sits far below base_total and ~87% of units are
+/// rejected from the per-edge counts alone, so the same gate needs ~8M claimed units — far more
+/// than a descent stage lives for, and the worker correctly never starts filling a table it would
+/// not get to use.
+const HOIST_MIN_STAGE_UNITS: u64 = 1_000_000;
 
 pub struct Worker {
     mw_client: MiddlewareClient,
@@ -39,6 +53,16 @@ pub struct Worker {
     vertex_count: usize,
     graph_cache: HashMap<i32, Graph>,
     clique_collection_cache: HashMap<i32, CliqueCollection>,
+    /// Memoised per-edge `created` counts per base graph, backing the hoisted pair-move
+    /// evaluation. Keyed by GRAPH id and pruned with the other per-graph caches, so it can never
+    /// outlive the graph it describes.
+    hoist_cache: HashMap<i32, HoistTables>,
+    /// Kill switch for the hoisted path (env HOIST_ENABLED). Off falls back to the seeded kernel,
+    /// which computes exactly the same values.
+    hoist_enabled: bool,
+    /// Work units this worker has EVALUATED (i.e. that survived the bound-skip) in the current
+    /// stage, gating the hoisted path against HOIST_MIN_STAGE_UNITS. Reset on every stage change.
+    stage_units_processed: u64,
     /// Base graph of the stage we most recently set up, so the next stage (one flip away) can be
     /// derived from it instead of rebuilt.
     last_base_graph_id: Option<i32>,
@@ -101,6 +125,7 @@ impl Worker {
         tabu_candidate_pool_size: usize,
         tabu_diversification_pairs: usize,
         tabu_random_seed: Option<u64>,
+        hoist_enabled: bool,
     ) -> Self {
         Worker {
             mw_client: MiddlewareClient::new(base_url),
@@ -109,6 +134,9 @@ impl Worker {
             clique_size,
             graph_cache: HashMap::new(),
             clique_collection_cache: HashMap::new(),
+            hoist_cache: HashMap::new(),
+            hoist_enabled,
+            stage_units_processed: 0,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
             fetch_size,
@@ -490,8 +518,22 @@ impl Worker {
         let work_count = (end_index - start_index) as usize;
         let enumerator = self.enumerator.as_ref().unwrap();
 
+        let clique_size = self.clique_size;
+        let publish_results = self.publish_results;
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
+        // Hoisted `created` evaluation for this base graph. Lazily memoised per edge, so a stage
+        // that advances after a fraction of a sweep pays only for what it touched.
+        let graph_vertex_count = graph.vertex_count;
+        let mut hoist = if self.hoist_enabled && self.stage_units_processed >= HOIST_MIN_STAGE_UNITS {
+            Some(
+                self.hoist_cache
+                    .entry(base_graph_id)
+                    .or_insert_with(|| HoistTables::new(graph_vertex_count)),
+            )
+        } else {
+            None
+        };
 
         // Fetch the current threshold for top-N results (None = accept anything).
         // Declared mut so it can be tightened in-loop as the sorted set fills up,
@@ -505,26 +547,29 @@ impl Worker {
         };
 
         let mut processed_results: Vec<WorkResult> = Vec::new();
+        // Units that survived the bound-skip; drives the hoist gate (see HOIST_MIN_STAGE_UNITS).
+        let mut evaluated_units: u64 = 0;
 
         // Process each work unit in the range
         for idx in start_index..end_index {
-            let edges_to_flip = match enumerator.index_to_work_unit(idx) {
-                WorkUnit::SingleFlip(edge) => vec![edge],
-                WorkUnit::PairFlip(red_edge, blue_edge) => vec![red_edge, blue_edge],
+            let unit = enumerator.index_to_work_unit(idx);
+            let edges_to_flip = match &unit {
+                WorkUnit::SingleFlip(edge) => vec![edge.clone()],
+                WorkUnit::PairFlip(red_edge, blue_edge) => {
+                    vec![red_edge.clone(), blue_edge.clone()]
+                }
             };
 
             let broken = clique_collection.get_count_of_cliques_containing_edges(&edges_to_flip);
             let base_total = clique_collection.total() as i32;
 
-            // Early termination when not publishing: stop counting if result can't be in top-N
-            let count = if !self.publish_results {
-                // Calculate the limit for early termination based on threshold
-                // If threshold exists: max_new = threshold - (base_total - broken) - 1
-                // This is the max new cliques that would still beat the threshold
-                let early_limit = match top_threshold {
+            // Early termination when not publishing: stop counting if result can't be in top-N.
+            // If threshold exists: max_new = threshold - (base_total - broken) - 1, the most new
+            // cliques that would still beat it.
+            let early_limit = if !publish_results {
+                match top_threshold {
                     Some(threshold) => {
-                        let max_count = threshold - 1; // Must be strictly less
-                        let max_new = max_count - base_total + broken;
+                        let max_new = (threshold - 1) - base_total + broken;
                         if max_new < 0 {
                             // base_total - broken >= threshold: this flip cannot beat the
                             // threshold even if it creates ZERO new cliques, so the kernel can
@@ -535,28 +580,49 @@ impl Worker {
                         max_new
                     }
                     None => i32::MAX, // No threshold, count everything
-                };
-
-                graph.flip_edges(&edges_to_flip);
-                let (new, exceeded) = get_new_cliques_with_limit(
-                    graph,
-                    self.clique_size,
-                    &edges_to_flip,
-                    early_limit,
-                );
-                graph.flip_edges(&edges_to_flip);
-
-                if exceeded {
-                    continue;
                 }
-                base_total - broken + new
             } else {
-                graph.flip_edges(&edges_to_flip);
-                let (new, _) =
-                    get_new_cliques_with_limit(graph, self.clique_size, &edges_to_flip, i32::MAX);
-                graph.flip_edges(&edges_to_flip);
-                base_total - broken + new
+                i32::MAX
             };
+            evaluated_units += 1;
+
+            // `created` is ~all of a work unit's cost. The hoisted path derives it algebraically
+            // from memoised per-edge counts (see hoist.rs) instead of running a seeded traversal,
+            // and is EXACT — the two branches agree unit for unit, so which one runs changes only
+            // the cost, never a result, a threshold, or a stage transition.
+            let (new, exceeded) = match hoist.as_deref_mut() {
+                Some(tables) => {
+                    let created = match &unit {
+                        WorkUnit::SingleFlip(edge) => tables.single_created(
+                            graph,
+                            clique_size,
+                            edge.vertex_one as usize,
+                            edge.vertex_two as usize,
+                        ),
+                        WorkUnit::PairFlip(red_edge, blue_edge) => tables.pair_created(
+                            graph,
+                            clique_size,
+                            (red_edge.vertex_one as usize, red_edge.vertex_two as usize),
+                            (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize),
+                        ),
+                    };
+                    // The hoisted value is uncapped, so the abort the kernel would have taken is
+                    // just a comparison here.
+                    (created, created > early_limit)
+                }
+                None => {
+                    graph.flip_edges(&edges_to_flip);
+                    let out =
+                        get_new_cliques_with_limit(graph, clique_size, &edges_to_flip, early_limit);
+                    graph.flip_edges(&edges_to_flip);
+                    out
+                }
+            };
+
+            if exceeded {
+                continue;
+            }
+            let count = base_total - broken + new;
 
             // Track as a potential best result (stored in top-N sorted set)
             // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
@@ -620,6 +686,8 @@ impl Worker {
                 }
             }
         }
+
+        self.stage_units_processed += evaluated_units;
 
         // Submit remaining results
         if self.publish_results && !processed_results.is_empty() {
@@ -883,12 +951,14 @@ impl Worker {
             if id != keep {
                 self.graph_cache.remove(&id);
                 self.clique_collection_cache.remove(&id);
+                self.hoist_cache.remove(&id);
             }
         }
     }
 
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
+        self.stage_units_processed = 0;
         self.base_graph_clique_count = None;
         self.stage_config = None;
         self.enumerator = None;
@@ -902,6 +972,7 @@ impl Worker {
     fn clear_graph_caches(&mut self) {
         self.graph_cache.clear();
         self.clique_collection_cache.clear();
+        self.hoist_cache.clear();
         self.last_base_graph_id = None;
     }
 

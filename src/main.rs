@@ -151,7 +151,15 @@ async fn main() {
 
     let tabu_random_seed: Option<u64> = env::var("TABU_RANDOM_SEED").ok().and_then(|s| s.parse().ok());
 
+    // Hoisted pair-move evaluation: derives `created` from memoised per-edge counts instead of a
+    // seeded traversal. Exact, so this is a pure cost switch; kept as a kill switch.
+    let hoist_enabled: bool = env::var("HOIST_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .expect("HOIST_ENABLED must be true or false");
+
     log_info!("Publish results to MySQL: {}", publish_results);
+    log_info!("Hoisted pair-move evaluation: {}", hoist_enabled);
     log_info!("Tracking top {} results per stage", top_results_count);
 
     if sa_mode {
@@ -203,6 +211,7 @@ async fn main() {
         tabu_candidate_pool_size,
         tabu_diversification_pairs,
         tabu_random_seed,
+        hoist_enabled,
     );
 
     // Connect to Redis

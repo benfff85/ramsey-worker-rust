@@ -306,6 +306,32 @@ pub fn accumulate_edge_clique_counts(
     total
 }
 
+/// Number of `clique_size`-cliques, in the color whose adjacency is given, that contain EVERY
+/// vertex of `seeds`.
+///
+/// `seeds` must be distinct and must already form a clique in this color — the caller establishes
+/// that; this only counts the ways to extend it. Seeding on a whole vertex set (rather than an
+/// edge) is what makes the pair-move correction term cheap: intersecting 3-4 adjacency rows
+/// leaves a tiny candidate set, versus the ~n/2 common neighbourhood of a single edge.
+pub fn count_cliques_through_vertex_set(
+    adjacency: &[BitMatrix],
+    seeds: &[usize],
+    clique_size: usize,
+) -> i32 {
+    if seeds.is_empty() || seeds.len() > clique_size {
+        return 0;
+    }
+    let mut p = adjacency[seeds[0]];
+    for &w in &seeds[1..] {
+        p.and_assign(&adjacency[w]);
+    }
+    // P must exclude the seeds themselves; the recursion assumes every candidate is a NEW vertex.
+    for &w in seeds {
+        p.clear(w);
+    }
+    bron_kerbosch_count_inplace(seeds.len(), &mut p, adjacency, clique_size)
+}
+
 pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
     let mut clique_count = 0;
 
