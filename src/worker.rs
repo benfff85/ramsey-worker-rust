@@ -5,7 +5,8 @@ use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::Graph;
 use crate::hoist::HoistTables;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
-use crate::redis_client::RedisClient;
+use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
+use std::sync::Arc;
 use crate::sa::{SaConfig, run_sa};
 use crate::tabu::{TabuConfig, run_tabu};
 use crate::vds::{VdsConfig, run_vds};
@@ -66,6 +67,23 @@ const HOIST_MIN_STAGE_INDEX: i64 = 500_000;
 /// usual worker count so slices stay distinct; a fleet smaller than this just leaves some slices
 /// unpublished, which costs nothing beyond filling those edges on demand as before.
 const HOIST_FILL_SLICES: i64 = 16;
+/// How often the work loop checks whether its stage has been superseded.
+///
+/// A stage advance invalidates everything after it: results are written to keys the queue manager
+/// clears on the switch, so a batch that runs on past one is wasted outright. Polling the fleet
+/// endpoint once per cycle left workers a large fraction of a stage behind at current rates, which
+/// both wasted that work and scattered the fleet across graphs so it could not pool the per-edge
+/// fill. This is a relaxed atomic load, so checking often is nearly free; the interval only needs
+/// to be coarse enough that the check is not a measurable share of a unit.
+const STAGE_CHECK_INTERVAL_UNITS: i64 = 4096;
+/// Pause before retrying a cycle that found nothing to do for a TRANSIENT reason — the stage
+/// advanced between resolving it and reading its config, or its work was fully claimed.
+///
+/// Those are races, not idleness, and they are routine now that stages turn over faster than a
+/// worker can set one up. Falling back to the full poll interval for them left workers asleep for
+/// a second at a time while the search moved on: measured 19% CPU across the fleet, most of it
+/// spent in one-second sleeps between "Stage config missing" messages.
+const TRANSIENT_RETRY_MILLIS: u64 = 25;
 
 /// Wall-clock work to aim for per cycle. Every cycle carries a fixed cost — one fleet
 /// active-stage HTTP call plus three Redis round trips, measured at ~22 ms — so a batch much
@@ -114,6 +132,12 @@ pub struct Worker {
     /// Kill switch for the hoisted path (env HOIST_ENABLED). Off falls back to the seeded kernel,
     /// which computes exactly the same values.
     hoist_enabled: bool,
+    /// Newest stage announced per campaign, kept current by a background subscriber. Lets the work
+    /// loop abandon a superseded stage in milliseconds instead of at its next poll.
+    stage_announcements: Arc<StageAnnouncements>,
+    /// Set when a cycle came back empty because of a race rather than because there is nothing to
+    /// do, so the next attempt waits milliseconds instead of a full poll interval.
+    retry_soon: bool,
     /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
     /// `fetch_size` is its floor and its reset value on a stage change.
     current_fetch_size: i32,
@@ -190,6 +214,8 @@ impl Worker {
             clique_collection_cache: HashMap::new(),
             hoist_cache: HashMap::new(),
             hoist_enabled,
+            stage_announcements: Arc::new(StageAnnouncements::default()),
+            retry_soon: false,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
@@ -237,6 +263,10 @@ impl Worker {
     pub async fn connect_redis(&mut self, host: &str, port: u16) -> Result<(), Box<dyn Error>> {
         let redis_client = RedisClient::new(host, port).await?;
         self.redis_client = Some(redis_client);
+        // A subscribed connection cannot serve commands, so the watcher gets its own.
+        let announcements = Arc::clone(&self.stage_announcements);
+        let (host, port) = (host.to_string(), port);
+        tokio::spawn(async move { watch_stage_advances(&host, port, announcements).await });
         Ok(())
     }
 
@@ -272,7 +302,15 @@ impl Worker {
             match self.cycle().await {
                 Ok(count) => {
                     if count == 0 {
-                        sleep(self.poll_interval).await;
+                        // A race (stage advanced under us) means work is waiting right now; only a
+                        // genuinely idle fleet should wait out the poll interval.
+                        let wait = if self.retry_soon {
+                            self.retry_soon = false;
+                            Duration::from_millis(TRANSIENT_RETRY_MILLIS)
+                        } else {
+                            self.poll_interval
+                        };
+                        sleep(wait).await;
                     } else {
                         let elapsed_ms = cycle_start.elapsed().as_millis();
                         log_info!("Processed {} work items in {}ms", count, elapsed_ms);
@@ -310,7 +348,8 @@ impl Worker {
                 stage_id
             );
             self.clear_stage_cache();
-            return Ok(0); // Return 0 to trigger poll interval, then retry with fresh stage
+            self.retry_soon = true;
+            return Ok(0);
         }
 
         if self.sa_mode {
@@ -566,6 +605,7 @@ impl Worker {
             None => {
                 log_info!("All work claimed for stage {}, clearing cache...", stage_id);
                 self.clear_stage_cache();
+                self.retry_soon = true;
                 return Ok(0);
             }
         };
@@ -694,7 +734,22 @@ impl Worker {
 
         // Process each work unit in the range
         let loop_started = std::time::Instant::now();
+        let announcements = Arc::clone(&self.stage_announcements);
+        let mut units_done: i64 = 0;
+        let mut abandoned = false;
         for idx in start_index..end_index {
+            // Abandon promptly when this stage has been superseded — everything computed past that
+            // point is written to keys the queue manager has already cleared.
+            if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
+                && units_done > 0
+                && announcements
+                    .latest_for(campaign_id_for_counter)
+                    .is_some_and(|announced| announced != stage_id)
+            {
+                abandoned = true;
+                break;
+            }
+            units_done += 1;
             let unit = enumerator.index_to_work_unit(idx);
             let edges_to_flip = match &unit {
                 WorkUnit::SingleFlip(edge) => vec![edge.clone()],
@@ -830,10 +885,21 @@ impl Worker {
         }
 
         let loop_elapsed = loop_started.elapsed();
+        if abandoned {
+            log_info!(
+                "Abandoned stage {} after {} of {} units — a newer stage was announced",
+                stage_id,
+                units_done,
+                work_count
+            );
+        }
+        // Size the next batch, and report progress, from units ACTUALLY processed. An abandoned
+        // batch did not do the rest of its claim, and counting it would both inflate throughput
+        // and make the batch look faster per unit than it was.
         self.current_fetch_size = next_fetch_size(
             self.current_fetch_size,
             self.fetch_size,
-            work_count as i64,
+            units_done,
             loop_elapsed.as_nanos(),
         );
 
@@ -843,10 +909,10 @@ impl Worker {
         }
 
         // Update processed count
-        if work_count > 0 {
+        if units_done > 0 {
             if let Some(redis) = self.redis_client.as_mut() {
                 let _ = redis
-                    .increment_processed_count(stage_id, campaign_id_for_counter, work_count as i64)
+                    .increment_processed_count(stage_id, campaign_id_for_counter, units_done)
                     .await;
             }
         }

@@ -11,6 +11,91 @@ use std::error::Error;
 /// graph appears on every stage advance.
 const HOIST_SHARD_TTL_SECONDS: u64 = 300;
 
+/// Channel the queue manager announces stage advances on. One channel carries every campaign and
+/// subscribers filter, so a fleet being repointed needs no resubscribe.
+pub const STAGE_ADVANCED_CHANNEL: &str = "stage_advanced";
+
+/// The newest stage a campaign has been announced on, shared between the subscriber task and the
+/// work loop. Stored as one atomic so a reader can never see a campaign and stage from different
+/// announcements; the work loop reads it every few thousand units, so it has to be cheap.
+#[derive(Debug, Default)]
+pub struct StageAnnouncements {
+    packed: std::sync::atomic::AtomicI64,
+}
+
+impl StageAnnouncements {
+    pub fn set(&self, campaign_id: i32, stage_id: i32) {
+        let packed = ((campaign_id as i64) << 32) | (stage_id as i64 & 0xFFFF_FFFF);
+        self.packed
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The latest announced stage for `campaign_id`, if the last announcement was for it.
+    #[inline]
+    pub fn latest_for(&self, campaign_id: i32) -> Option<i32> {
+        let packed = self.packed.load(std::sync::atomic::Ordering::Relaxed);
+        if packed == 0 {
+            return None;
+        }
+        let announced_campaign = (packed >> 32) as i32;
+        if announced_campaign != campaign_id {
+            return None;
+        }
+        Some(packed as i32)
+    }
+}
+
+/// Watch for stage-advance announcements, keeping `announcements` current.
+///
+/// Runs on its own connection because a subscribed Redis connection cannot serve commands. Loops
+/// forever, reconnecting after a failure: workers still poll the fleet endpoint every cycle, so a
+/// subscription that is down costs the latency this exists to remove and nothing more.
+pub async fn watch_stage_advances(
+    host: &str,
+    port: u16,
+    announcements: std::sync::Arc<StageAnnouncements>,
+) {
+    use futures_util::StreamExt;
+    let url = format!("redis://{}:{}", host, port);
+    loop {
+        match redis::Client::open(url.as_str()) {
+            Ok(client) => match client.get_async_pubsub().await {
+                Ok(mut pubsub) => {
+                    if pubsub.subscribe(STAGE_ADVANCED_CHANNEL).await.is_ok() {
+                        log_info!("Watching '{}' for stage advances", STAGE_ADVANCED_CHANNEL);
+                        let mut stream = pubsub.on_message();
+                        while let Some(msg) = stream.next().await {
+                            if let Ok(payload) = msg.get_payload::<String>() {
+                                if let Some((campaign_id, stage_id)) = parse_stage_advance(&payload) {
+                                    announcements.set(campaign_id, stage_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => log_error!("Stage-advance subscribe failed: {e}"),
+            },
+            Err(e) => log_error!("Stage-advance client failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Pull the ids out of `{"campaignId":10,"stageId":42}` without pulling in a JSON parser for two
+/// integers on a hot-ish path.
+fn parse_stage_advance(payload: &str) -> Option<(i32, i32)> {
+    let field = |name: &str| -> Option<i32> {
+        let at = payload.find(name)? + name.len();
+        let rest = &payload[at..];
+        let start = rest.find(|c: char| c.is_ascii_digit() || c == '-')?;
+        let end = rest[start..]
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len() - start);
+        rest[start..start + end].parse().ok()
+    };
+    Some((field("\"campaignId\"")?, field("\"stageId\"")?))
+}
+
 /// Pub/sub channel workers announce new best results on. The queue manager subscribes and arms
 /// a settle timer, so it neither polls blindly nor adopts the very first (usually weakest)
 /// improvement. Must match the QM's RedisListenerConfig.BEST_RESULT_CHANNEL.
@@ -673,5 +758,48 @@ impl RedisClient {
             .set_ex::<_, _, ()>(&key, blob, ttl_seconds)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_queue_managers_announcement() {
+        assert_eq!(
+            parse_stage_advance("{\"campaignId\":10,\"stageId\":141248}"),
+            Some((10, 141248))
+        );
+    }
+
+    #[test]
+    fn ignores_a_malformed_announcement() {
+        assert_eq!(parse_stage_advance("not json"), None);
+        assert_eq!(parse_stage_advance("{\"campaignId\":10}"), None);
+    }
+
+    /// A worker must only act on announcements for the campaign it is working. One channel serves
+    /// every campaign, so another fleet's advance must not make this one abandon its stage.
+    #[test]
+    fn announcements_are_scoped_to_a_campaign() {
+        let a = StageAnnouncements::default();
+        assert_eq!(a.latest_for(10), None, "nothing announced yet");
+
+        a.set(10, 500);
+        assert_eq!(a.latest_for(10), Some(500));
+        assert_eq!(a.latest_for(11), None, "another campaign must not match");
+
+        a.set(11, 900);
+        assert_eq!(a.latest_for(11), Some(900));
+        assert_eq!(a.latest_for(10), None, "superseded by a different campaign");
+    }
+
+    /// Stage ids are well past 2^15 in production; make sure the packing survives large values.
+    #[test]
+    fn packing_survives_large_ids() {
+        let a = StageAnnouncements::default();
+        a.set(10, 2_000_000_000);
+        assert_eq!(a.latest_for(10), Some(2_000_000_000));
     }
 }
