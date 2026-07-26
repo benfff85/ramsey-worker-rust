@@ -55,7 +55,8 @@ The Queue Manager's `StageProgressionMonitor` polls this key and triggers stage 
 | `RAMSEY_CAMPAIGN_ID` | Campaign ID to process | `1` |
 | `REDIS_HOST` | Redis server hostname | `localhost` |
 | `REDIS_PORT` | Redis server port | `6379` |
-| `WORK_UNIT_FETCH_COUNT` | Work range size to claim per cycle | `50000` |
+| `WORK_UNIT_FETCH_COUNT` | **Floor** for the work range claimed per cycle — the worker resizes each cycle from measured throughput, targeting ~200ms of work. Must stay small enough that a batch fits inside a stage. | `50000` |
+| `HOIST_ENABLED` | Use the hoisted pair-move evaluation (`hoist.rs`) instead of the seeded kernel. Both compute identical values, so this only trades cost. | `true` |
 | `WORK_UNIT_PUBLISH_COUNT` | Batch size for result submission | `50000` |
 | `WORK_UNIT_POLL_FREQ` | Polling interval (ms) when no work available | `1000` |
 | `PUBLISH_RESULTS` | Whether to submit results to MySQL | `true` |
