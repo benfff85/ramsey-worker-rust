@@ -647,7 +647,7 @@ impl Worker {
                         for (s, values) in slices {
                             tables.adopt_slice(s as usize, HOIST_FILL_SLICES as usize, &values);
                         }
-                        adopted = tables.filled();
+                        adopted = tables.filled(); // seeded before we filled our own slice
                     }
                 }
                 let slice = match self.redis_client.as_mut() {
@@ -676,14 +676,22 @@ impl Worker {
                         }
                     }
                 }
+                // Report BOTH sweeps separately. The first races peers — they reach the gate when
+                // we do, so it is near-zero by construction — while the second is where the
+                // fleet's work actually shows up. Reporting only the first reads as "no sharing"
+                // even when the table came back mostly filled by peers.
+                let edges = graph_vertex_count * (graph_vertex_count - 1) / 2;
+                let known = tables.filled();
                 log_info!(
-                    "Hoist fill for graph {}: slice {} ({} edges computed here), {} entries seeded from peers, {} of {} known",
+                    "Hoist fill for graph {}: slice {} ({} edges computed here), {} seeded before + {} after publishing, {} of {} known ({}% from peers)",
                     base_graph_id,
                     slice,
                     values.len(),
                     adopted,
-                    tables.filled(),
-                    graph_vertex_count * (graph_vertex_count - 1) / 2
+                    known.saturating_sub(adopted + values.len()),
+                    known,
+                    edges,
+                    100 * known.saturating_sub(values.len()) / edges.max(1)
                 );
             }
             self.hoist_cache.insert(base_graph_id, tables);
