@@ -633,7 +633,6 @@ impl Worker {
         if first_time {
             let mut tables = HoistTables::new(graph_vertex_count);
             let mut adopted = 0usize;
-            let mut mine = 0usize;
             if self.redis_client.is_some() {
                 let graph_for_fill = self.graph_cache.get_mut(&base_graph_id).unwrap();
                 // Seed from peers first so the slice we then fill is genuinely new work.
@@ -658,7 +657,6 @@ impl Worker {
                     slice as usize,
                     HOIST_FILL_SLICES as usize,
                 );
-                mine = values.len();
                 if let Some(redis) = self.redis_client.as_mut() {
                     if let Err(e) = redis.put_hoist_slice(base_graph_id, slice, &values).await {
                         log_error!("Could not publish hoist slice {slice} for graph {base_graph_id}: {e}");
@@ -676,7 +674,7 @@ impl Worker {
                     "Hoist fill for graph {}: slice {} ({} edges computed here), {} entries seeded from peers, {} of {} known",
                     base_graph_id,
                     slice,
-                    mine,
+                    values.len(),
                     adopted,
                     tables.filled(),
                     graph_vertex_count * (graph_vertex_count - 1) / 2
