@@ -10,6 +10,9 @@ pub struct WorkUnitEdge {
     pub vertex_two: u16,
 }
 
+/// Clone is cheap relative to a clique traversal and lets a worker derive the next stage's graph
+/// from the previous one (they differ by a single flip) instead of rebuilding from the bitstring.
+#[derive(Clone)]
 pub struct Graph {
     pub vertex_count: usize,
     pub adjacency: Vec<BitMatrix>,
@@ -30,6 +33,21 @@ impl Graph {
         };
         graph.resync_complement();
         graph
+    }
+
+    /// The vertex pair a bitstring position refers to, using the same row-major i&lt;j order
+    /// [`Self::from_bitstring`] consumes. Lets a caller translate "which bits differ between two
+    /// stages' bitstrings" into the edges that were flipped.
+    pub fn edge_for_bit_index(index: usize, vertex_count: usize) -> Option<(usize, usize)> {
+        let mut remaining = index;
+        for i in 0..vertex_count {
+            let row = vertex_count - i - 1; // pairs (i, i+1..vertex_count)
+            if remaining < row {
+                return Some((i, i + 1 + remaining));
+            }
+            remaining -= row;
+        }
+        None
     }
 
     pub fn from_bitstring(bit_string: &str, vertex_count: usize) -> Self {

@@ -6,6 +6,101 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
+/// Lifetime of a published hoist slice. Only needs to outlive the window in which a fleet is
+/// working one graph — seconds to minutes — and the short life keeps Redis bounded, since a new
+/// graph appears on every stage advance.
+const HOIST_SHARD_TTL_SECONDS: u64 = 300;
+
+/// Channel the queue manager announces stage advances on. One channel carries every campaign and
+/// subscribers filter, so a fleet being repointed needs no resubscribe.
+pub const STAGE_ADVANCED_CHANNEL: &str = "stage_advanced";
+
+/// The newest stage a campaign has been announced on, shared between the subscriber task and the
+/// work loop. Stored as one atomic so a reader can never see a campaign and stage from different
+/// announcements; the work loop reads it every few thousand units, so it has to be cheap.
+#[derive(Debug, Default)]
+pub struct StageAnnouncements {
+    packed: std::sync::atomic::AtomicI64,
+}
+
+impl StageAnnouncements {
+    pub fn set(&self, campaign_id: i32, stage_id: i32) {
+        let packed = ((campaign_id as i64) << 32) | (stage_id as i64 & 0xFFFF_FFFF);
+        self.packed
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The latest announced stage for `campaign_id`, if the last announcement was for it.
+    #[inline]
+    pub fn latest_for(&self, campaign_id: i32) -> Option<i32> {
+        let packed = self.packed.load(std::sync::atomic::Ordering::Relaxed);
+        if packed == 0 {
+            return None;
+        }
+        let announced_campaign = (packed >> 32) as i32;
+        if announced_campaign != campaign_id {
+            return None;
+        }
+        Some(packed as i32)
+    }
+}
+
+/// Watch for stage-advance announcements, keeping `announcements` current.
+///
+/// Runs on its own connection because a subscribed Redis connection cannot serve commands. Loops
+/// forever, reconnecting after a failure: workers still poll the fleet endpoint every cycle, so a
+/// subscription that is down costs the latency this exists to remove and nothing more.
+pub async fn watch_stage_advances(
+    host: &str,
+    port: u16,
+    announcements: std::sync::Arc<StageAnnouncements>,
+) {
+    use futures_util::StreamExt;
+    let url = format!("redis://{}:{}", host, port);
+    loop {
+        match redis::Client::open(url.as_str()) {
+            Ok(client) => match client.get_async_pubsub().await {
+                Ok(mut pubsub) => {
+                    if pubsub.subscribe(STAGE_ADVANCED_CHANNEL).await.is_ok() {
+                        log_info!("Watching '{}' for stage advances", STAGE_ADVANCED_CHANNEL);
+                        let mut stream = pubsub.on_message();
+                        while let Some(msg) = stream.next().await {
+                            if let Ok(payload) = msg.get_payload::<String>() {
+                                if let Some((campaign_id, stage_id)) = parse_stage_advance(&payload) {
+                                    announcements.set(campaign_id, stage_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => log_error!("Stage-advance subscribe failed: {e}"),
+            },
+            Err(e) => log_error!("Stage-advance client failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Pull the ids out of `{"campaignId":10,"stageId":42}` without pulling in a JSON parser for two
+/// integers on a hot-ish path.
+fn parse_stage_advance(payload: &str) -> Option<(i32, i32)> {
+    let field = |name: &str| -> Option<i32> {
+        let at = payload.find(name)? + name.len();
+        let rest = &payload[at..];
+        let start = rest.find(|c: char| c.is_ascii_digit() || c == '-')?;
+        let end = rest[start..]
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len() - start);
+        rest[start..start + end].parse().ok()
+    };
+    Some((field("\"campaignId\"")?, field("\"stageId\"")?))
+}
+
+/// Pub/sub channel workers announce new best results on. The queue manager subscribes and arms
+/// a settle timer, so it neither polls blindly nor adopts the very first (usually weakest)
+/// improvement. Must match the QM's RedisListenerConfig.BEST_RESULT_CHANNEL.
+pub const BEST_RESULT_CHANNEL: &str = "best_result_events";
+
 /// Best result for a stage - stored in Redis for stage progression
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BestResult {
@@ -456,13 +551,255 @@ impl RedisClient {
     // ========== Progress Tracking ==========
 
     /// Increment the processed work unit count for a stage
+    /// Record work done, both against the stage and against the campaign.
+    ///
+    /// The per-stage counter is deleted when a stage advances, so anything differencing it loses
+    /// every unit across a turnover — near the floor stages now advance faster than once a second,
+    /// which made fleet throughput read as ~0. The campaign-scoped total never resets, so it can be
+    /// differenced across stage boundaries. Both are pipelined into one round trip, so this stays
+    /// as cheap as the single increment it replaces.
     pub async fn increment_processed_count(
         &mut self,
         stage_id: i32,
+        campaign_id: i32,
         count: i64,
     ) -> Result<i64, Box<dyn Error>> {
-        let key = format!("processed_count:{}", stage_id);
-        let new_count: i64 = self.connection.incr(&key, count).await?;
+        let stage_key = format!("processed_count:{}", stage_id);
+        let campaign_key = format!("processed_total:{}", campaign_id);
+        let (new_count, _): (i64, i64) = redis::pipe()
+            .atomic()
+            .incr(&stage_key, count)
+            .incr(&campaign_key, count)
+            .query_async(&mut self.connection)
+            .await?;
         Ok(new_count)
+    }
+
+    // ========== Shared per-edge clique counts ==========
+    //
+    // Every worker otherwise recomputes the SAME per-edge clique cardinalities for each new
+    // stage's base graph (the "new graph tax": a full Bron-Kerbosch traversal whose cost scales
+    // with the clique count — ~1s on a 1.6M-clique graph, paid by every worker in parallel on
+    // the same box). The first worker to build them shares them here; peers fetch and skip the
+    // traversal. Keyed by GRAPH id (immutable content) with a short TTL so Redis stays bounded.
+    //
+    // Blob layout: [0..8) total clique count (u64 LE), then vertex_count^2 i32 LE counts.
+
+    fn edge_counts_key(graph_id: i32) -> String {
+        format!("clique_edge_counts:{}", graph_id)
+    }
+
+    /// Fetch shared per-edge clique counts for a graph. Returns (counts, total_clique_count).
+    pub async fn get_shared_edge_counts(
+        &mut self,
+        graph_id: i32,
+    ) -> Result<Option<(Vec<i32>, usize)>, Box<dyn Error>> {
+        let key = Self::edge_counts_key(graph_id);
+        let blob: Option<Vec<u8>> = self.connection.get(&key).await?;
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        if blob.len() < 8 || (blob.len() - 8) % 4 != 0 {
+            log_error!(
+                "Shared edge counts for graph {} malformed ({} bytes); ignoring",
+                graph_id,
+                blob.len()
+            );
+            return Ok(None);
+        }
+        let total = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
+        let counts = blob[8..]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Ok(Some((counts, total)))
+    }
+
+    // ========== Co-operative hoist-table fill ==========
+    //
+    // Filling the per-edge hoist table costs an uncapped traversal per edge — ~2.9s for a
+    // 282-vertex graph — and every worker on that graph would otherwise pay it in full, in
+    // parallel, at the start of every deep stage. Splitting the edge space lets each worker fill
+    // one slice and publish it, so the fleet does the work once between them.
+    //
+    // Keys are scoped by GRAPH id, which is globally unique, so fleets on different campaigns
+    // never collide and fleets that happen to share a graph co-operate automatically.
+    //
+    // A slice is only ever a warm start: [`HoistTables::adopt_slice`] computes anything missing on
+    // demand, so a crashed peer, an expired key or a slice that never lands costs time, never
+    // correctness.
+
+    fn hoist_shard_key(graph_id: i32, slice: i64) -> String {
+        format!("hoist_shard:{}:{}", graph_id, slice)
+    }
+
+    /// Claim a slice of the edge space for this graph. Workers claiming concurrently get distinct
+    /// slices until the count wraps, at which point a duplicate is harmless — it just recomputes
+    /// what a peer already published.
+    pub async fn claim_hoist_slice(
+        &mut self,
+        graph_id: i32,
+        slices: i64,
+    ) -> Result<i64, Box<dyn Error>> {
+        let key = format!("hoist_claim:{}", graph_id);
+        let n: i64 = self.connection.incr(&key, 1i64).await?;
+        // Expire the counter with the slices themselves so a long-dead graph leaves nothing behind.
+        let _: () = self.connection.expire(&key, HOIST_SHARD_TTL_SECONDS as i64).await?;
+        Ok((n - 1).rem_euclid(slices))
+    }
+
+    /// Publish this worker's slice for peers to adopt.
+    pub async fn put_hoist_slice(
+        &mut self,
+        graph_id: i32,
+        slice: i64,
+        values: &[i32],
+    ) -> Result<(), Box<dyn Error>> {
+        let mut blob = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let key = Self::hoist_shard_key(graph_id, slice);
+        let _: () = self
+            .connection
+            .set_ex(&key, blob, HOIST_SHARD_TTL_SECONDS)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch every published slice for this graph in one round trip. Returns `(slice, values)` for
+    /// those present; absent or malformed slices are simply omitted.
+    pub async fn get_hoist_slices(
+        &mut self,
+        graph_id: i32,
+        slices: i64,
+    ) -> Result<Vec<(i64, Vec<i32>)>, Box<dyn Error>> {
+        let keys: Vec<String> = (0..slices).map(|s| Self::hoist_shard_key(graph_id, s)).collect();
+        let blobs: Vec<Option<Vec<u8>>> = self.connection.mget(&keys).await?;
+        let mut out = Vec::new();
+        for (s, blob) in blobs.into_iter().enumerate() {
+            let Some(blob) = blob else { continue };
+            if blob.is_empty() || blob.len() % 4 != 0 {
+                log_error!(
+                    "Hoist slice {} for graph {} malformed ({} bytes); ignoring",
+                    s,
+                    graph_id,
+                    blob.len()
+                );
+                continue;
+            }
+            let values = blob
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            out.push((s as i64, values));
+        }
+        Ok(out)
+    }
+
+    /// Announce that a new best (novel, record-breaking) result landed for a stage, so the queue
+    /// manager can start its settle timer immediately instead of discovering the improvement on
+    /// its next poll. Fire-and-forget: Redis pub/sub has no delivery guarantee and the QM keeps a
+    /// polling fallback, so a dropped message costs a little latency, never correctness.
+    pub async fn publish_best_result(
+        &mut self,
+        stage_id: i32,
+        clique_count: i32,
+    ) -> Result<(), Box<dyn Error>> {
+        let payload = format!(
+            "{{\"stageId\":{},\"cliqueCount\":{}}}",
+            stage_id, clique_count
+        );
+        let _: i64 = self
+            .connection
+            .publish(BEST_RESULT_CHANNEL, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Elect a single builder for a graph's edge counts: returns true for the one caller that
+    /// wins the SET NX. Losers wait for the winner's result instead of all doing the same
+    /// traversal at once (without this, every worker sees a new stage within milliseconds, all
+    /// miss the cache, and all build in parallel — no sharing at all). The TTL means a builder
+    /// that dies only delays peers, who then fall back to building locally.
+    pub async fn try_acquire_edge_counts_build_lock(
+        &mut self,
+        graph_id: i32,
+        ttl_seconds: u64,
+    ) -> Result<bool, Box<dyn Error>> {
+        let key = format!("clique_edge_counts_lock:{}", graph_id);
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_seconds)
+            .query_async(&mut self.connection)
+            .await?;
+        Ok(acquired.is_some())
+    }
+
+    /// Share per-edge clique counts for a graph with a TTL. Best-effort: on failure peers
+    /// simply rebuild locally, so callers may ignore the error.
+    pub async fn set_shared_edge_counts(
+        &mut self,
+        graph_id: i32,
+        counts: &[i32],
+        total_clique_count: usize,
+        ttl_seconds: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let key = Self::edge_counts_key(graph_id);
+        let mut blob = Vec::with_capacity(8 + counts.len() * 4);
+        blob.extend_from_slice(&(total_clique_count as u64).to_le_bytes());
+        for c in counts {
+            blob.extend_from_slice(&c.to_le_bytes());
+        }
+        self.connection
+            .set_ex::<_, _, ()>(&key, blob, ttl_seconds)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_queue_managers_announcement() {
+        assert_eq!(
+            parse_stage_advance("{\"campaignId\":10,\"stageId\":141248}"),
+            Some((10, 141248))
+        );
+    }
+
+    #[test]
+    fn ignores_a_malformed_announcement() {
+        assert_eq!(parse_stage_advance("not json"), None);
+        assert_eq!(parse_stage_advance("{\"campaignId\":10}"), None);
+    }
+
+    /// A worker must only act on announcements for the campaign it is working. One channel serves
+    /// every campaign, so another fleet's advance must not make this one abandon its stage.
+    #[test]
+    fn announcements_are_scoped_to_a_campaign() {
+        let a = StageAnnouncements::default();
+        assert_eq!(a.latest_for(10), None, "nothing announced yet");
+
+        a.set(10, 500);
+        assert_eq!(a.latest_for(10), Some(500));
+        assert_eq!(a.latest_for(11), None, "another campaign must not match");
+
+        a.set(11, 900);
+        assert_eq!(a.latest_for(11), Some(900));
+        assert_eq!(a.latest_for(10), None, "superseded by a different campaign");
+    }
+
+    /// Stage ids are well past 2^15 in production; make sure the packing survives large values.
+    #[test]
+    fn packing_survives_large_ids() {
+        let a = StageAnnouncements::default();
+        a.set(10, 2_000_000_000);
+        assert_eq!(a.latest_for(10), Some(2_000_000_000));
     }
 }
