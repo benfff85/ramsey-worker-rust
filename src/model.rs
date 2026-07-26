@@ -79,6 +79,8 @@ pub enum WorkEnumerationStrategy {
     SINGLE_EDGE_CARDINALITY,
     DUAL_EDGE_CARDINALITY,
     DUAL_EDGE_CARDINALITY_WITH_SINGLES,
+    /// Singles then pairs, both in plain edge order — no cardinality scoring, no sort.
+    SEQUENTIAL_WITH_SINGLES,
 }
 
 /// Stage configuration stored in Redis for counter-based work
