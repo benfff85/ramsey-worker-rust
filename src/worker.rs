@@ -58,6 +58,14 @@ const GRAPH_CACHE_MAX: usize = 3;
 /// It is also comfortably past the 39,621-unit singles block, so every single-edge flip is
 /// evaluated before any table filling begins.
 const HOIST_MIN_STAGE_INDEX: i64 = 500_000;
+/// Slices the per-edge fill is split into across the fleet.
+///
+/// Every worker on a graph would otherwise fill the whole table itself — ~2.9s of uncapped
+/// traversals, done 14 times over in parallel. Each worker instead claims one slice, publishes it,
+/// and adopts its peers', so the fleet pays the fill once between them. Kept a little above the
+/// usual worker count so slices stay distinct; a fleet smaller than this just leaves some slices
+/// unpublished, which costs nothing beyond filling those edges on demand as before.
+const HOIST_FILL_SLICES: i64 = 16;
 
 /// Wall-clock work to aim for per cycle. Every cycle carries a fixed cost — one fleet
 /// active-stage HTTP call plus three Redis round trips, measured at ~22 ms — so a batch much
@@ -568,24 +576,105 @@ impl Worker {
         let clique_size = self.clique_size;
         let publish_results = self.publish_results;
         let campaign_id_for_counter = self.campaign_id;
-        let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
-        let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
-        // Hoisted `created` evaluation for this base graph. Lazily memoised per edge, so a stage
-        // that advances after a fraction of a sweep pays only for what it touched.
-        let graph_vertex_count = graph.vertex_count;
-        let mut hoist = if self.hoist_enabled && start_index >= HOIST_MIN_STAGE_INDEX {
-            if !self.hoist_cache.contains_key(&base_graph_id) {
+        let graph_vertex_count = self.graph_cache[&base_graph_id].vertex_count;
+        let engage = self.hoist_enabled && start_index >= HOIST_MIN_STAGE_INDEX;
+        let first_time = engage && !self.hoist_cache.contains_key(&base_graph_id);
+        if first_time {
+            log_info!(
+                "Hoist ENGAGED for graph {} at stage work index {}",
+                base_graph_id,
+                start_index
+            );
+        }
+
+        // Co-operative fill: claim one slice of the edge space, publish it, and adopt whatever
+        // peers have published. Anything still missing is computed on demand exactly as before, so
+        // a crashed peer or an expired key costs a little time and nothing else.
+        if first_time {
+            let mut tables = HoistTables::new(graph_vertex_count);
+            let mut adopted = 0usize;
+            let mut mine = 0usize;
+            if self.redis_client.is_some() {
+                let graph_for_fill = self.graph_cache.get_mut(&base_graph_id).unwrap();
+                // Seed from peers first so the slice we then fill is genuinely new work.
+                if let Some(redis) = self.redis_client.as_mut() {
+                    if let Ok(slices) = redis.get_hoist_slices(base_graph_id, HOIST_FILL_SLICES).await {
+                        for (s, values) in slices {
+                            tables.adopt_slice(s as usize, HOIST_FILL_SLICES as usize, &values);
+                        }
+                        adopted = tables.filled();
+                    }
+                }
+                let slice = match self.redis_client.as_mut() {
+                    Some(redis) => redis
+                        .claim_hoist_slice(base_graph_id, HOIST_FILL_SLICES)
+                        .await
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let values = tables.fill_slice(
+                    graph_for_fill,
+                    clique_size,
+                    slice as usize,
+                    HOIST_FILL_SLICES as usize,
+                );
+                mine = values.len();
+                if let Some(redis) = self.redis_client.as_mut() {
+                    if let Err(e) = redis.put_hoist_slice(base_graph_id, slice, &values).await {
+                        log_error!("Could not publish hoist slice {slice} for graph {base_graph_id}: {e}");
+                    }
+                }
+                // One more sweep for slices that landed while we were filling ours.
+                if let Some(redis) = self.redis_client.as_mut() {
+                    if let Ok(slices) = redis.get_hoist_slices(base_graph_id, HOIST_FILL_SLICES).await {
+                        for (s, values) in slices {
+                            tables.adopt_slice(s as usize, HOIST_FILL_SLICES as usize, &values);
+                        }
+                    }
+                }
                 log_info!(
-                    "Hoist ENGAGED for graph {} at stage work index {}",
+                    "Hoist fill for graph {}: slice {} ({} edges computed here), {} entries seeded from peers, {} of {} known",
                     base_graph_id,
-                    start_index
+                    slice,
+                    mine,
+                    adopted,
+                    tables.filled(),
+                    graph_vertex_count * (graph_vertex_count - 1) / 2
                 );
             }
-            Some(
-                self.hoist_cache
-                    .entry(base_graph_id)
-                    .or_insert_with(|| HoistTables::new(graph_vertex_count)),
-            )
+            self.hoist_cache.insert(base_graph_id, tables);
+        }
+
+        // Collect slices peers published after our own sweep. They reach the gate when we do and
+        // publish at roughly the same moment, so the sweep taken right after filling our slice
+        // usually races them; picking the rest up over the next few batches is what actually makes
+        // the fill co-operative rather than 14 workers each doing the whole thing.
+        if engage && !first_time {
+            let wants = self
+                .hoist_cache
+                .get(&base_graph_id)
+                .is_some_and(|t| t.wants_refresh());
+            if wants {
+                let fetched = match self.redis_client.as_mut() {
+                    Some(redis) => redis
+                        .get_hoist_slices(base_graph_id, HOIST_FILL_SLICES)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if let Some(tables) = self.hoist_cache.get_mut(&base_graph_id) {
+                    for (s, values) in fetched {
+                        tables.adopt_slice(s as usize, HOIST_FILL_SLICES as usize, &values);
+                    }
+                    tables.note_refresh();
+                }
+            }
+        }
+
+        let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
+        let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
+        let mut hoist = if engage {
+            self.hoist_cache.get_mut(&base_graph_id)
         } else {
             None
         };

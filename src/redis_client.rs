@@ -6,6 +6,11 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
+/// Lifetime of a published hoist slice. Only needs to outlive the window in which a fleet is
+/// working one graph — seconds to minutes — and the short life keeps Redis bounded, since a new
+/// graph appears on every stage advance.
+const HOIST_SHARD_TTL_SECONDS: u64 = 300;
+
 /// Pub/sub channel workers announce new best results on. The queue manager subscribes and arms
 /// a settle timer, so it neither polls blindly nor adopts the very first (usually weakest)
 /// improvement. Must match the QM's RedisListenerConfig.BEST_RESULT_CHANNEL.
@@ -523,6 +528,88 @@ impl RedisClient {
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         Ok(Some((counts, total)))
+    }
+
+    // ========== Co-operative hoist-table fill ==========
+    //
+    // Filling the per-edge hoist table costs an uncapped traversal per edge — ~2.9s for a
+    // 282-vertex graph — and every worker on that graph would otherwise pay it in full, in
+    // parallel, at the start of every deep stage. Splitting the edge space lets each worker fill
+    // one slice and publish it, so the fleet does the work once between them.
+    //
+    // Keys are scoped by GRAPH id, which is globally unique, so fleets on different campaigns
+    // never collide and fleets that happen to share a graph co-operate automatically.
+    //
+    // A slice is only ever a warm start: [`HoistTables::adopt_slice`] computes anything missing on
+    // demand, so a crashed peer, an expired key or a slice that never lands costs time, never
+    // correctness.
+
+    fn hoist_shard_key(graph_id: i32, slice: i64) -> String {
+        format!("hoist_shard:{}:{}", graph_id, slice)
+    }
+
+    /// Claim a slice of the edge space for this graph. Workers claiming concurrently get distinct
+    /// slices until the count wraps, at which point a duplicate is harmless — it just recomputes
+    /// what a peer already published.
+    pub async fn claim_hoist_slice(
+        &mut self,
+        graph_id: i32,
+        slices: i64,
+    ) -> Result<i64, Box<dyn Error>> {
+        let key = format!("hoist_claim:{}", graph_id);
+        let n: i64 = self.connection.incr(&key, 1i64).await?;
+        // Expire the counter with the slices themselves so a long-dead graph leaves nothing behind.
+        let _: () = self.connection.expire(&key, HOIST_SHARD_TTL_SECONDS as i64).await?;
+        Ok((n - 1).rem_euclid(slices))
+    }
+
+    /// Publish this worker's slice for peers to adopt.
+    pub async fn put_hoist_slice(
+        &mut self,
+        graph_id: i32,
+        slice: i64,
+        values: &[i32],
+    ) -> Result<(), Box<dyn Error>> {
+        let mut blob = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let key = Self::hoist_shard_key(graph_id, slice);
+        let _: () = self
+            .connection
+            .set_ex(&key, blob, HOIST_SHARD_TTL_SECONDS)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch every published slice for this graph in one round trip. Returns `(slice, values)` for
+    /// those present; absent or malformed slices are simply omitted.
+    pub async fn get_hoist_slices(
+        &mut self,
+        graph_id: i32,
+        slices: i64,
+    ) -> Result<Vec<(i64, Vec<i32>)>, Box<dyn Error>> {
+        let keys: Vec<String> = (0..slices).map(|s| Self::hoist_shard_key(graph_id, s)).collect();
+        let blobs: Vec<Option<Vec<u8>>> = self.connection.mget(&keys).await?;
+        let mut out = Vec::new();
+        for (s, blob) in blobs.into_iter().enumerate() {
+            let Some(blob) = blob else { continue };
+            if blob.is_empty() || blob.len() % 4 != 0 {
+                log_error!(
+                    "Hoist slice {} for graph {} malformed ({} bytes); ignoring",
+                    s,
+                    graph_id,
+                    blob.len()
+                );
+                continue;
+            }
+            let values = blob
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            out.push((s as i64, values));
+        }
+        Ok(out)
     }
 
     /// Announce that a new best (novel, record-breaking) result landed for a stage, so the queue

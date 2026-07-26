@@ -143,6 +143,12 @@ fn correction(
 #[derive(Debug, Clone)]
 pub struct HoistTables {
     vertex_count: usize,
+    /// Re-checks left for peers' slices. Workers reach the gate together and publish at roughly
+    /// the same moment, so a single sweep right after filling our own slice mostly races them and
+    /// comes back empty. Re-checking over the next few batches is what actually collects the
+    /// fleet's work; the budget stops us polling forever when a slice is never published (a
+    /// smaller fleet than there are slices), in which case the stragglers are filled on demand.
+    refresh_budget: u8,
     /// `created` for flipping that ONE edge, indexed `min * vertex_count + max`. For a blue edge
     /// this is `C_b`, for a red edge `D_r` — an edge has exactly one colour, so one table serves
     /// both. Doubles as the answer for single-flip work units.
@@ -153,6 +159,7 @@ impl HoistTables {
     pub fn new(vertex_count: usize) -> Self {
         HoistTables {
             vertex_count,
+            refresh_budget: 12,
             single: vec![UNKNOWN; vertex_count * vertex_count],
         }
     }
@@ -166,6 +173,81 @@ impl HoistTables {
     /// How many entries have been computed — for logging/tests only.
     pub fn filled(&self) -> usize {
         self.single.iter().filter(|&&x| x != UNKNOWN).count()
+    }
+
+    /// Number of edges in a slice of the edge space, so callers can size buffers.
+    pub fn slice_len(vertex_count: usize, slice: usize, slices: usize) -> usize {
+        let edges = vertex_count * (vertex_count - 1) / 2;
+        edges.saturating_sub(slice).div_ceil(slices)
+    }
+
+    /// Compute every entry in one slice of the edge space and return the values in slice order.
+    ///
+    /// Slices are taken by striding the canonical upper-triangular edge order
+    /// ([`Graph::edge_for_bit_index`]): slice `s` of `n` owns bit indices `s, s+n, s+2n, …`. That
+    /// ordering is shared by every worker and derived from the graph alone, so a peer can map the
+    /// returned values straight back onto edges without them being carried alongside.
+    ///
+    /// Filling one slice is the co-operative half of the ramp: with the fleet splitting the edge
+    /// space, each worker pays 1/n of a fill it would otherwise do in full and alone.
+    pub fn fill_slice(
+        &mut self,
+        graph: &mut Graph,
+        clique_size: usize,
+        slice: usize,
+        slices: usize,
+    ) -> Vec<i32> {
+        let edges = graph.vertex_count * (graph.vertex_count - 1) / 2;
+        let mut out = Vec::with_capacity(Self::slice_len(graph.vertex_count, slice, slices));
+        let mut bit = slice;
+        while bit < edges {
+            match Graph::edge_for_bit_index(bit, graph.vertex_count) {
+                Some((u, v)) => out.push(self.single_created(graph, clique_size, u, v)),
+                None => break,
+            }
+            bit += slices;
+        }
+        out
+    }
+
+    /// Adopt a peer's slice. Values must be in the same stride order [`Self::fill_slice`] emits.
+    ///
+    /// Entries already known locally are left alone — they were computed here and are definitive.
+    /// Anything the peer did not cover simply stays unknown and is computed on demand, so a
+    /// partial or missing slice only costs time, never correctness.
+    pub fn adopt_slice(&mut self, slice: usize, slices: usize, values: &[i32]) {
+        let edges = self.vertex_count * (self.vertex_count - 1) / 2;
+        let mut bit = slice;
+        for &value in values {
+            if bit >= edges {
+                break;
+            }
+            if value >= 0 {
+                if let Some((u, v)) = Graph::edge_for_bit_index(bit, self.vertex_count) {
+                    let i = self.index(u, v);
+                    if self.single[i] == UNKNOWN {
+                        self.single[i] = value;
+                    }
+                }
+            }
+            bit += slices;
+        }
+    }
+
+    /// Whether it is still worth asking Redis for slices we do not have.
+    pub fn wants_refresh(&self) -> bool {
+        self.refresh_budget > 0 && !self.is_complete()
+    }
+
+    /// Record that a refresh happened, so the budget is spent whether or not it found anything.
+    pub fn note_refresh(&mut self) {
+        self.refresh_budget = self.refresh_budget.saturating_sub(1);
+    }
+
+    /// True once every edge has a value, i.e. no further filling can be needed.
+    pub fn is_complete(&self) -> bool {
+        let edges = self.vertex_count * (self.vertex_count - 1) / 2;
+        self.filled() >= edges
     }
 
     /// `created` for flipping the single edge `(u,v)` of the base graph, memoised.
@@ -399,5 +481,83 @@ mod tests {
             assert_eq!(first, tables.pair_created(&mut graph, k, r, b));
         }
         assert_eq!(graph.to_bitstring(), before, "base graph must be restored");
+    }
+
+    /// The sharded fill must land on exactly the same table as filling it alone. A stride
+    /// mismatch between the worker that computed a slice and the one that adopts it would put
+    /// correct values on the WRONG edges — silent corruption that no later check would catch.
+    #[test]
+    fn sharded_fill_reconstructs_the_same_table_as_a_solo_fill() {
+        for (n, k, slices) in [(11usize, 4usize, 3usize), (12, 5, 4), (13, 4, 7), (10, 4, 1)] {
+            let b = bits(n, 91);
+            let mut graph = Graph::from_bitstring(&b, n);
+
+            // Reference: one worker fills every edge itself.
+            let mut solo = HoistTables::new(n);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    solo.single_created(&mut graph, k, i, j);
+                }
+            }
+
+            // Co-operative: each slice computed by its own table, then merged into a fresh one.
+            let mut merged = HoistTables::new(n);
+            for s in 0..slices {
+                let mut peer = HoistTables::new(n);
+                let values = peer.fill_slice(&mut graph, k, s, slices);
+                assert_eq!(values.len(), HoistTables::slice_len(n, s, slices), "slice {s} length");
+                merged.adopt_slice(s, slices, &values);
+            }
+
+            assert!(merged.is_complete(), "n={n} slices={slices}: merge left gaps");
+            assert_eq!(merged.filled(), solo.filled());
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    assert_eq!(
+                        merged.single_created(&mut graph, k, i, j),
+                        solo.single_created(&mut graph, k, i, j),
+                        "n={n} k={k} slices={slices} edge ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A missing or partial slice must degrade to local computation, never to a wrong answer —
+    /// this is what makes a peer's contribution safe to trust without verifying it.
+    #[test]
+    fn missing_slices_fall_back_to_local_computation() {
+        let (n, k, slices) = (12usize, 5usize, 4usize);
+        let mut graph = Graph::from_bitstring(&bits(n, 33), n);
+
+        let mut solo = HoistTables::new(n);
+        let mut partial = HoistTables::new(n);
+        // Only slice 1 arrives; the rest never do.
+        let mut peer = HoistTables::new(n);
+        let values = peer.fill_slice(&mut graph, k, 1, slices);
+        partial.adopt_slice(1, slices, &values);
+        assert!(!partial.is_complete());
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                assert_eq!(
+                    partial.single_created(&mut graph, k, i, j),
+                    solo.single_created(&mut graph, k, i, j),
+                    "edge ({i},{j}) diverged with only one slice present"
+                );
+            }
+        }
+        assert!(partial.is_complete(), "on-demand fill should have completed it");
+    }
+
+    /// Adopting must never overwrite a value this worker computed itself.
+    #[test]
+    fn adopt_does_not_clobber_locally_computed_entries() {
+        let (n, k) = (10usize, 4usize);
+        let mut graph = Graph::from_bitstring(&bits(n, 7), n);
+        let mut t = HoistTables::new(n);
+        let truth = t.single_created(&mut graph, k, 0, 1); // edge bit index 0 -> slice 0 of 2
+        t.adopt_slice(0, 2, &vec![truth + 999; HoistTables::slice_len(n, 0, 2)]);
+        assert_eq!(t.single_created(&mut graph, k, 0, 1), truth);
     }
 }
