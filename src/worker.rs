@@ -42,19 +42,22 @@ const EDGE_COUNTS_WAIT_POLLS: usize = 120;
 const MAX_INCREMENTAL_FLIPS: usize = 16;
 /// Graphs/collections retained per worker. The incremental path needs only the previous one.
 const GRAPH_CACHE_MAX: usize = 3;
-/// Units a worker must have EVALUATED in the current stage before it starts using the hoisted
-/// evaluation. Filling one edge's entry costs an UNCAPPED traversal, ~7x an early-aborted one, and
-/// is repaid only once that edge is reused enough times. A worker meets every blue edge within its
-/// first ~19,810 units but reuses each only once per red edge it reaches, so the fill turns a
-/// profit after roughly 19,810 x 7 evaluated units — and not before.
+/// How deep a stage must be, fleet-wide, before a worker starts filling its hoist tables.
 ///
-/// Counting EVALUATED units (not claimed ones) is what makes this regime-independent. Near the
-/// floor nothing is bound-skipped, so the gate opens after ~1M units and the rest of the ~28M-unit
-/// sweep runs hoisted. Mid-descent the threshold sits far below base_total and ~87% of units are
-/// rejected from the per-edge counts alone, so the same gate needs ~8M claimed units — far more
-/// than a descent stage lives for, and the worker correctly never starts filling a table it would
-/// not get to use.
-const HOIST_MIN_STAGE_UNITS: u64 = 250_000;
+/// The gate exists only to avoid filling a table the stage will not live long enough to reuse: an
+/// entry costs an UNCAPPED traversal (~147us near the floor, more mid-descent) against ~8us for
+/// the capped kernel evaluation it replaces, and it only repays once that edge is hit again.
+///
+/// This reads the fleet-wide claimed index rather than the worker's own unit count, which is a far
+/// better signal for the same decision. It is the actual measure of "how deep is this stage", it
+/// accumulates 14x faster so the gate opens in a fraction of a second instead of seconds, and it
+/// needs no per-worker bookkeeping. Measured: a post-kick descent stage advances by a fleet index
+/// of only 25,000-75,000 units, while a near-floor wall stage sweeps all 392M — so this threshold
+/// sits ~7x above anything a descent reaches, and a wall stage crosses it in ~0.28s.
+///
+/// It is also comfortably past the 39,621-unit singles block, so every single-edge flip is
+/// evaluated before any table filling begins.
+const HOIST_MIN_STAGE_INDEX: i64 = 500_000;
 
 /// Wall-clock work to aim for per cycle. Every cycle carries a fixed cost — one fleet
 /// active-stage HTTP call plus three Redis round trips, measured at ~22 ms — so a batch much
@@ -103,9 +106,6 @@ pub struct Worker {
     /// Kill switch for the hoisted path (env HOIST_ENABLED). Off falls back to the seeded kernel,
     /// which computes exactly the same values.
     hoist_enabled: bool,
-    /// Work units this worker has EVALUATED (i.e. that survived the bound-skip) in the current
-    /// stage, gating the hoisted path against HOIST_MIN_STAGE_UNITS. Reset on every stage change.
-    stage_units_processed: u64,
     /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
     /// `fetch_size` is its floor and its reset value on a stage change.
     current_fetch_size: i32,
@@ -182,7 +182,6 @@ impl Worker {
             clique_collection_cache: HashMap::new(),
             hoist_cache: HashMap::new(),
             hoist_enabled,
-            stage_units_processed: 0,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
@@ -574,12 +573,12 @@ impl Worker {
         // Hoisted `created` evaluation for this base graph. Lazily memoised per edge, so a stage
         // that advances after a fraction of a sweep pays only for what it touched.
         let graph_vertex_count = graph.vertex_count;
-        let mut hoist = if self.hoist_enabled && self.stage_units_processed >= HOIST_MIN_STAGE_UNITS {
+        let mut hoist = if self.hoist_enabled && start_index >= HOIST_MIN_STAGE_INDEX {
             if !self.hoist_cache.contains_key(&base_graph_id) {
                 log_info!(
-                    "Hoist ENGAGED for graph {} after {} evaluated units in this stage",
+                    "Hoist ENGAGED for graph {} at stage work index {}",
                     base_graph_id,
-                    self.stage_units_processed
+                    start_index
                 );
             }
             Some(
@@ -603,8 +602,6 @@ impl Worker {
         };
 
         let mut processed_results: Vec<WorkResult> = Vec::new();
-        // Units that survived the bound-skip; drives the hoist gate (see HOIST_MIN_STAGE_UNITS).
-        let mut evaluated_units: u64 = 0;
 
         // Process each work unit in the range
         let loop_started = std::time::Instant::now();
@@ -641,7 +638,6 @@ impl Worker {
             } else {
                 i32::MAX
             };
-            evaluated_units += 1;
 
             // `created` is ~all of a work unit's cost. The hoisted path derives it algebraically
             // from memoised per-edge counts (see hoist.rs) instead of running a seeded traversal,
@@ -745,7 +741,6 @@ impl Worker {
         }
 
         let loop_elapsed = loop_started.elapsed();
-        self.stage_units_processed += evaluated_units;
         self.current_fetch_size = next_fetch_size(
             self.current_fetch_size,
             self.fetch_size,
@@ -1024,7 +1019,6 @@ impl Worker {
 
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
-        self.stage_units_processed = 0;
         // A new stage starts unhoisted, so shrink back to the responsive size rather than
         // carrying the previous stage's hoisted batch into its warmup.
         self.current_fetch_size = self.fetch_size;
