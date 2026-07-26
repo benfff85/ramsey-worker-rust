@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::sa::{SaConfig, run_sa};
 use crate::tabu::{TabuConfig, run_tabu};
 use crate::vds::{VdsConfig, run_vds};
-use crate::{log_error, log_info};
+use crate::{log_debug, log_error, log_info};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::error::Error;
@@ -100,6 +100,10 @@ const TARGET_BATCH_LOOP_MILLIS: u128 = 200;
 const MAX_FETCH_SIZE: i32 = 1_000_000;
 /// Most the batch may grow in a single step, so one unusually fast batch cannot overshoot.
 const MAX_FETCH_GROWTH: i64 = 4;
+/// How often a worker summarizes its throughput, replacing the per-batch line. Batches run several
+/// times a second, so per-batch logging scaled with the fleet's speed rather than with anything
+/// worth reading.
+const STATS_INTERVAL_SECS: u64 = 30;
 
 /// Next batch size, from the previous batch's measured cost.
 ///
@@ -144,6 +148,12 @@ pub struct Worker {
     /// Set when a cycle came back empty because of a race rather than because there is nothing to
     /// do, so the next attempt waits milliseconds instead of a full poll interval.
     retry_soon: bool,
+    /// Rolling throughput accumulator. Logging every batch fired several times a second per worker
+    /// and reported a figure nobody reads directly; one periodic line reports units/sec instead.
+    stats_window_start: std::time::Instant,
+    stats_units: u64,
+    stats_batches: u64,
+    stats_busy_nanos: u128,
     /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
     /// `fetch_size` is its floor and its reset value on a stage change.
     current_fetch_size: i32,
@@ -222,6 +232,10 @@ impl Worker {
             hoist_enabled,
             stage_announcements: Arc::new(StageAnnouncements::default()),
             retry_soon: false,
+            stats_window_start: std::time::Instant::now(),
+            stats_units: 0,
+            stats_batches: 0,
+            stats_busy_nanos: 0,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
@@ -318,8 +332,16 @@ impl Worker {
                         };
                         sleep(wait).await;
                     } else {
-                        let elapsed_ms = cycle_start.elapsed().as_millis();
-                        log_info!("Processed {} work items in {}ms", count, elapsed_ms);
+                        let batch = cycle_start.elapsed();
+                        log_debug!(
+                            "Processed {} work items in {}ms",
+                            count,
+                            batch.as_millis()
+                        );
+                        self.stats_units += count as u64;
+                        self.stats_batches += 1;
+                        self.stats_busy_nanos += batch.as_nanos();
+                        self.maybe_log_throughput();
                     }
                 }
                 Err(e) => {
@@ -349,7 +371,8 @@ impl Worker {
         if !has_counter {
             // Stage config missing - likely stage progressed externally
             // Clear cache so we re-fetch the active stage on next cycle
-            log_info!(
+            // Routine race now that stages advance sub-second, not an anomaly worth INFO.
+            log_debug!(
                 "Stage config missing for stage {} - stage may have progressed, refreshing...",
                 stage_id
             );
@@ -446,7 +469,7 @@ impl Worker {
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
             let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
             if let Some(config) = redis_client.get_stage_config(stage_id).await? {
-                log_info!(
+                log_debug!(
                     "Loaded stage config: strategy={:?}, totalPairs={}, baseGraphId={}",
                     config.strategy,
                     config.total_pairs,
@@ -561,7 +584,7 @@ impl Worker {
                     self.prune_graph_caches(graph_id);
                     }
                 } else {
-                    log_info!(
+                    log_debug!(
                         "Reusing cached graph {} for new stage {}",
                         config.base_graph_id,
                         stage_id
@@ -609,7 +632,7 @@ impl Worker {
         let (start_index, end_index) = match range {
             Some(r) => r,
             None => {
-                log_info!("All work claimed for stage {}, clearing cache...", stage_id);
+                log_debug!("All work claimed for stage {}, clearing cache...", stage_id);
                 self.clear_stage_cache();
                 self.retry_soon = true;
                 return Ok(0);
@@ -1184,6 +1207,32 @@ impl Worker {
         }
     }
 
+    /// Emit one throughput line per `STATS_INTERVAL_SECS` and reset the window.
+    ///
+    /// Reports units/sec — the figure that actually gets read — plus the busy fraction, which
+    /// tells whether the worker is compute-bound or waiting on Redis/HTTP.
+    fn maybe_log_throughput(&mut self) {
+        let window = self.stats_window_start.elapsed();
+        if window.as_secs() < STATS_INTERVAL_SECS {
+            return;
+        }
+        let secs = window.as_secs_f64();
+        let busy_secs = self.stats_busy_nanos as f64 / 1e9;
+        log_info!(
+            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy",
+            self.stats_units,
+            secs,
+            self.stats_units as f64 / secs / 1e6,
+            self.stats_batches,
+            busy_secs * 1000.0 / self.stats_batches.max(1) as f64,
+            100.0 * busy_secs / secs
+        );
+        self.stats_window_start = std::time::Instant::now();
+        self.stats_units = 0;
+        self.stats_batches = 0;
+        self.stats_busy_nanos = 0;
+    }
+
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
         // A new stage starts unhoisted, so shrink back to the responsive size rather than
@@ -1233,7 +1282,8 @@ impl Worker {
                 self.clear_stage_cache();
                 // Different campaign → refresh vertex/clique params (as initialize
                 // does in campaign mode), so CliqueCollection sizing stays correct.
-                if self.campaign_id != stage.campaign_id {
+                let repointed = self.campaign_id != stage.campaign_id;
+                if repointed {
                     self.clear_graph_caches(); // cached collections are sized for the old campaign
                     self.campaign_id = stage.campaign_id;
                     if let Ok(campaign) = self.mw_client.get_campaign(stage.campaign_id).await {
@@ -1242,13 +1292,25 @@ impl Worker {
                     }
                 }
                 self.stage_id = Some(stage.stage_id);
-                log_info!(
-                    "Fleet {} → stage {} (campaign {}, base_graph_id {})",
-                    fleet,
-                    stage.stage_id,
-                    stage.campaign_id,
-                    stage.base_graph_id
-                );
+                // A repoint is rare and operationally significant, so it stays at INFO. Following
+                // the stage counter is neither — it happens more than once a second per worker.
+                if repointed {
+                    log_info!(
+                        "Fleet {} REPOINTED to campaign {} → stage {} (base_graph_id {})",
+                        fleet,
+                        stage.campaign_id,
+                        stage.stage_id,
+                        stage.base_graph_id
+                    );
+                } else {
+                    log_debug!(
+                        "Fleet {} → stage {} (campaign {}, base_graph_id {})",
+                        fleet,
+                        stage.stage_id,
+                        stage.campaign_id,
+                        stage.base_graph_id
+                    );
+                }
             }
             return Ok(Some(stage.stage_id));
         }
