@@ -58,7 +58,13 @@ const GRAPH_CACHE_MAX: usize = 3;
 ///
 /// It is also comfortably past the 39,621-unit singles block, so every single-edge flip is
 /// evaluated before any table filling begins.
-const HOIST_MIN_STAGE_INDEX: i64 = 500_000;
+///
+/// Re-sized 500k -> 5M once the fleet reached ~21M units/sec: at that rate a wall stage crosses
+/// 5M in ~0.24s (1.3% of an ~18s sweep), so the ramp barely notices, while descent stages — which
+/// die at an index of 0-52,000 — stay an order of magnitude clear of it. At 500k a long tail of
+/// descent stages was outliving the gate and paying for a table fill they never got to reuse.
+/// Worth revisiting whenever fleet throughput moves substantially again.
+const HOIST_MIN_STAGE_INDEX: i64 = 5_000_000;
 /// Slices the per-edge fill is split into across the fleet.
 ///
 /// Every worker on a graph would otherwise fill the whole table itself — ~2.9s of uncapped
