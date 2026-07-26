@@ -260,6 +260,57 @@ impl WorkEnumerator for DualCardinalityWithSinglesEnumerator {
     }
 }
 
+/// SEQUENTIAL_WITH_SINGLES: the same shape as DUAL_EDGE_CARDINALITY_WITH_SINGLES — every edge as a
+/// single flip first (red block then blue block), then the full pair space — but in plain edge
+/// order, with no cardinality scoring and no sort.
+///
+/// The cardinality ordering exists to sweep likely-improving moves first, which mattered when a
+/// stage could only get through part of its space. It no longer does: a sweep that took ~233s now
+/// takes ~6s, stages routinely reach most or all of the space, and the queue manager adopts the
+/// best result in the top-50 rather than the first one found — so what order they were found in
+/// does not change the outcome. Scoring cost ~564 operations per edge over 39,621 edges plus two
+/// sorts, rebuilt per stage in every worker: 16.18ms each time, for an ordering whose closest
+/// measured analogue (participation rank) backtested at zero signal against 4,637 real winners.
+///
+/// Plain edge order is also better for the hoisted path: consecutive units walk consecutive blue
+/// edges, whose per-edge table entries are adjacent in memory.
+pub struct SequentialWithSinglesEnumerator {
+    singles: Vec<ScoredEdge>,
+    pairs: BasicEnumerator,
+    total: i64,
+}
+
+impl SequentialWithSinglesEnumerator {
+    pub fn new(graph: &Graph) -> Self {
+        let pairs = BasicEnumerator::new(graph);
+        // Red block then blue block, matching the cardinality variant's convention so the only
+        // difference between the two strategies is the ordering WITHIN each block.
+        let mut singles = pairs.red_edges.clone();
+        singles.extend(pairs.blue_edges.iter().cloned());
+        let total = singles.len() as i64 + pairs.total_work_units();
+        SequentialWithSinglesEnumerator { singles, pairs, total }
+    }
+}
+
+impl WorkEnumerator for SequentialWithSinglesEnumerator {
+    fn index_to_work_unit(&self, index: i64) -> WorkUnit {
+        let singles_count = self.singles.len() as i64;
+        if index < singles_count {
+            let e = &self.singles[index as usize];
+            WorkUnit::SingleFlip(WorkUnitEdge {
+                vertex_one: e.vertex_one,
+                vertex_two: e.vertex_two,
+            })
+        } else {
+            self.pairs.index_to_work_unit(index - singles_count)
+        }
+    }
+
+    fn total_work_units(&self) -> i64 {
+        self.total
+    }
+}
+
 /// Create the appropriate enumerator based on strategy name
 pub fn create_enumerator(
     strategy: &crate::model::WorkEnumerationStrategy,
@@ -276,6 +327,9 @@ pub fn create_enumerator(
         }
         crate::model::WorkEnumerationStrategy::DUAL_EDGE_CARDINALITY_WITH_SINGLES => {
             Box::new(DualCardinalityWithSinglesEnumerator::new(graph))
+        }
+        crate::model::WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES => {
+            Box::new(SequentialWithSinglesEnumerator::new(graph))
         }
     }
 }
@@ -444,5 +498,91 @@ mod tests {
                 assert!(!is_red, "blue block must follow red block (index {i})");
             }
         }
+    }
+
+    // ---------- SEQUENTIAL_WITH_SINGLES ----------
+
+    #[test]
+    fn sequential_enumerator_is_bijective_over_the_pair_region() {
+        let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
+        let e = SequentialWithSinglesEnumerator::new(&g);
+        let singles_count: i64 = 15;
+        let mut seen: HashSet<((u16, u16), (u16, u16))> = HashSet::new();
+        for i in singles_count..e.total_work_units() {
+            let WorkUnit::PairFlip(red, blue) = e.index_to_work_unit(i) else {
+                panic!("expected a pair at {i}");
+            };
+            assert!(seen.insert(normalize_pair(red, blue)), "duplicate at {i}");
+        }
+        assert_eq!(seen.len() as i64, e.total_work_units() - singles_count);
+    }
+
+    /// The work space must be identical to the cardinality variant's — same singles prefix, same
+    /// pair count — because the queue manager computes totalPairs from the strategy NAME and the
+    /// worker refuses a stage whose totals disagree.
+    #[test]
+    fn sequential_covers_exactly_the_same_space_as_the_cardinality_variant() {
+        let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
+        let seq = SequentialWithSinglesEnumerator::new(&g);
+        let card = DualCardinalityWithSinglesEnumerator::new(&g);
+        assert_eq!(seq.total_work_units(), card.total_work_units());
+
+        let collect = |e: &dyn WorkEnumerator| {
+            let mut singles = HashSet::new();
+            let mut pairs = HashSet::new();
+            for i in 0..e.total_work_units() {
+                match e.index_to_work_unit(i) {
+                    WorkUnit::SingleFlip(x) => {
+                        singles.insert(if x.vertex_one < x.vertex_two {
+                            (x.vertex_one, x.vertex_two)
+                        } else {
+                            (x.vertex_two, x.vertex_one)
+                        });
+                    }
+                    WorkUnit::PairFlip(r, b) => {
+                        pairs.insert(normalize_pair(r, b));
+                    }
+                }
+            }
+            (singles, pairs)
+        };
+        assert_eq!(collect(&seq), collect(&card), "same moves, different order");
+    }
+
+    /// Singles keep the red-block-then-blue-block convention; only the order within changes.
+    #[test]
+    fn sequential_singles_are_red_block_then_blue_block() {
+        let g = Graph::from_bitstring(HYBRID_FIXTURE, 6);
+        let e = SequentialWithSinglesEnumerator::new(&g);
+        for i in 0..15i64 {
+            let WorkUnit::SingleFlip(edge) = e.index_to_work_unit(i) else {
+                panic!("expected a single at {i}");
+            };
+            let is_red = g.adjacency[edge.vertex_one as usize].get(edge.vertex_two as usize);
+            assert_eq!(is_red, i < 9, "red block must come first (index {i})");
+        }
+    }
+
+    /// Plain edge order, i.e. NOT sorted by cardinality — this is the whole point of the strategy.
+    #[test]
+    fn sequential_does_not_sort_by_cardinality() {
+        let g = Graph::from_bitstring(FIXTURE_BITS, 6);
+        let e = SequentialWithSinglesEnumerator::new(&g);
+        // Pair index 0 must be (first red edge in edge order, first blue edge in edge order).
+        let mut first_red = None;
+        let mut first_blue = None;
+        for i in 0..6u16 {
+            for j in (i + 1)..6u16 {
+                let red = g.adjacency[i as usize].get(j as usize);
+                if red && first_red.is_none() { first_red = Some((i, j)) }
+                if !red && first_blue.is_none() { first_blue = Some((i, j)) }
+            }
+        }
+        let WorkUnit::PairFlip(r, b) = e.index_to_work_unit(15) else { panic!() };
+        assert_eq!(
+            (normalize_pair(r, b)),
+            (first_red.unwrap(), first_blue.unwrap()),
+            "first pair should be the first red and first blue edge in plain edge order"
+        );
     }
 }
