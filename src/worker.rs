@@ -105,6 +105,23 @@ const MAX_FETCH_GROWTH: i64 = 4;
 /// worth reading.
 const STATS_INTERVAL_SECS: u64 = 30;
 
+/// Which stage to actually work, given the middleware's answer and the newest announced stage.
+///
+/// The middleware serves its active-stage answer from a short-lived cache, so it can name a stage
+/// that has already been superseded — and asking Redis for that stage's config then misses,
+/// because the queue manager deletes it as soon as the successor is live. Announcements are
+/// published only after the new stage is ACTIVE and its config is seeded, so a *newer* announced
+/// stage is always workable and is better information than a stale cache entry.
+///
+/// Only ever moves forward: an announcement older than the middleware's answer is ignored, so a
+/// stale or missing announcement can never drag a worker back onto a dead stage.
+fn effective_stage_id(mw_stage_id: i32, announced: Option<i32>) -> i32 {
+    match announced {
+        Some(a) if a > mw_stage_id => a,
+        _ => mw_stage_id,
+    }
+}
+
 /// Next batch size, from the previous batch's measured cost.
 ///
 /// One setting cannot serve both regimes: a hoisted unit costs ~0.26 us and an unhoisted one
@@ -1275,7 +1292,25 @@ impl Worker {
                 Some(s) => s,
             };
 
-            if self.stage_id != Some(stage.stage_id) {
+            // The middleware caches its active-stage answer, so it can name a stage that has
+            // already been superseded — and by the time we ask Redis for that stage's config the
+            // queue manager has deleted it, costing a wasted cycle and a retry sleep.
+            //
+            // A stage-advance announcement is published only after the new stage is ACTIVE *and*
+            // its config is seeded, so an announced stage is always workable. When it is newer
+            // than what the cache returned, it is strictly better information — prefer it.
+            let announced = self.stage_announcements.latest_for(stage.campaign_id);
+            let stage_id = effective_stage_id(stage.stage_id, announced);
+            if stage_id != stage.stage_id {
+                log_debug!(
+                    "Middleware named stale stage {} for campaign {}; using announced stage {}",
+                    stage.stage_id,
+                    stage.campaign_id,
+                    stage_id
+                );
+            }
+
+            if self.stage_id != Some(stage_id) {
                 // Fleet repointed or the stage progressed → reset per-stage state. NOTE: the
                 // graph/collection caches deliberately survive, so the new stage (one flip away)
                 // can be derived from the previous one instead of rebuilt from scratch.
@@ -1291,7 +1326,14 @@ impl Worker {
                         self.clique_size = campaign.subgraph_size as usize;
                     }
                 }
-                self.stage_id = Some(stage.stage_id);
+                self.stage_id = Some(stage_id);
+                // Only the middleware's own answer carries a base graph id; when the announcement
+                // superseded it that field describes the older stage, so don't report it.
+                let base_graph = if stage_id == stage.stage_id {
+                    stage.base_graph_id.to_string()
+                } else {
+                    "from stage config".to_string()
+                };
                 // A repoint is rare and operationally significant, so it stays at INFO. Following
                 // the stage counter is neither — it happens more than once a second per worker.
                 if repointed {
@@ -1299,20 +1341,20 @@ impl Worker {
                         "Fleet {} REPOINTED to campaign {} → stage {} (base_graph_id {})",
                         fleet,
                         stage.campaign_id,
-                        stage.stage_id,
-                        stage.base_graph_id
+                        stage_id,
+                        base_graph
                     );
                 } else {
                     log_debug!(
                         "Fleet {} → stage {} (campaign {}, base_graph_id {})",
                         fleet,
-                        stage.stage_id,
+                        stage_id,
                         stage.campaign_id,
-                        stage.base_graph_id
+                        base_graph
                     );
                 }
             }
-            return Ok(Some(stage.stage_id));
+            return Ok(Some(stage_id));
         }
 
         // ---- Campaign mode (legacy fallback, RAMSEY_CAMPAIGN_ID) ----
@@ -1361,6 +1403,26 @@ mod tests {
     use super::*;
 
     const MS: u128 = 1_000_000;
+
+    /// The middleware's cached answer can name a stage the queue manager has already retired,
+    /// whose Redis config is therefore gone. A newer announcement is authoritative — it is only
+    /// published once the stage is ACTIVE and seeded — so prefer it.
+    #[test]
+    fn prefers_a_newer_announced_stage_over_a_stale_cached_one() {
+        assert_eq!(effective_stage_id(100, Some(103)), 103);
+    }
+
+    /// Guard rails: nothing may drag a worker backwards onto a dead stage.
+    #[test]
+    fn never_moves_backwards_or_sideways() {
+        assert_eq!(effective_stage_id(100, None), 100, "no announcement yet");
+        assert_eq!(effective_stage_id(100, Some(100)), 100, "agreement");
+        assert_eq!(
+            effective_stage_id(100, Some(97)),
+            100,
+            "a stale announcement must not override a newer middleware answer"
+        );
+    }
 
     /// Hoisted units (~0.26us) should drive the batch toward ~200ms of work, i.e. ~770k units,
     /// but only 4x per step so one fast batch cannot overshoot.
