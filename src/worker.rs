@@ -108,7 +108,22 @@ const TRANSIENT_RETRY_MILLIS: u64 = 25;
 /// cannot notice a stage change until its batch ends.
 const TARGET_BATCH_LOOP_MILLIS: u128 = 200;
 /// Ceiling on the adaptive batch, so one cycle can never run away.
-const MAX_FETCH_SIZE: i32 = 1_000_000;
+///
+/// Raised 1M -> 4M once the correction bound landed. At 1M this stopped being a safety ceiling and
+/// became the BINDING constraint: per-worker throughput reached 8-12M units/sec, at which
+/// [`TARGET_BATCH_LOOP_MILLIS`] wants 1.6-2.4M units, so batches ran ~77 ms instead of 200 ms and
+/// the fixed ~17 ms per-cycle cost was paid ~2.6x as often. Measured: busy fell 95% -> 82%, i.e.
+/// per-cycle overhead went 5% -> 18% of worker wall-clock.
+///
+/// The ceiling is sized in UNITS but the thing that matters is DURATION, and the controller already
+/// targets that — so this only needs to stay above what the target implies at plausible throughput.
+/// 4M covers ~20M units/sec, comfortably above today's 12M.
+///
+/// Cost of a larger batch is stage-TAIL latency, not wasted work: `claim_work_range` clamps the end
+/// index to `total_pairs`, and a stage cannot finish until its last full batch does, so the tail is
+/// ~one batch duration (~200 ms of a ~5 s stage). Abandonment is unaffected — a worker drops a
+/// superseded stage every [`STAGE_CHECK_INTERVAL_UNITS`], not at batch boundaries.
+const MAX_FETCH_SIZE: i32 = 4_000_000;
 /// Most the batch may grow in a single step, so one unusually fast batch cannot overshoot.
 const MAX_FETCH_GROWTH: i64 = 4;
 /// How often a worker summarizes its throughput, replacing the per-batch line. Batches run several
@@ -1603,6 +1618,31 @@ mod tests {
             size = next_fetch_size(size, floor, size as i64, nanos);
         }
         assert!(size > 700_000 && size <= MAX_FETCH_SIZE, "settled at {size}");
+    }
+
+    /// Regression guard for the ceiling silently becoming the binding constraint.
+    ///
+    /// Once the correction bound landed, a unit cost ~0.083us (8-12M units/sec), so the 200ms
+    /// target wants ~2.4M units — more than the old 1M ceiling allowed. The controller pinned
+    /// there, batches ran ~77ms instead of 200ms, and the fixed ~17ms per-cycle cost was paid 2.6x
+    /// too often: measured live as busy 95% -> 82%, i.e. per-cycle overhead 5% -> 18%.
+    ///
+    /// Nothing failed when that happened — the ceiling is meant to be hit occasionally, so there
+    /// was no signal. This asserts it is NOT hit at production throughput, so the next speedup
+    /// trips a test instead of quietly costing 10% of the fleet.
+    #[test]
+    fn ceiling_does_not_bind_at_post_bound_throughput() {
+        let floor = 2_000;
+        let mut size = floor;
+        for _ in 0..12 {
+            let nanos = size as u128 * 83; // 0.083us/unit ~= 12M units/sec
+            size = next_fetch_size(size, floor, size as i64, nanos);
+        }
+        assert!(size > 2_000_000, "settled at {size}, short of the 200ms target");
+        assert!(
+            size < MAX_FETCH_SIZE,
+            "pinned at the ceiling ({size}) — MAX_FETCH_SIZE is binding again, raise it"
+        );
     }
 
     #[test]
