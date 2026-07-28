@@ -153,6 +153,15 @@ pub struct HoistTables {
     /// this is `C_b`, for a red edge `D_r` — an edge has exactly one colour, so one table serves
     /// both. Doubles as the answer for single-flip work units.
     single: Vec<i32>,
+    /// Entries computed on demand because neither this worker nor a peer had them yet, and the
+    /// wall-clock spent doing it. Instrumentation only.
+    ///
+    /// The sharded fill covers one slice; everything else arrives from peers or is computed here,
+    /// mid-loop, at the cost of an UNCAPPED traversal. That cost is invisible in the throughput
+    /// line because it happens INSIDE the unit loop and so counts as "busy" — which is exactly why
+    /// it needs measuring separately before any inner-loop work is prioritised.
+    fills: u64,
+    fill_nanos: u128,
 }
 
 impl HoistTables {
@@ -161,6 +170,8 @@ impl HoistTables {
             vertex_count,
             refresh_budget: 12,
             single: vec![UNKNOWN; vertex_count * vertex_count],
+            fills: 0,
+            fill_nanos: 0,
         }
     }
 
@@ -265,6 +276,7 @@ impl HoistTables {
         if cached != UNKNOWN {
             return cached;
         }
+        let started = std::time::Instant::now();
         let edge = [WorkUnitEdge {
             vertex_one: u as u16,
             vertex_two: v as u16,
@@ -276,7 +288,17 @@ impl HoistTables {
         let (created, _) = get_new_cliques_with_limit(graph, clique_size, &edge, i32::MAX);
         graph.flip_edges(&edge);
         self.single[i] = created;
+        self.fills += 1;
+        self.fill_nanos += started.elapsed().as_nanos();
         created
+    }
+
+    /// Read and reset the on-demand fill counters.
+    pub fn take_fill_stats(&mut self) -> (u64, u128) {
+        let out = (self.fills, self.fill_nanos);
+        self.fills = 0;
+        self.fill_nanos = 0;
+        out
     }
 
     /// `created` for the pair move, or `None` when it provably exceeds `limit`.

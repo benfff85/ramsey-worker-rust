@@ -2,7 +2,7 @@ use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliqu
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
-use crate::graph::Graph;
+use crate::graph::{Graph, WorkUnitEdge};
 use crate::hoist::HoistTables;
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
@@ -254,6 +254,11 @@ pub struct Worker {
     stats_units: u64,
     stats_batches: u64,
     stats_busy_nanos: u128,
+    /// On-demand hoist-table fills and their wall-clock, accumulated over the stats window.
+    /// These happen INSIDE the unit loop, so they are counted as "busy" and are otherwise
+    /// indistinguishable from real evaluation work in the throughput line.
+    stats_fills: u64,
+    stats_fill_nanos: u128,
     /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
     /// `fetch_size` is its floor and its reset value on a stage change.
     current_fetch_size: i32,
@@ -337,6 +342,8 @@ impl Worker {
             stats_units: 0,
             stats_batches: 0,
             stats_busy_nanos: 0,
+            stats_fills: 0,
+            stats_fill_nanos: 0,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
@@ -442,6 +449,11 @@ impl Worker {
                         self.stats_units += count as u64;
                         self.stats_batches += 1;
                         self.stats_busy_nanos += batch.as_nanos();
+                        for t in self.hoist_cache.values_mut() {
+                            let (f, n) = t.take_fill_stats();
+                            self.stats_fills += f;
+                            self.stats_fill_nanos += n;
+                        }
                         self.maybe_log_throughput();
                     }
                 }
@@ -892,14 +904,30 @@ impl Worker {
             }
             units_done += 1;
             let unit = enumerator.index_to_work_unit(idx);
-            let edges_to_flip = match &unit {
-                WorkUnit::SingleFlip(edge) => vec![edge.clone()],
+            // Stack buffer, not a per-unit heap allocation. This was profiled at 0.2% and
+            // deliberately left alone in the 2026-07-15 kernel round — correctly, when a unit cost
+            // 13.5us of Bron-Kerbosch. The hoist and then the correction bound removed everything
+            // that dwarfed it, and the same ~15ns is now 63-70% of what remains: measured
+            // 0.0268 -> 0.0123 us/unit near the floor and 0.0368 -> 0.0177 mid-descent, i.e. ~2.2x
+            // on the evaluation half of a worker's time. Nothing about the allocation changed —
+            // only its share did.
+            let mut edge_buf = [
+                WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
+                WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
+            ];
+            let edges_to_flip: &[WorkUnitEdge] = match &unit {
+                WorkUnit::SingleFlip(edge) => {
+                    edge_buf[0] = edge.clone();
+                    &edge_buf[..1]
+                }
                 WorkUnit::PairFlip(red_edge, blue_edge) => {
-                    vec![red_edge.clone(), blue_edge.clone()]
+                    edge_buf[0] = red_edge.clone();
+                    edge_buf[1] = blue_edge.clone();
+                    &edge_buf[..2]
                 }
             };
 
-            let broken = clique_collection.get_count_of_cliques_containing_edges(&edges_to_flip);
+            let broken = clique_collection.get_count_of_cliques_containing_edges(edges_to_flip);
             let base_total = clique_collection.total() as i32;
 
             // Early termination when not publishing: stop counting if result can't be in top-N.
@@ -961,10 +989,10 @@ impl Worker {
                     }
                 },
                 None => {
-                    graph.flip_edges(&edges_to_flip);
+                    graph.flip_edges(edges_to_flip);
                     let out =
-                        get_new_cliques_with_limit(graph, clique_size, &edges_to_flip, early_limit);
-                    graph.flip_edges(&edges_to_flip);
+                        get_new_cliques_with_limit(graph, clique_size, edges_to_flip, early_limit);
+                    graph.flip_edges(edges_to_flip);
                     out
                 }
             };
@@ -986,14 +1014,14 @@ impl Worker {
                 let hash = crate::hash::derived_graph_hash(
                     &base_bitstring,
                     derived_vertex_count,
-                    &edges_to_flip,
+                    edges_to_flip,
                 );
                 if let Some(redis) = self.redis_client.as_mut() {
                     if let Ok((kept, new_threshold)) = redis
                         .add_to_top_results(
                             stage_id,
                             base_graph_id,
-                            &edges_to_flip,
+                            edges_to_flip,
                             count,
                             &hash,
                             self.top_results_count,
@@ -1024,7 +1052,7 @@ impl Worker {
                     id: None,
                     base_graph_id,
                     stage_id,
-                    edges_to_flip: edges_to_flip.clone(),
+                    edges_to_flip: edges_to_flip.to_vec(),
                     clique_count: count,
                     work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
                 };
@@ -1337,17 +1365,22 @@ impl Worker {
         let secs = window.as_secs_f64();
         let busy_secs = self.stats_busy_nanos as f64 / 1e9;
         log_info!(
-            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy",
+            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy, {} on-demand fills costing {:.2}s ({:.0}% of busy)",
             self.stats_units,
             secs,
             self.stats_units as f64 / secs / 1e6,
             self.stats_batches,
             busy_secs * 1000.0 / self.stats_batches.max(1) as f64,
-            100.0 * busy_secs / secs
+            100.0 * busy_secs / secs,
+            self.stats_fills,
+            self.stats_fill_nanos as f64 / 1e9,
+            100.0 * (self.stats_fill_nanos as f64 / 1e9) / busy_secs.max(1e-9)
         );
         self.stats_window_start = std::time::Instant::now();
         self.stats_units = 0;
         self.stats_batches = 0;
+        self.stats_fills = 0;
+        self.stats_fill_nanos = 0;
         self.stats_busy_nanos = 0;
     }
 
