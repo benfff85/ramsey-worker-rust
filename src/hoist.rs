@@ -153,6 +153,29 @@ pub struct HoistTables {
     /// this is `C_b`, for a red edge `D_r` — an edge has exactly one colour, so one table serves
     /// both. Doubles as the answer for single-flip work units.
     single: Vec<i32>,
+    /// Entries computed on demand because neither this worker nor a peer had them yet, and the
+    /// wall-clock spent doing it. Instrumentation only.
+    ///
+    /// The sharded fill covers one slice; everything else arrives from peers or is computed here,
+    /// mid-loop, at the cost of an UNCAPPED traversal. That cost is invisible in the throughput
+    /// line because it happens INSIDE the unit loop and so counts as "busy" — which is exactly why
+    /// it needs measuring separately before any inner-loop work is prioritised.
+    fills: u64,
+    fill_nanos: u128,
+    /// Fills split by the edge's colour in the BASE graph, and by whether they came from this
+    /// worker's own sharded slice or from a miss inside the unit loop.
+    ///
+    /// The split matters because the two colours are not equally valuable. `BasicEnumerator` maps
+    /// `red_idx = index / blue_count`, so RED is the outer loop: a contiguous claim spans ~81 red
+    /// edges but ALL 19,810 blue ones. A blue entry is therefore read by every worker on every
+    /// batch, a red entry only by the one worker whose range covers it — roughly 14x versus 1x.
+    /// If on-demand misses are overwhelmingly blue, the co-operative fill is mis-targeted: it
+    /// strides all 39,621 edges when the contended half is the blue 19,810.
+    fills_red: u64,
+    fills_blue: u64,
+    slice_fills: u64,
+    /// Set while [`Self::fill_slice`] runs so its fills are attributed to the slice, not to misses.
+    in_slice_fill: bool,
 }
 
 impl HoistTables {
@@ -161,6 +184,12 @@ impl HoistTables {
             vertex_count,
             refresh_budget: 12,
             single: vec![UNKNOWN; vertex_count * vertex_count],
+            fills: 0,
+            fill_nanos: 0,
+            fills_red: 0,
+            fills_blue: 0,
+            slice_fills: 0,
+            in_slice_fill: false,
         }
     }
 
@@ -199,6 +228,7 @@ impl HoistTables {
     ) -> Vec<i32> {
         let edges = graph.vertex_count * (graph.vertex_count - 1) / 2;
         let mut out = Vec::with_capacity(Self::slice_len(graph.vertex_count, slice, slices));
+        self.in_slice_fill = true;
         let mut bit = slice;
         while bit < edges {
             match Graph::edge_for_bit_index(bit, graph.vertex_count) {
@@ -207,6 +237,7 @@ impl HoistTables {
             }
             bit += slices;
         }
+        self.in_slice_fill = false;
         out
     }
 
@@ -265,6 +296,8 @@ impl HoistTables {
         if cached != UNKNOWN {
             return cached;
         }
+        let started = std::time::Instant::now();
+        let was_red = graph.adjacency[u].get(v); // colour in the BASE graph, before the flip
         let edge = [WorkUnitEdge {
             vertex_one: u as u16,
             vertex_two: v as u16,
@@ -276,7 +309,22 @@ impl HoistTables {
         let (created, _) = get_new_cliques_with_limit(graph, clique_size, &edge, i32::MAX);
         graph.flip_edges(&edge);
         self.single[i] = created;
+        self.fills += 1;
+        self.fill_nanos += started.elapsed().as_nanos();
+        if was_red { self.fills_red += 1 } else { self.fills_blue += 1 }
+        if self.in_slice_fill { self.slice_fills += 1 }
         created
+    }
+
+    /// Read and reset the fill counters: (total, nanos, red, blue, from_own_slice).
+    pub fn take_fill_stats(&mut self) -> (u64, u128, u64, u64, u64) {
+        let out = (self.fills, self.fill_nanos, self.fills_red, self.fills_blue, self.slice_fills);
+        self.fills = 0;
+        self.fill_nanos = 0;
+        self.fills_red = 0;
+        self.fills_blue = 0;
+        self.slice_fills = 0;
+        out
     }
 
     /// `created` for the pair move, or `None` when it provably exceeds `limit`.
