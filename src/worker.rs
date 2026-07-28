@@ -93,6 +93,21 @@ const HOIST_FILL_SLICES: i64 = 16;
 /// fill. This is a relaxed atomic load, so checking often is nearly free; the interval only needs
 /// to be coarse enough that the check is not a measurable share of a unit.
 const STAGE_CHECK_INTERVAL_UNITS: i64 = 4096;
+/// How long a worker will wait for peers' hoist slices before starting its unit loop.
+///
+/// The co-operative fill only pays off if a worker's table is populated BEFORE it starts looping.
+/// It is not: coverage at engage is ~56%, and because blue is the inner enumeration index the very
+/// first batch touches every blue edge, so the misses are all paid up front. Measured, the fleet
+/// does 4.4x the necessary fill work and recomputes each blue entry ~5.2x over.
+///
+/// Sized against the slice fill itself (~0.4s): peers publish within roughly that window, so a few
+/// hundred ms captures most of them. Bounded, and abandoned early when coverage stops improving or
+/// the stage is superseded, so the downside on a short stage is small and self-limiting.
+const HOIST_COVERAGE_WAIT: Duration = Duration::from_millis(300);
+/// Gap between coverage polls while waiting. Each poll is one MGET of the slice keys.
+const HOIST_COVERAGE_POLL: Duration = Duration::from_millis(25);
+/// Consecutive polls that add nothing before giving up — peers have published all they will.
+const HOIST_COVERAGE_STAGNANT_POLLS: u8 = 2;
 /// Pause before retrying a cycle that found nothing to do for a TRANSIENT reason — the stage
 /// advanced between resolving it and reading its config, or its work was fully claimed.
 ///
@@ -259,6 +274,9 @@ pub struct Worker {
     /// indistinguishable from real evaluation work in the throughput line.
     stats_fills: u64,
     stats_fill_nanos: u128,
+    stats_fills_red: u64,
+    stats_fills_blue: u64,
+    stats_fills_slice: u64,
     /// Adaptive batch size, retuned from each batch's measured cost (see `next_fetch_size`).
     /// `fetch_size` is its floor and its reset value on a stage change.
     current_fetch_size: i32,
@@ -344,6 +362,9 @@ impl Worker {
             stats_busy_nanos: 0,
             stats_fills: 0,
             stats_fill_nanos: 0,
+            stats_fills_red: 0,
+            stats_fills_blue: 0,
+            stats_fills_slice: 0,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
@@ -450,9 +471,12 @@ impl Worker {
                         self.stats_batches += 1;
                         self.stats_busy_nanos += batch.as_nanos();
                         for t in self.hoist_cache.values_mut() {
-                            let (f, n) = t.take_fill_stats();
+                            let (f, n, red, blue, slice) = t.take_fill_stats();
                             self.stats_fills += f;
                             self.stats_fill_nanos += n;
+                            self.stats_fills_red += red;
+                            self.stats_fills_blue += blue;
+                            self.stats_fills_slice += slice;
                         }
                         self.maybe_log_throughput();
                     }
@@ -774,6 +798,7 @@ impl Worker {
             );
         }
 
+        let announcements_for_wait = Arc::clone(&self.stage_announcements);
         // Co-operative fill: claim one slice of the edge space, publish it, and adopt whatever
         // peers have published. Anything still missing is computed on demand exactly as before, so
         // a crashed peer or an expired key costs a little time and nothing else.
@@ -821,10 +846,101 @@ impl Worker {
                 // we do, so it is near-zero by construction — while the second is where the
                 // fleet's work actually shows up. Reporting only the first reads as "no sharing"
                 // even when the table came back mostly filled by peers.
+                // Wait briefly for peers before entering the loop.
+                //
+                // Measured: the fleet performs 4.4x more fill work than the information-theoretic
+                // minimum, and blue entries alone are computed 5.2x over -- 14 workers each
+                // recomputing the same values because they start looping before peers publish.
+                // The waste is front-loaded and cannot be recovered by polling afterwards: blue is
+                // the inner enumeration index, so a worker's FIRST batch touches all 19,810 blue
+                // edges while coverage is still ~56%. 74% of on-demand misses are blue.
+                //
+                // Bounded three ways so this can never stall a stage: a hard deadline, an
+                // early exit once coverage stops improving, and an immediate bail if the stage is
+                // superseded -- which is what makes it safe on a mispredicted eager engage during
+                // a descent, since such a stage advances and the wait ends on the spot.
+                let wait_started = std::time::Instant::now();
+                let mut last_known = tables.filled();
+                let mut stagnant = 0u8;
+                let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                while wait_started.elapsed() < HOIST_COVERAGE_WAIT
+                    && stagnant < HOIST_COVERAGE_STAGNANT_POLLS
+                {
+                    if announcements_for_wait
+                        .latest_for(campaign_id_for_counter)
+                        .is_some_and(|announced| announced != stage_id)
+                    {
+                        break; // stage superseded — nothing here is worth waiting for
+                    }
+                    tokio::time::sleep(HOIST_COVERAGE_POLL).await;
+                    if let Some(redis) = self.redis_client.as_mut() {
+                        if let Ok(slices) =
+                            redis.get_hoist_slices(base_graph_id, HOIST_FILL_SLICES).await
+                        {
+                            for (sl, vals) in slices {
+                                present.insert(sl);
+                                tables.adopt_slice(sl as usize, HOIST_FILL_SLICES as usize, &vals);
+                            }
+                        }
+                    }
+                    let now_known = tables.filled();
+                    if now_known == last_known {
+                        stagnant += 1;
+                    } else {
+                        stagnant = 0;
+                        last_known = now_known;
+                    }
+                }
+                let waited_ms = wait_started.elapsed().as_millis();
+
+                // Self-healing gap fill.
+                //
+                // The claim is `(INCR - 1) mod HOIST_FILL_SLICES`, so a fleet SMALLER than the
+                // slice count leaves the tail slices unclaimed forever: 14 workers against 16
+                // slices means 4,953 edges are never published by anyone, and every worker refills
+                // them on demand, every stage. That capped coverage at 87.5% and was the binding
+                // constraint once the wait started collecting properly.
+                //
+                // Pinning the constant to the fleet size would break the moment the M1 resumes or
+                // a burst joins, so instead take another turn of the SAME counter: claims
+                // N+1.. land on exactly the slices the first round missed, and the INCR keeps two
+                // workers from picking the same one. Skipped when the slice is already published,
+                // and bounded to one extra slice per worker per graph.
+                let mut extra_filled: Option<i64> = None;
+                if !tables.is_complete() {
+                    let extra = match self.redis_client.as_mut() {
+                        Some(redis) => redis
+                            .claim_hoist_slice(base_graph_id, HOIST_FILL_SLICES)
+                            .await
+                            .ok(),
+                        None => None,
+                    };
+                    if let Some(extra) = extra {
+                        if !present.contains(&extra) {
+                            let vals = tables.fill_slice(
+                                graph_for_fill,
+                                clique_size,
+                                extra as usize,
+                                HOIST_FILL_SLICES as usize,
+                            );
+                            if let Some(redis) = self.redis_client.as_mut() {
+                                if let Err(e) =
+                                    redis.put_hoist_slice(base_graph_id, extra, &vals).await
+                                {
+                                    log_error!(
+                                        "Could not publish gap slice {extra} for graph {base_graph_id}: {e}"
+                                    );
+                                }
+                            }
+                            extra_filled = Some(extra);
+                        }
+                    }
+                }
+
                 let edges = graph_vertex_count * (graph_vertex_count - 1) / 2;
                 let known = tables.filled();
                 log_info!(
-                    "Hoist fill for graph {}: slice {} ({} edges computed here), {} seeded before + {} after publishing, {} of {} known ({}% from peers)",
+                    "Hoist fill for graph {}: slice {} ({} edges computed here), {} seeded before + {} after publishing, {} of {} known ({}% from peers), waited {}ms, gap slice {:?}",
                     base_graph_id,
                     slice,
                     values.len(),
@@ -832,7 +948,9 @@ impl Worker {
                     known.saturating_sub(adopted + values.len()),
                     known,
                     edges,
-                    100 * known.saturating_sub(values.len()) / edges.max(1)
+                    100 * known.saturating_sub(values.len()) / edges.max(1),
+                    waited_ms,
+                    extra_filled
                 );
             }
             self.hoist_cache.insert(base_graph_id, tables);
@@ -1365,7 +1483,7 @@ impl Worker {
         let secs = window.as_secs_f64();
         let busy_secs = self.stats_busy_nanos as f64 / 1e9;
         log_info!(
-            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy, {} on-demand fills costing {:.2}s ({:.0}% of busy)",
+            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy, {} on-demand fills costing {:.2}s ({:.0}% of busy) [slice {} | misses {} = {} red + {} blue]",
             self.stats_units,
             secs,
             self.stats_units as f64 / secs / 1e6,
@@ -1374,13 +1492,20 @@ impl Worker {
             100.0 * busy_secs / secs,
             self.stats_fills,
             self.stats_fill_nanos as f64 / 1e9,
-            100.0 * (self.stats_fill_nanos as f64 / 1e9) / busy_secs.max(1e-9)
+            100.0 * (self.stats_fill_nanos as f64 / 1e9) / busy_secs.max(1e-9),
+            self.stats_fills_slice,
+            self.stats_fills.saturating_sub(self.stats_fills_slice),
+            self.stats_fills_red,
+            self.stats_fills_blue
         );
         self.stats_window_start = std::time::Instant::now();
         self.stats_units = 0;
         self.stats_batches = 0;
         self.stats_fills = 0;
         self.stats_fill_nanos = 0;
+        self.stats_fills_red = 0;
+        self.stats_fills_blue = 0;
+        self.stats_fills_slice = 0;
         self.stats_busy_nanos = 0;
     }
 
