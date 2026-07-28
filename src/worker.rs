@@ -63,7 +63,18 @@ const GRAPH_CACHE_MAX: usize = 3;
 /// 5M in ~0.24s (1.3% of an ~18s sweep), so the ramp barely notices, while descent stages — which
 /// die at an index of 0-52,000 — stay an order of magnitude clear of it. At 500k a long tail of
 /// descent stages was outliving the gate and paying for a table fill they never got to reuse.
-/// Worth revisiting whenever fleet throughput moves substantially again.
+///
+/// **That "~0.24s" was wrong, and the error is instructive:** it reasons from HOISTED throughput,
+/// but every unit before the gate opens is by definition UNHOISTED and runs ~20x slower. Measured
+/// on the live fleet the ramp is **2.60s of a 13.01s full sweep** — 20% of the stage to get 1.7%
+/// of its units done. Do not re-derive this threshold from fleet units/sec without checking which
+/// regime the number came from.
+///
+/// This is now the FALLBACK gate. [`HoistGate`] normally predicts from the previous stage's depth
+/// and skips the ramp outright; this threshold still applies whenever there is no such prediction
+/// (a cold worker, or the stage after a short one). Note that simply lowering it is the wrong fix
+/// — scored against the same measurements, engaging on every stage is WORSE (+9.8%) than keeping a
+/// gate and predicting (+12.4%), because a wrongly-filled short stage costs 0.41s.
 const HOIST_MIN_STAGE_INDEX: i64 = 5_000_000;
 /// Slices the per-edge fill is split into across the fleet.
 ///
@@ -145,6 +156,61 @@ fn next_fetch_size(current: i32, floor: i32, units: i64, loop_nanos: u128) -> i3
     ideal.min(ceiling).clamp(floor as i64, MAX_FETCH_SIZE as i64) as i32
 }
 
+/// Decides when a worker starts filling its hoist tables for a stage.
+///
+/// The [`HOIST_MIN_STAGE_INDEX`] ramp exists to avoid filling a table a short stage will not live
+/// long enough to reuse. Paying it on EVERY stage is what it actually cost: measured on the live
+/// fleet, 2.60s of a 13.01s full sweep — 20% of the stage to get 1.7% of its units done, and 36
+/// core-seconds spent avoiding a 5.7 core-second fill.
+///
+/// Regime is strongly autocorrelated, so the previous stage's depth predicts this one. Measured
+/// over 1,463 stages: P(full sweep | previous was a full sweep) = **72.7%**, against a 25.6% base
+/// rate. The payoff is lopsided enough that even a poor predictor wins — a correct call saves the
+/// 2.60s ramp, a wrong one costs a 0.41s fill, so **break-even is 13.6% accuracy**.
+///
+/// A wrong prediction degrades to the original index gate, never to "no hoist", so the worst case
+/// is exactly the previous behaviour.
+#[derive(Debug, Default)]
+struct HoistGate {
+    /// Previous stage went deep, so skip the ramp on this one.
+    eager: bool,
+    /// This stage has been seen past the gate — becomes the next stage's `eager`.
+    reached: bool,
+    /// Stage the flags were last rolled for, so a mid-stage roll cannot happen twice.
+    rolled_for_stage: Option<i32>,
+}
+
+impl HoistGate {
+    /// Carry the previous stage's observation forward into `stage_id`'s prediction.
+    ///
+    /// Idempotent per stage: `clear_stage_cache()` also drops the stage config mid-stage on a
+    /// transient race, and rolling again there would discard the observation for the stage we are
+    /// still on and mispredict it.
+    fn roll(&mut self, stage_id: i32) {
+        if self.rolled_for_stage != Some(stage_id) {
+            self.eager = self.reached;
+            self.reached = false;
+            self.rolled_for_stage = Some(stage_id);
+        }
+    }
+
+    /// Record where in the stage a claimed batch started.
+    ///
+    /// Deliberately keyed on the fleet index and NOT on "did we engage". Recording engagement
+    /// would make every eagerly-engaged stage look deep, latching `eager` on through a descent —
+    /// the one way this heuristic could stop self-correcting.
+    fn observe(&mut self, start_index: i64) {
+        if start_index >= HOIST_MIN_STAGE_INDEX {
+            self.reached = true;
+        }
+    }
+
+    /// Whether to run the hoisted path for a batch starting at `start_index`.
+    fn engage(&self, enabled: bool, start_index: i64) -> bool {
+        enabled && (self.eager || start_index >= HOIST_MIN_STAGE_INDEX)
+    }
+}
+
 pub struct Worker {
     mw_client: MiddlewareClient,
     redis_client: Option<RedisClient>,
@@ -159,6 +225,8 @@ pub struct Worker {
     /// Kill switch for the hoisted path (env HOIST_ENABLED). Off falls back to the seeded kernel,
     /// which computes exactly the same values.
     hoist_enabled: bool,
+    /// Predicts whether a stage is deep enough to want the hoist table, from the previous one.
+    hoist_gate: HoistGate,
     /// Newest stage announced per campaign, kept current by a background subscriber. Lets the work
     /// loop abandon a superseded stage in milliseconds instead of at its next poll.
     stage_announcements: Arc<StageAnnouncements>,
@@ -247,6 +315,7 @@ impl Worker {
             clique_collection_cache: HashMap::new(),
             hoist_cache: HashMap::new(),
             hoist_enabled,
+            hoist_gate: HoistGate::default(),
             stage_announcements: Arc::new(StageAnnouncements::default()),
             retry_soon: false,
             stats_window_start: std::time::Instant::now(),
@@ -482,6 +551,9 @@ impl Worker {
 
     /// Counter-based work cycle: claim index ranges and enumerate locally
     async fn cycle_counter_based(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
+        // Carry the previous stage's observed depth forward as this stage's gate prediction.
+        self.hoist_gate.roll(stage_id);
+
         // Ensure we have stage config cached
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
             let redis_client = self.redis_client.as_mut().ok_or("Redis not connected")?;
@@ -663,13 +735,15 @@ impl Worker {
         let publish_results = self.publish_results;
         let campaign_id_for_counter = self.campaign_id;
         let graph_vertex_count = self.graph_cache[&base_graph_id].vertex_count;
-        let engage = self.hoist_enabled && start_index >= HOIST_MIN_STAGE_INDEX;
+        self.hoist_gate.observe(start_index);
+        let engage = self.hoist_gate.engage(self.hoist_enabled, start_index);
         let first_time = engage && !self.hoist_cache.contains_key(&base_graph_id);
         if first_time {
             log_info!(
-                "Hoist ENGAGED for graph {} at stage work index {}",
+                "Hoist ENGAGED for graph {} at stage work index {} ({})",
                 base_graph_id,
-                start_index
+                start_index,
+                if self.hoist_gate.eager { "eager: previous stage was deep" } else { "index gate" }
             );
         }
 
@@ -1403,6 +1477,87 @@ mod tests {
     use super::*;
 
     const MS: u128 = 1_000_000;
+
+    const DEEP: i64 = HOIST_MIN_STAGE_INDEX;
+    const SHALLOW: i64 = 4096;
+
+    /// Baseline: with no history the gate is exactly the original fleet-index threshold, so a
+    /// worker that has just started behaves as it did before.
+    #[test]
+    fn gate_without_history_is_the_original_index_gate() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        assert!(!g.engage(true, SHALLOW), "shallow batch must not engage on a cold gate");
+        assert!(g.engage(true, DEEP), "the index gate must still engage a deep batch");
+        assert!(!g.engage(false, DEEP), "HOIST_ENABLED=false must still win");
+    }
+
+    /// The win: after a stage that swept deep, the next stage skips the ramp entirely.
+    #[test]
+    fn gate_is_eager_on_the_stage_after_a_deep_one() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(DEEP); // stage 1 went deep
+        g.roll(2);
+        assert!(g.engage(true, 0), "stage after a deep one must engage from index 0");
+    }
+
+    /// The safety property: a short stage must clear eagerness, so a descent stops paying fills.
+    #[test]
+    fn gate_stops_being_eager_after_a_short_stage() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(DEEP);
+        g.roll(2);
+        assert!(g.engage(true, 0));
+        // Stage 2 advanced early — never seen past the gate.
+        g.observe(SHALLOW);
+        g.roll(3);
+        assert!(!g.engage(true, SHALLOW), "eagerness must not survive a short stage");
+    }
+
+    /// The latching hazard this design exists to avoid: if depth were recorded from "did we
+    /// engage" rather than from the fleet index, an eager stage would mark itself deep and every
+    /// subsequent stage would stay eager forever, through an entire descent.
+    #[test]
+    fn eagerness_does_not_latch_across_a_run_of_short_stages() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(DEEP);
+        for stage in 2..12 {
+            g.roll(stage);
+            // Engaging eagerly must not count as evidence that the stage was deep.
+            let _ = g.engage(true, 0);
+            g.observe(SHALLOW);
+        }
+        g.roll(12);
+        assert!(!g.engage(true, SHALLOW), "eagerness latched on through a descent");
+    }
+
+    /// A mid-stage roll (clear_stage_cache on a transient race, or all work claimed) must not
+    /// discard the current stage's observation and mispredict the stage still being worked.
+    #[test]
+    fn rolling_twice_for_one_stage_keeps_the_observation() {
+        let mut g = HoistGate::default();
+        g.roll(7);
+        g.observe(DEEP);
+        g.roll(7); // same stage again — must be a no-op
+        g.roll(8);
+        assert!(g.engage(true, 0), "a repeated roll for one stage lost its observation");
+    }
+
+    /// Only the fleet index decides depth; a run of shallow batches on a deep stage is still deep
+    /// because the deep observation is sticky within the stage.
+    #[test]
+    fn depth_is_sticky_within_a_stage() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(SHALLOW);
+        g.observe(DEEP);
+        g.observe(SHALLOW);
+        g.roll(2);
+        assert!(g.engage(true, 0));
+    }
 
     /// The middleware's cached answer can name a stage the queue manager has already retired,
     /// whose Redis config is therefore gone. A newer announcement is authoritative — it is only
