@@ -914,25 +914,37 @@ impl Worker {
             // and is EXACT — the two branches agree unit for unit, so which one runs changes only
             // the cost, never a result, a threshold, or a stage transition.
             let (new, exceeded) = match hoist.as_deref_mut() {
-                Some(tables) => {
-                    let created = match &unit {
-                        WorkUnit::SingleFlip(edge) => tables.single_created(
+                Some(tables) => match &unit {
+                    WorkUnit::SingleFlip(edge) => {
+                        // A single flip's `created` IS the table entry, so there is nothing to
+                        // abort; the kernel's early exit becomes a comparison.
+                        let created = tables.single_created(
                             graph,
                             clique_size,
                             edge.vertex_one as usize,
                             edge.vertex_two as usize,
-                        ),
-                        WorkUnit::PairFlip(red_edge, blue_edge) => tables.pair_created(
+                        );
+                        (created, created > early_limit)
+                    }
+                    // Pairs take the bounded form: `created >= D_r` (cross pairs all red) or
+                    // `>= C_b` (all blue), both already in hand, so most units that cannot beat
+                    // the limit are rejected without computing the correction — which is 98% of
+                    // this loop's cost. Exact, not a prune: see `pair_created_bounded`.
+                    WorkUnit::PairFlip(red_edge, blue_edge) => {
+                        match tables.pair_created_bounded(
                             graph,
                             clique_size,
                             (red_edge.vertex_one as usize, red_edge.vertex_two as usize),
                             (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize),
-                        ),
-                    };
-                    // The hoisted value is uncapped, so the abort the kernel would have taken is
-                    // just a comparison here.
-                    (created, created > early_limit)
-                }
+                            early_limit,
+                        ) {
+                            Some(created) => (created, false),
+                            // Provably over the limit. The count is never read once `exceeded`
+                            // is set — the loop continues immediately.
+                            None => (0, true),
+                        }
+                    }
+                },
                 None => {
                     graph.flip_edges(&edges_to_flip);
                     let out =

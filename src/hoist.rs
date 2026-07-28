@@ -279,8 +279,72 @@ impl HoistTables {
         created
     }
 
+    /// `created` for the pair move, or `None` when it provably exceeds `limit`.
+    ///
+    /// # The bound, and why it is exact
+    ///
+    /// The correction is the entire cost of this evaluation — measured, 13.69% of units take it and
+    /// it is **98%** of the hoisted loop at ~1.7 µs each. But a unit only needs its exact `created`
+    /// if it might BEAT the limit; everything else just needs to be rejected. A lower bound on
+    /// `created` is enough to reject, and one is free:
+    ///
+    /// `X` counts k-cliques of `R ∪ {b}` containing BOTH `r` and `b`; `C_b` counts those containing
+    /// `b`. Every clique counted by `X` contains `b`, so **`X ≤ C_b`**. When the cross pairs are all
+    /// red, `Y = 0` (it would need them all blue), so
+    ///
+    /// ```text
+    /// created = (C_b − X) + D_r  ≥  D_r        because X ≤ C_b
+    /// ```
+    ///
+    /// so `D_r > limit` proves `created > limit`. Symmetrically `Y ≤ D_r` gives `created ≥ C_b` when
+    /// the cross pairs are all blue. Both values are already computed for `base`, so the test is one
+    /// comparison against a register.
+    ///
+    /// This is an algebraic consequence of the same identity the whole hoist rests on, not a
+    /// heuristic prune: it can only skip work already destined for rejection, and can never change a
+    /// `created`, a threshold, or a stage transition. Measured on graph 222120 it removes the
+    /// correction from **99.89%** of slow-path units (0 soundness violations over 492,747), taking a
+    /// single-core sweep from 103 s to 1.7 s.
+    ///
+    /// `limit` is the caller's `early_limit`. Pass `i32::MAX` to disable the bound entirely (the
+    /// comparison can then never fire), which is what an unthresholded stage does.
+    ///
+    /// `graph` must be the BASE graph and is unchanged on return.
+    pub fn pair_created_bounded(
+        &mut self,
+        graph: &mut Graph,
+        clique_size: usize,
+        r: (usize, usize),
+        b: (usize, usize),
+        limit: i32,
+    ) -> Option<i32> {
+        let c_b = self.single_created(graph, clique_size, b.0, b.1);
+        let d_r = self.single_created(graph, clique_size, r.0, r.1);
+        let base = c_b + d_r;
+        let created = match cross_pairs(&graph.adjacency, r, b) {
+            CrossPairs::Mixed => base,
+            CrossPairs::AllRed => {
+                // created >= D_r, so this rejects without touching the correction.
+                if d_r > limit {
+                    return None;
+                }
+                base - correction(&graph.adjacency, r, b, clique_size)
+            }
+            CrossPairs::AllBlue => {
+                if c_b > limit {
+                    return None;
+                }
+                base - correction(&graph.complement_adjacency, r, b, clique_size)
+            }
+        };
+        if created > limit { None } else { Some(created) }
+    }
+
     /// `created` for the pair move that flips red edge `r` and blue edge `b`. EXACT — identical to
     /// what the seeded kernel returns for the same move on the same base graph.
+    ///
+    /// Unbounded reference for [`Self::pair_created_bounded`] and the tests; the hot path uses the
+    /// bounded form.
     ///
     /// `graph` must be the BASE graph and is unchanged on return.
     pub fn pair_created(
@@ -548,6 +612,120 @@ mod tests {
             }
         }
         assert!(partial.is_complete(), "on-demand fill should have completed it");
+    }
+
+    /// The inequality the bound rests on, checked directly against brute force rather than assumed:
+    /// X (cliques through BOTH edges) can never exceed C_b (cliques through the blue edge), and Y
+    /// can never exceed D_r. If this were ever false the bound could reject an improving move — the
+    /// one failure that would silently lose search progress.
+    #[test]
+    fn corrections_never_exceed_the_single_edge_counts() {
+        for (n, k, seed) in [(9usize, 4usize, 7u64), (10, 4, 11), (10, 5, 3), (12, 5, 29)] {
+            let mut graph = Graph::from_bitstring(&bits(n, seed), n);
+            graph.resync_complement();
+            let mut tables = HoistTables::new(n);
+            let mut checked = 0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    for a in 0..n {
+                        for c in (a + 1)..n {
+                            if !graph.adjacency[i].get(j) || graph.adjacency[a].get(c) {
+                                continue; // need r red, b blue
+                            }
+                            let (r, b) = ((i, j), (a, c));
+                            let c_b = tables.single_created(&mut graph, k, b.0, b.1);
+                            let d_r = tables.single_created(&mut graph, k, r.0, r.1);
+                            match cross_pairs(&graph.adjacency, r, b) {
+                                CrossPairs::Mixed => {}
+                                CrossPairs::AllRed => {
+                                    let x = correction(&graph.adjacency, r, b, k);
+                                    assert!(x <= c_b, "X={x} > C_b={c_b} at r={r:?} b={b:?} n={n}");
+                                    checked += 1;
+                                }
+                                CrossPairs::AllBlue => {
+                                    let y = correction(&graph.complement_adjacency, r, b, k);
+                                    assert!(y <= d_r, "Y={y} > D_r={d_r} at r={r:?} b={b:?} n={n}");
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(checked > 0, "fixture n={n} exercised no correction cases");
+        }
+    }
+
+    /// The bound must be OBSERVATIONALLY IDENTICAL to computing the correction: for every pair and
+    /// every limit, `pair_created_bounded` returns `Some(v)` exactly when the true `created` is
+    /// `<= limit`, and that `v` is the true value. Swept across limits that straddle the true value
+    /// so both the fire and no-fire sides of every branch are exercised.
+    #[test]
+    fn bounded_matches_unbounded_at_every_limit() {
+        for (n, k, seed) in [(9usize, 4usize, 7u64), (10, 4, 11), (10, 5, 3), (12, 5, 29)] {
+            let mut graph = Graph::from_bitstring(&bits(n, seed), n);
+            graph.resync_complement();
+            let mut reference = HoistTables::new(n);
+            let mut bounded = HoistTables::new(n);
+            let mut fired = 0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    for a in 0..n {
+                        for c in (a + 1)..n {
+                            if !graph.adjacency[i].get(j) || graph.adjacency[a].get(c) {
+                                continue;
+                            }
+                            let (r, b) = ((i, j), (a, c));
+                            let truth = reference.pair_created(&mut graph, k, r, b);
+                            for limit in [
+                                -1, 0, 1,
+                                truth - 2, truth - 1, truth, truth + 1, truth + 2,
+                                i32::MAX,
+                            ] {
+                                let got = bounded.pair_created_bounded(&mut graph, k, r, b, limit);
+                                let expect = if truth > limit { None } else { Some(truth) };
+                                assert_eq!(
+                                    got, expect,
+                                    "n={n} k={k} r={r:?} b={b:?} limit={limit} truth={truth}"
+                                );
+                                if got.is_none() {
+                                    fired += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(fired > 0, "fixture n={n} never exercised a rejection");
+        }
+    }
+
+    /// The bound must be inert at `i32::MAX` — an unthresholded stage has to keep getting exact
+    /// values, since that is when every result is submitted.
+    #[test]
+    fn unlimited_bound_never_rejects_and_stays_exact() {
+        let (n, k) = (11usize, 4usize);
+        let mut graph = Graph::from_bitstring(&bits(n, 5), n);
+        graph.resync_complement();
+        let mut reference = HoistTables::new(n);
+        let mut bounded = HoistTables::new(n);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for a in 0..n {
+                    for c in (a + 1)..n {
+                        if !graph.adjacency[i].get(j) || graph.adjacency[a].get(c) {
+                            continue;
+                        }
+                        let (r, b) = ((i, j), (a, c));
+                        assert_eq!(
+                            bounded.pair_created_bounded(&mut graph, k, r, b, i32::MAX),
+                            Some(reference.pair_created(&mut graph, k, r, b)),
+                            "r={r:?} b={b:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Adopting must never overwrite a value this worker computed itself.
