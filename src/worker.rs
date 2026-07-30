@@ -76,6 +76,35 @@ const GRAPH_CACHE_MAX: usize = 3;
 /// — scored against the same measurements, engaging on every stage is WORSE (+9.8%) than keeping a
 /// gate and predicting (+12.4%), because a wrongly-filled short stage costs 0.41s.
 const HOIST_MIN_STAGE_INDEX: i64 = 5_000_000;
+/// Fleet index a stage must reach for its table fill to have PAID FOR ITSELF.
+///
+/// Distinct from [`HOIST_MIN_STAGE_INDEX`], and conflating the two was a bug. The engage gate asks
+/// "is this stage deep enough to be worth filling for?"; this asks the retrospective question "did
+/// it turn out to be?", and only the second belongs in the signal that predicts the NEXT stage.
+///
+/// Using the engage gate for both created a feedback loop that switched the predictor off exactly
+/// when it worked: an eagerly-engaged stage runs ~20x faster, so it finds an improvement and
+/// advances SOONER — often around 3M, short of the 5M gate. It therefore recorded itself as
+/// "not deep", the next stage lost eagerness, and paid the full ramp. Observed live alternating
+/// almost every other stage, at **41 s** of kernel work per affected stage post-kick.
+///
+/// Sized by amortisation, not by the gate. A fill is ~2,476 uncapped traversals (~0.4 s) and the
+/// hoisted path saves ~7.6 us/unit near the floor, so it repays after ~53,000 units. 250k gives a
+/// ~5x margin over that while staying well clear of the 25,000-75,000 index a genuine post-kick
+/// descent stage dies at — so descents still correctly drop eagerness.
+const HOIST_AMORTISED_INDEX: i64 = 250_000;
+/// Consecutive stages that must fail to amortise before eagerness is dropped.
+///
+/// Dropping after ONE shallow stage was too twitchy, and the cost is wildly asymmetric. Measured
+/// live in a post-kick regime: a stage that does NOT engage early spends **35.4 s** grinding to the
+/// 5M gate on the seeded kernel, while a fill that turns out to be wasted costs **0.61 s** — so
+/// engaging is ~58x cheaper than not, and break-even is only a **1.7%** chance the stage is deep.
+/// Near the floor the ratio is gentler (2.6 s vs 0.41 s) but still ~6x in the same direction.
+///
+/// With a 1-stage memory, regimes that alternate short/long mispredicted constantly: 37% of stages
+/// still paid the full ramp after the amortisation threshold was fixed. A run of 8 costs at most
+/// 8 x 0.61 s = ~5 s once per descent onset, and buys immunity to alternation.
+const HOIST_SHALLOW_RUN_TO_DROP: u8 = 8;
 /// Slices the per-edge fill is split into across the fleet.
 ///
 /// Every worker on a graph would otherwise fill the whole table itself — ~2.9s of uncapped
@@ -204,6 +233,9 @@ fn next_fetch_size(current: i32, floor: i32, units: i64, loop_nanos: u128) -> i3
 struct HoistGate {
     /// Previous stage went deep, so skip the ramp on this one.
     eager: bool,
+    /// Consecutive stages that failed to amortise a fill. Eagerness is only dropped after
+    /// [`HOIST_SHALLOW_RUN_TO_DROP`] of them — see that constant for why one is far too few.
+    shallow_run: u8,
     /// This stage has been seen past the gate — becomes the next stage's `eager`.
     reached: bool,
     /// Stage the flags were last rolled for, so a mid-stage roll cannot happen twice.
@@ -218,7 +250,18 @@ impl HoistGate {
     /// still on and mispredict it.
     fn roll(&mut self, stage_id: i32) {
         if self.rolled_for_stage != Some(stage_id) {
-            self.eager = self.reached;
+            if self.reached {
+                self.shallow_run = 0;
+                self.eager = true;
+            } else {
+                self.shallow_run = self.shallow_run.saturating_add(1);
+                // Only give up on eagerness after a RUN of shallow stages. A single one is noise:
+                // regimes alternate, and one mispredicted deep stage costs ~58x what a wasted fill
+                // does (see HOIST_SHALLOW_RUN_TO_DROP).
+                if self.shallow_run >= HOIST_SHALLOW_RUN_TO_DROP {
+                    self.eager = false;
+                }
+            }
             self.reached = false;
             self.rolled_for_stage = Some(stage_id);
         }
@@ -226,11 +269,16 @@ impl HoistGate {
 
     /// Record where in the stage a claimed batch started.
     ///
-    /// Deliberately keyed on the fleet index and NOT on "did we engage". Recording engagement
-    /// would make every eagerly-engaged stage look deep, latching `eager` on through a descent —
-    /// the one way this heuristic could stop self-correcting.
+    /// Keyed on the fleet index and NOT on "did we engage" — recording engagement would make every
+    /// eagerly-engaged stage look deep and latch `eager` on through a descent.
+    ///
+    /// Compared against [`HOIST_AMORTISED_INDEX`], NOT the engage gate. The gate is a forecast; this
+    /// is the outcome. Using the gate here meant a stage had to reach 5M to count as deep, but an
+    /// eagerly-engaged stage is ~20x faster and so usually advances before then — latching `eager`
+    /// OFF every other stage. Guarding against latching ON was correct and is still tested; the
+    /// failure that actually happened was the opposite one.
     fn observe(&mut self, start_index: i64) {
-        if start_index >= HOIST_MIN_STAGE_INDEX {
+        if start_index >= HOIST_AMORTISED_INDEX {
             self.reached = true;
         }
     }
@@ -1665,6 +1713,10 @@ mod tests {
 
     const DEEP: i64 = HOIST_MIN_STAGE_INDEX;
     const SHALLOW: i64 = 4096;
+    /// Where an EAGERLY-engaged stage typically advances: far past the amortisation threshold but
+    /// short of the engage gate, because engaging made it ~20x faster. This is the case the old
+    /// code mis-classified as shallow.
+    const EAGER_TYPICAL: i64 = 3_000_000;
 
     /// Baseline: with no history the gate is exactly the original fleet-index threshold, so a
     /// worker that has just started behaves as it did before.
@@ -1687,18 +1739,38 @@ mod tests {
         assert!(g.engage(true, 0), "stage after a deep one must engage from index 0");
     }
 
-    /// The safety property: a short stage must clear eagerness, so a descent stops paying fills.
+    /// The safety property: a RUN of short stages must clear eagerness, so a sustained descent
+    /// stops paying fills. Deliberately a run and not a single stage — dropping on one was
+    /// measured to mispredict 37% of stages in an alternating regime, each mispredict costing ~58x
+    /// what a wasted fill does.
     #[test]
-    fn gate_stops_being_eager_after_a_short_stage() {
+    fn gate_stops_being_eager_after_a_run_of_short_stages() {
         let mut g = HoistGate::default();
         g.roll(1);
         g.observe(DEEP);
         g.roll(2);
-        assert!(g.engage(true, 0));
-        // Stage 2 advanced early — never seen past the gate.
-        g.observe(SHALLOW);
-        g.roll(3);
-        assert!(!g.engage(true, SHALLOW), "eagerness must not survive a short stage");
+        assert!(g.engage(true, 0), "should be eager after a deep stage");
+        // A sustained descent: every stage dies well short of amortising.
+        for stage in 2..(2 + HOIST_SHALLOW_RUN_TO_DROP as i32) {
+            g.observe(SHALLOW);
+            g.roll(stage + 1);
+        }
+        assert!(!g.engage(true, SHALLOW), "eagerness must not survive a sustained descent");
+    }
+
+    /// The alternation case that motivated the hysteresis: deep/shallow/deep/shallow must stay
+    /// eager throughout, because every mispredicted deep stage costs ~58x a wasted fill.
+    #[test]
+    fn alternating_regimes_keep_eagerness() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(DEEP);
+        for stage in 2..14 {
+            g.roll(stage);
+            assert!(g.engage(true, 0), "stage {stage} lost eagerness while regimes alternated");
+            // alternate: a productive deep stage, then one that ends early
+            g.observe(if stage % 2 == 0 { SHALLOW } else { EAGER_TYPICAL });
+        }
     }
 
     /// The latching hazard this design exists to avoid: if depth were recorded from "did we
@@ -1717,6 +1789,43 @@ mod tests {
         }
         g.roll(12);
         assert!(!g.engage(true, SHALLOW), "eagerness latched on through a descent");
+    }
+
+    /// The regression this constant exists for: an eagerly-engaged stage runs ~20x faster and so
+    /// advances BEFORE the 5M engage gate — around 3M. When `observe` compared against the gate,
+    /// such a stage recorded itself "not deep", the next stage lost eagerness, and paid the full
+    /// ramp. Live that alternated almost every other stage at ~41 s of kernel work each. Eagerness
+    /// must survive a stage that ended early BECAUSE the hoist worked.
+    #[test]
+    fn eagerness_survives_a_stage_that_ended_early_because_the_hoist_worked() {
+        let mut g = HoistGate::default();
+        g.roll(1);
+        g.observe(DEEP); // a wall stage earns eagerness
+        for stage in 2..8 {
+            g.roll(stage);
+            assert!(g.engage(true, 0), "stage {stage} lost eagerness after a productive stage");
+            // Engaged early, so it advances well past amortisation but short of the engage gate.
+            g.observe(EAGER_TYPICAL);
+        }
+    }
+
+    /// The amortisation threshold must sit ABOVE where a real descent stage dies, or a descent
+    /// would keep re-earning eagerness and pay a fill on every one of thousands of short stages.
+    #[test]
+    fn descent_indices_do_not_earn_eagerness() {
+        // Measured range a post-kick descent stage advances by: 25,000-75,000 fleet units.
+        for idx in [0i64, 25_000, 52_000, 75_000] {
+            let mut g = HoistGate::default();
+            g.roll(1);
+            g.observe(idx);
+            g.roll(2);
+            assert!(
+                !g.engage(true, SHALLOW),
+                "a stage ending at index {idx} must not earn eagerness"
+            );
+        }
+        assert!(HOIST_AMORTISED_INDEX > 75_000, "threshold sits inside the descent range");
+        assert!(HOIST_AMORTISED_INDEX < HOIST_MIN_STAGE_INDEX, "amortisation must be below the gate");
     }
 
     /// A mid-stage roll (clear_stage_cache on a transient race, or all work claimed) must not
