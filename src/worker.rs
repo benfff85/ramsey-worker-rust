@@ -219,6 +219,10 @@ pub struct Worker {
     /// Base graph of the stage we most recently set up, so the next stage (one flip away) can be
     /// derived from it instead of rebuilt.
     last_base_graph_id: Option<i32>,
+    /// (parent graph id, edges the advance flipped) for the graph just derived, so the hoist
+    /// engage path can carry the parent's per-edge table forward instead of rebuilding it.
+    /// Consumed once, at engage.
+    hoist_carry: Option<(i32, Vec<(usize, usize)>)>,
     poll_interval: Duration,
     fetch_size: i32,
     publish_size: i32,
@@ -302,6 +306,7 @@ impl Worker {
             stats_fills_slice: 0,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
+            hoist_carry: None,
             poll_interval: Duration::from_millis(poll_interval_ms),
             fetch_size,
             publish_size,
@@ -734,7 +739,36 @@ impl Worker {
         // peers have published. Anything still missing is computed on demand exactly as before, so
         // a crashed peer or an expired key costs a little time and nothing else.
         if first_time {
+            // Seed from the previous stage's table where we have one. The co-operative fill below
+            // is deliberately unchanged: `fill_slice` returns memoised values instantly for
+            // carried entries, so our published slice is still complete and peers still cover the
+            // rest -- carrying only removes work, never sharing.
             let mut tables = HoistTables::new(graph_vertex_count);
+            let mut carried_kept = 0usize;
+            if let Some((parent_id, flipped)) = self.hoist_carry.take() {
+                if self.hoist_cache.contains_key(&parent_id)
+                    && self.graph_cache.contains_key(&parent_id)
+                    && self.graph_cache.contains_key(&base_graph_id)
+                {
+                    let mut t = self.hoist_cache[&parent_id].clone();
+                    let invalidated = t.carry_forward(
+                        &self.graph_cache[&parent_id],
+                        &self.graph_cache[&base_graph_id],
+                        &flipped,
+                    );
+                    carried_kept = t.filled();
+                    tables = t;
+                    log_info!(
+                        "Hoist carried graph {} -> {}: kept {} of {} entries, invalidated {} from {} flip(s)",
+                        parent_id,
+                        base_graph_id,
+                        carried_kept,
+                        graph_vertex_count * (graph_vertex_count - 1) / 2,
+                        invalidated,
+                        flipped.len()
+                    );
+                }
+            }
             let mut adopted = 0usize;
             if self.redis_client.is_some() {
                 let graph_for_fill = self.graph_cache.get_mut(&base_graph_id).unwrap();
@@ -1378,6 +1412,14 @@ impl Worker {
             flipped.len(),
             cc.total()
         );
+        // Remember what this advance changed so the hoist engage path can carry the parent's
+        // per-edge table forward. ~90% of its 39,621 entries survive a 1-2 edge advance, and
+        // rebuilding all of them is the largest fixed cost of a short stage.
+        let flipped_edges: Vec<(usize, usize)> = flipped
+            .iter()
+            .filter_map(|&bit| Graph::edge_for_bit_index(bit, config.graph.vertex_count))
+            .collect();
+        self.hoist_carry = Some((prev_id, flipped_edges));
         self.graph_cache.insert(graph_id, graph);
         self.clique_collection_cache.insert(graph_id, cc);
         true
