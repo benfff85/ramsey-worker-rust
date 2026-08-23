@@ -96,6 +96,21 @@ const STAGE_CHECK_INTERVAL_UNITS: i64 = 4096;
 /// Sized against the slice fill itself (~0.4s): peers publish within roughly that window, so a few
 /// hundred ms captures most of them. Bounded, and abandoned early when coverage stops improving or
 /// the stage is superseded, so the downside on a short stage is small and self-limiting.
+/// Coverage (in permille) at which waiting for peers stops paying for itself.
+///
+/// Measured over 800 stage engages once the hoist carry was live: the wait returns 24,751 entries
+/// from a cold table and 2,593 at 70-85% coverage — worth 4,158 ms and 436 ms of avoided on-demand
+/// fills respectively, against ~90 ms spent. At 85-95% it is a wash (557 entries ~= 94 ms saved for
+/// 102 ms spent), and at 95%+ it returns EXACTLY ZERO on 189 of 800 engages while still costing
+/// ~70 ms. Carrying the table across a stage advance is what moved most engages into that band, so
+/// this threshold only became worth having after that change.
+const HOIST_WAIT_SKIP_PERMILLE: u32 = 950;
+
+/// Whether peers' slices are still worth waiting for, given what we already hold.
+fn should_wait_for_coverage(known: usize, total: usize) -> bool {
+    total > 0 && (known * 1000) < (total * HOIST_WAIT_SKIP_PERMILLE as usize)
+}
+
 const HOIST_COVERAGE_WAIT: Duration = Duration::from_millis(300);
 /// Gap between coverage polls while waiting. Each poll is one MGET of the slice keys.
 const HOIST_COVERAGE_POLL: Duration = Duration::from_millis(25);
@@ -825,10 +840,12 @@ impl Worker {
                 // superseded -- which is what makes it safe on a mispredicted eager engage during
                 // a descent, since such a stage advances and the wait ends on the spot.
                 let wait_started = std::time::Instant::now();
+                let edge_total = graph_vertex_count * (graph_vertex_count - 1) / 2;
                 let mut last_known = tables.filled();
                 let mut stagnant = 0u8;
                 let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                while wait_started.elapsed() < HOIST_COVERAGE_WAIT
+                while should_wait_for_coverage(tables.filled(), edge_total)
+                    && wait_started.elapsed() < HOIST_COVERAGE_WAIT
                     && stagnant < HOIST_COVERAGE_STAGNANT_POLLS
                 {
                     if announcements_for_wait
@@ -1759,4 +1776,27 @@ mod tests {
         let next = next_fetch_size(size, floor, size as i64, nanos);
         assert_eq!(next, size, "should not move when already on target");
     }
+    /// Waiting for peers is worth ~90 ms only while there is enough of the table missing for their
+    /// slices to fill. Measured over 800 stage engages after the hoist carry landed: below 85%
+    /// coverage the wait returns 2,593-24,751 entries (worth 436-4,158 ms of on-demand fills
+    /// against ~90 ms spent), while at 95%+ it returns exactly ZERO on 189 of 800 engages and
+    /// still costs ~70 ms. Carrying the table across a stage advance is what moved most engages
+    /// into that band.
+    #[test]
+    fn coverage_wait_is_skipped_only_when_the_table_is_nearly_complete() {
+        let total = 39_621;
+        // cold start and mid-range: peers still have real work to hand us
+        assert!(should_wait_for_coverage(0, total));
+        assert!(should_wait_for_coverage(22_000, total)); // ~56%, the pre-carry norm
+        assert!(should_wait_for_coverage(33_400, total)); // ~84%, the post-carry norm
+        // nearly complete: the wait measurably returns nothing
+        assert!(!should_wait_for_coverage(37_700, total)); // ~95%
+        assert!(!should_wait_for_coverage(total, total));
+        // boundary is exactly the documented threshold, not a vibe. Ceiling, because the
+        // predicate compares known*1000 against total*permille rather than a truncated quotient.
+        let at = (total * HOIST_WAIT_SKIP_PERMILLE as usize).div_ceil(1000);
+        assert!(!should_wait_for_coverage(at, total));
+        assert!(should_wait_for_coverage(at - 1, total));
+    }
+
 }
