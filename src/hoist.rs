@@ -480,6 +480,22 @@ impl HoistTables {
             }
         }
     }
+
+    #[inline(always)]
+    pub fn compute_correction(
+        &self,
+        adjacency: &[BitMatrix],
+        r: (usize, usize),
+        b: (usize, usize),
+        clique_size: usize,
+    ) -> i32 {
+        correction(adjacency, r, b, clique_size)
+    }
+
+    #[inline(always)]
+    pub fn single_slice(&self) -> &[i32] {
+        &self.single
+    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,12 @@
 use crate::algorithm::{get_all_cliques, get_cliques_comprehensive, get_new_cliques_with_limit};
 use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
-use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
+use crate::enumeration::{
+    create_enumerator, SequentialWithSinglesEnumerator, WorkEnumerator, WorkUnit,
+};
 use crate::graph::{Graph, WorkUnitEdge};
-use crate::hoist::HoistTables;
-use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
+use crate::hoist::{cross_pairs, CrossPairs, HoistTables};
+use crate::model::{StageConfig, WorkEnumerationStrategy, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
 use std::sync::Arc;
 use crate::sa::{SaConfig, run_sa};
@@ -990,177 +992,458 @@ impl Worker {
         let announcements = Arc::clone(&self.stage_announcements);
         let mut units_done: i64 = 0;
         let mut abandoned = false;
-        for idx in start_index..end_index {
-            // Abandon promptly when this stage has been superseded — everything computed past that
-            // point is written to keys the queue manager has already cleared.
-            if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
-                && units_done > 0
-                && announcements
-                    .latest_for(campaign_id_for_counter)
-                    .is_some_and(|announced| announced != stage_id)
-            {
-                abandoned = true;
-                break;
+        let base_total = clique_collection.total() as i32;
+        let vertex_count = self.vertex_count;
+        let clique_size = self.clique_size;
+
+        if let (Some(tables), WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES) =
+            (hoist.as_deref_mut(), &config.strategy)
+        {
+            // FAST RESTRUCTURED PATH for SEQUENTIAL_WITH_SINGLES with hoist engaged.
+            // Eliminates dynamic dispatch, per-unit div/mod, and hoists invariant red edge properties
+            // (D_r, red broken counts, and adjacency rows) across all 19,810 blue partner edges.
+            let enumerator_seq = SequentialWithSinglesEnumerator::new(graph);
+            let singles = enumerator_seq.singles();
+            let red_edges = enumerator_seq.red_edges();
+            let blue_edges = enumerator_seq.blue_edges();
+            let singles_count = singles.len() as i64;
+            let blue_count = blue_edges.len() as i64;
+            let edge_counts = clique_collection.edge_counts();
+
+            // 1. Singles block [start_index, min(end_index, singles_count))
+            if start_index < singles_count {
+                let s_end = end_index.min(singles_count) as usize;
+                for idx in (start_index as usize)..s_end {
+                    if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
+                        && units_done > 0
+                        && announcements
+                            .latest_for(campaign_id_for_counter)
+                            .is_some_and(|announced| announced != stage_id)
+                    {
+                        abandoned = true;
+                        break;
+                    }
+                    units_done += 1;
+
+                    let edge = &singles[idx];
+                    let u = edge.vertex_one as usize;
+                    let v = edge.vertex_two as usize;
+                    let (min_v, max_v) = if u < v { (u, v) } else { (v, u) };
+                    let broken = edge_counts[min_v * vertex_count + max_v];
+
+                    let early_limit = if !publish_results {
+                        match top_threshold {
+                            Some(threshold) => {
+                                let max_new = (threshold - 1) - base_total + broken;
+                                if max_new < 0 {
+                                    continue;
+                                }
+                                max_new
+                            }
+                            None => i32::MAX,
+                        }
+                    } else {
+                        i32::MAX
+                    };
+
+                    let created = tables.single_created(graph, clique_size, u, v);
+                    if created > early_limit {
+                        continue;
+                    }
+
+                    let count = base_total - broken + created;
+                    let edge_buf = [WorkUnitEdge {
+                        vertex_one: edge.vertex_one,
+                        vertex_two: edge.vertex_two,
+                    }];
+                    let edges_to_flip = &edge_buf[..1];
+
+                    let should_submit = match top_threshold {
+                        None => true,
+                        Some(threshold) => count < threshold,
+                    };
+                    if should_submit {
+                        let hash = crate::hash::derived_graph_hash(
+                            &base_bitstring,
+                            derived_vertex_count,
+                            edges_to_flip,
+                        );
+                        if let Some(redis) = self.redis_client.as_mut() {
+                            if let Ok((kept, new_threshold)) = redis
+                                .add_to_top_results(
+                                    stage_id,
+                                    base_graph_id,
+                                    edges_to_flip,
+                                    count,
+                                    &hash,
+                                    self.top_results_count,
+                                )
+                                .await
+                            {
+                                if kept {
+                                    let _ = redis.publish_best_result(stage_id, count).await;
+                                }
+                                if let Some(t) = new_threshold {
+                                    top_threshold = Some(match top_threshold {
+                                        Some(current) => current.min(t),
+                                        None => t,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    if self.publish_results {
+                        let result = WorkResult {
+                            id: None,
+                            base_graph_id,
+                            stage_id,
+                            edges_to_flip: edges_to_flip.to_vec(),
+                            clique_count: count,
+                            work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                        };
+                        processed_results.push(result);
+                        if processed_results.len() >= self.publish_size as usize {
+                            self.mw_client.submit_results(&processed_results).await?;
+                            processed_results.clear();
+                        }
+                    }
+                }
             }
-            units_done += 1;
-            let unit = enumerator.index_to_work_unit(idx);
-            // Stack buffer, not a per-unit heap allocation. This was profiled at 0.2% and
-            // deliberately left alone in the 2026-07-15 kernel round — correctly, when a unit cost
-            // 13.5us of Bron-Kerbosch. The hoist and then the correction bound removed everything
-            // that dwarfed it, and the same ~15ns is now 63-70% of what remains: measured
-            // 0.0268 -> 0.0123 us/unit near the floor and 0.0368 -> 0.0177 mid-descent, i.e. ~2.2x
-            // on the evaluation half of a worker's time. Nothing about the allocation changed —
-            // only its share did.
-            let mut edge_buf = [
-                WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
-                WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
-            ];
-            let edges_to_flip: &[WorkUnitEdge] = match &unit {
-                WorkUnit::SingleFlip(edge) => {
-                    edge_buf[0] = edge.clone();
-                    &edge_buf[..1]
-                }
-                WorkUnit::PairFlip(red_edge, blue_edge) => {
-                    edge_buf[0] = red_edge.clone();
-                    edge_buf[1] = blue_edge.clone();
-                    &edge_buf[..2]
-                }
-            };
 
-            let broken = clique_collection.get_count_of_cliques_containing_edges(edges_to_flip);
-            let base_total = clique_collection.total() as i32;
+            // 2. Pairs block [max(start_index, singles_count), end_index)
+            if !abandoned && end_index > singles_count {
+                let p_start = (start_index.max(singles_count) - singles_count) as usize;
+                let p_end = (end_index - singles_count) as usize;
 
-            // Early termination when not publishing: stop counting if result can't be in top-N.
-            // If threshold exists: max_new = threshold - (base_total - broken) - 1, the most new
-            // cliques that would still beat it.
-            let early_limit = if !publish_results {
-                match top_threshold {
-                    Some(threshold) => {
-                        let max_new = (threshold - 1) - base_total + broken;
-                        if max_new < 0 {
-                            // base_total - broken >= threshold: this flip cannot beat the
-                            // threshold even if it creates ZERO new cliques, so the kernel can
-                            // only confirm what the per-edge counts already prove. Skip it
-                            // outright instead of paying two flip_edges plus a seeded traversal.
+                let start_red = p_start / (blue_count as usize);
+                let start_blue = p_start % (blue_count as usize);
+                let end_red = (p_end - 1) / (blue_count as usize);
+                let end_blue = (p_end - 1) % (blue_count as usize);
+
+                'outer_red: for red_idx in start_red..=end_red {
+                    let r_edge = &red_edges[red_idx];
+                    let rx = r_edge.vertex_one as usize;
+                    let ry = r_edge.vertex_two as usize;
+                    let (min_r, max_r) = if rx < ry { (rx, ry) } else { (ry, rx) };
+                    let red_broken = edge_counts[min_r * vertex_count + max_r];
+                    let d_r = tables.single_created(graph, clique_size, rx, ry);
+                    let row_rx = graph.adjacency[rx];
+                    let row_ry = graph.adjacency[ry];
+
+                    let b_from = if red_idx == start_red { start_blue } else { 0 };
+                    let b_to = if red_idx == end_red { end_blue + 1 } else { blue_count as usize };
+
+                    for blue_idx in b_from..b_to {
+                        if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
+                            && units_done > 0
+                            && announcements
+                                .latest_for(campaign_id_for_counter)
+                                .is_some_and(|announced| announced != stage_id)
+                        {
+                            abandoned = true;
+                            break 'outer_red;
+                        }
+                        units_done += 1;
+
+                        let b_edge = &blue_edges[blue_idx];
+                        let bx = b_edge.vertex_one as usize;
+                        let by = b_edge.vertex_two as usize;
+                        let (min_b, max_b) = if bx < by { (bx, by) } else { (by, bx) };
+                        let blue_broken = edge_counts[min_b * vertex_count + max_b];
+                        let broken = red_broken + blue_broken;
+
+                        let early_limit = if !publish_results {
+                            match top_threshold {
+                                Some(threshold) => {
+                                    let max_new = (threshold - 1) - base_total + broken;
+                                    if max_new < 0 {
+                                        continue;
+                                    }
+                                    max_new
+                                }
+                                None => i32::MAX,
+                            }
+                        } else {
+                            i32::MAX
+                        };
+
+                        let c_b = tables.single_created(graph, clique_size, bx, by);
+                        let base = c_b + d_r;
+
+                        // Check disjoint vs shared vertices
+                        let is_disjoint = rx != bx && rx != by && ry != bx && ry != by;
+                        let created = if is_disjoint {
+                            let rx_bx = row_rx.get(bx);
+                            let rx_by = row_rx.get(by);
+                            let ry_bx = row_ry.get(bx);
+                            let ry_by = row_ry.get(by);
+
+                            if rx_bx && rx_by && ry_bx && ry_by {
+                                // AllRed
+                                if d_r > early_limit {
+                                    continue;
+                                }
+                                base - tables.compute_correction(
+                                    &graph.adjacency,
+                                    (rx, ry),
+                                    (bx, by),
+                                    clique_size,
+                                )
+                            } else if !rx_bx && !rx_by && !ry_bx && !ry_by {
+                                // AllBlue
+                                if c_b > early_limit {
+                                    continue;
+                                }
+                                base - tables.compute_correction(
+                                    &graph.complement_adjacency,
+                                    (rx, ry),
+                                    (bx, by),
+                                    clique_size,
+                                )
+                            } else {
+                                // Mixed
+                                base
+                            }
+                        } else {
+                            match cross_pairs(&graph.adjacency, (rx, ry), (bx, by)) {
+                                CrossPairs::Mixed => base,
+                                CrossPairs::AllRed => {
+                                    if d_r > early_limit {
+                                        continue;
+                                    }
+                                    base - tables.compute_correction(
+                                        &graph.adjacency,
+                                        (rx, ry),
+                                        (bx, by),
+                                        clique_size,
+                                    )
+                                }
+                                CrossPairs::AllBlue => {
+                                    if c_b > early_limit {
+                                        continue;
+                                    }
+                                    base - tables.compute_correction(
+                                        &graph.complement_adjacency,
+                                        (rx, ry),
+                                        (bx, by),
+                                        clique_size,
+                                    )
+                                }
+                            }
+                        };
+
+                        if created > early_limit {
                             continue;
                         }
-                        max_new
-                    }
-                    None => i32::MAX, // No threshold, count everything
-                }
-            } else {
-                i32::MAX
-            };
 
-            // `created` is ~all of a work unit's cost. The hoisted path derives it algebraically
-            // from memoised per-edge counts (see hoist.rs) instead of running a seeded traversal,
-            // and is EXACT — the two branches agree unit for unit, so which one runs changes only
-            // the cost, never a result, a threshold, or a stage transition.
-            let (new, exceeded) = match hoist.as_deref_mut() {
-                Some(tables) => match &unit {
+                        let count = base_total - broken + created;
+                        let edge_buf = [
+                            WorkUnitEdge {
+                                vertex_one: r_edge.vertex_one,
+                                vertex_two: r_edge.vertex_two,
+                            },
+                            WorkUnitEdge {
+                                vertex_one: b_edge.vertex_one,
+                                vertex_two: b_edge.vertex_two,
+                            },
+                        ];
+                        let edges_to_flip = &edge_buf[..2];
+
+                        let should_submit = match top_threshold {
+                            None => true,
+                            Some(threshold) => count < threshold,
+                        };
+                        if should_submit {
+                            let hash = crate::hash::derived_graph_hash(
+                                &base_bitstring,
+                                derived_vertex_count,
+                                edges_to_flip,
+                            );
+                            if let Some(redis) = self.redis_client.as_mut() {
+                                if let Ok((kept, new_threshold)) = redis
+                                    .add_to_top_results(
+                                        stage_id,
+                                        base_graph_id,
+                                        edges_to_flip,
+                                        count,
+                                        &hash,
+                                        self.top_results_count,
+                                    )
+                                    .await
+                                {
+                                    if kept {
+                                        let _ = redis.publish_best_result(stage_id, count).await;
+                                    }
+                                    if let Some(t) = new_threshold {
+                                        top_threshold = Some(match top_threshold {
+                                            Some(current) => current.min(t),
+                                            None => t,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if self.publish_results {
+                            let result = WorkResult {
+                                id: None,
+                                base_graph_id,
+                                stage_id,
+                                edges_to_flip: edges_to_flip.to_vec(),
+                                clique_count: count,
+                                work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                            };
+                            processed_results.push(result);
+                            if processed_results.len() >= self.publish_size as usize {
+                                self.mw_client.submit_results(&processed_results).await?;
+                                processed_results.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // FALLBACK SCALAR PATH for unhoisted stages or non-sequential enumeration strategies.
+            let enumerator = create_enumerator(&config.strategy, graph);
+
+            for idx in start_index..end_index {
+                if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
+                    && units_done > 0
+                    && announcements
+                        .latest_for(campaign_id_for_counter)
+                        .is_some_and(|announced| announced != stage_id)
+                {
+                    abandoned = true;
+                    break;
+                }
+                units_done += 1;
+                let unit = enumerator.index_to_work_unit(idx);
+                let mut edge_buf = [
+                    WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
+                    WorkUnitEdge { vertex_one: 0, vertex_two: 0 },
+                ];
+                let edges_to_flip: &[WorkUnitEdge] = match &unit {
                     WorkUnit::SingleFlip(edge) => {
-                        // A single flip's `created` IS the table entry, so there is nothing to
-                        // abort; the kernel's early exit becomes a comparison.
-                        let created = tables.single_created(
-                            graph,
-                            clique_size,
-                            edge.vertex_one as usize,
-                            edge.vertex_two as usize,
-                        );
-                        (created, created > early_limit)
+                        edge_buf[0] = edge.clone();
+                        &edge_buf[..1]
                     }
-                    // Pairs take the bounded form: `created >= D_r` (cross pairs all red) or
-                    // `>= C_b` (all blue), both already in hand, so most units that cannot beat
-                    // the limit are rejected without computing the correction — which is 98% of
-                    // this loop's cost. Exact, not a prune: see `pair_created_bounded`.
                     WorkUnit::PairFlip(red_edge, blue_edge) => {
-                        match tables.pair_created_bounded(
+                        edge_buf[0] = red_edge.clone();
+                        edge_buf[1] = blue_edge.clone();
+                        &edge_buf[..2]
+                    }
+                };
+
+                let broken = clique_collection.get_count_of_cliques_containing_edges(edges_to_flip);
+
+                let early_limit = if !publish_results {
+                    match top_threshold {
+                        Some(threshold) => {
+                            let max_new = (threshold - 1) - base_total + broken;
+                            if max_new < 0 {
+                                continue;
+                            }
+                            max_new
+                        }
+                        None => i32::MAX,
+                    }
+                } else {
+                    i32::MAX
+                };
+
+                let (new, exceeded) = match hoist.as_deref_mut() {
+                    Some(tables) => match &unit {
+                        WorkUnit::SingleFlip(edge) => {
+                            let created = tables.single_created(
+                                graph,
+                                clique_size,
+                                edge.vertex_one as usize,
+                                edge.vertex_two as usize,
+                            );
+                            (created, created > early_limit)
+                        }
+                        WorkUnit::PairFlip(red_edge, blue_edge) => {
+                            match tables.pair_created_bounded(
+                                graph,
+                                clique_size,
+                                (red_edge.vertex_one as usize, red_edge.vertex_two as usize),
+                                (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize),
+                                early_limit,
+                            ) {
+                                Some(created) => (created, false),
+                                None => (0, true),
+                            }
+                        }
+                    },
+                    None => {
+                        graph.flip_edges(edges_to_flip);
+                        let out = get_new_cliques_with_limit(
                             graph,
                             clique_size,
-                            (red_edge.vertex_one as usize, red_edge.vertex_two as usize),
-                            (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize),
-                            early_limit,
-                        ) {
-                            Some(created) => (created, false),
-                            // Provably over the limit. The count is never read once `exceeded`
-                            // is set — the loop continues immediately.
-                            None => (0, true),
-                        }
-                    }
-                },
-                None => {
-                    graph.flip_edges(edges_to_flip);
-                    let out =
-                        get_new_cliques_with_limit(graph, clique_size, edges_to_flip, early_limit);
-                    graph.flip_edges(edges_to_flip);
-                    out
-                }
-            };
-
-            if exceeded {
-                continue;
-            }
-            let count = base_total - broken + new;
-
-            // Track as a potential best result (stored in top-N sorted set)
-            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
-            let should_submit = match top_threshold {
-                None => true, // Set is not full, accept any result
-                Some(threshold) => count < threshold,
-            };
-            if should_submit {
-                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
-                // Only computed for record-breakers (count < best novel), so it's rare.
-                let hash = crate::hash::derived_graph_hash(
-                    &base_bitstring,
-                    derived_vertex_count,
-                    edges_to_flip,
-                );
-                if let Some(redis) = self.redis_client.as_mut() {
-                    if let Ok((kept, new_threshold)) = redis
-                        .add_to_top_results(
-                            stage_id,
-                            base_graph_id,
                             edges_to_flip,
-                            count,
-                            &hash,
-                            self.top_results_count,
-                        )
-                        .await
-                    {
-                        // Only a real insert is news; a rejected (already-visited) candidate
-                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
-                        // fallback, so a dropped message costs latency, not correctness.
-                        if kept {
-                            let _ = redis.publish_best_result(stage_id, count).await;
-                        }
-                        // Update threshold in-place so early termination tightens
-                        // within this batch rather than staying stale for all 250K units.
-                        if let Some(t) = new_threshold {
-                            top_threshold = Some(match top_threshold {
-                                Some(current) => current.min(t),
-                                None => t,
-                            });
+                            early_limit,
+                        );
+                        graph.flip_edges(edges_to_flip);
+                        out
+                    }
+                };
+
+                if exceeded {
+                    continue;
+                }
+                let count = base_total - broken + new;
+
+                let should_submit = match top_threshold {
+                    None => true,
+                    Some(threshold) => count < threshold,
+                };
+                if should_submit {
+                    let hash = crate::hash::derived_graph_hash(
+                        &base_bitstring,
+                        derived_vertex_count,
+                        edges_to_flip,
+                    );
+                    if let Some(redis) = self.redis_client.as_mut() {
+                        if let Ok((kept, new_threshold)) = redis
+                            .add_to_top_results(
+                                stage_id,
+                                base_graph_id,
+                                edges_to_flip,
+                                count,
+                                &hash,
+                                self.top_results_count,
+                            )
+                            .await
+                        {
+                            if kept {
+                                let _ = redis.publish_best_result(stage_id, count).await;
+                            }
+                            if let Some(t) = new_threshold {
+                                top_threshold = Some(match top_threshold {
+                                    Some(current) => current.min(t),
+                                    None => t,
+                                });
+                            }
                         }
                     }
                 }
-            }
 
-            // Collect results for publishing
-            if self.publish_results {
-                let result = WorkResult {
-                    id: None,
-                    base_graph_id,
-                    stage_id,
-                    edges_to_flip: edges_to_flip.to_vec(),
-                    clique_count: count,
-                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
-                };
-                processed_results.push(result);
+                if self.publish_results {
+                    let result = WorkResult {
+                        id: None,
+                        base_graph_id,
+                        stage_id,
+                        edges_to_flip: edges_to_flip.to_vec(),
+                        clique_count: count,
+                        work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                    };
+                    processed_results.push(result);
 
-                if processed_results.len() >= self.publish_size as usize {
-                    self.mw_client.submit_results(&processed_results).await?;
-                    processed_results.clear();
+                    if processed_results.len() >= self.publish_size as usize {
+                        self.mw_client.submit_results(&processed_results).await?;
+                        processed_results.clear();
+                    }
                 }
             }
         }

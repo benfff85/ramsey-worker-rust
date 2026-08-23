@@ -70,6 +70,16 @@ impl BasicEnumerator {
             total_pairs,
         }
     }
+
+    #[inline(always)]
+    pub fn red_edges(&self) -> &[ScoredEdge] {
+        &self.red_edges
+    }
+
+    #[inline(always)]
+    pub fn blue_edges(&self) -> &[ScoredEdge] {
+        &self.blue_edges
+    }
 }
 
 impl WorkEnumerator for BasicEnumerator {
@@ -289,6 +299,36 @@ impl SequentialWithSinglesEnumerator {
         singles.extend(pairs.blue_edges.iter().cloned());
         let total = singles.len() as i64 + pairs.total_work_units();
         SequentialWithSinglesEnumerator { singles, pairs, total }
+    }
+
+    #[inline(always)]
+    pub fn singles(&self) -> &[ScoredEdge] {
+        &self.singles
+    }
+
+    #[inline(always)]
+    pub fn red_edges(&self) -> &[ScoredEdge] {
+        self.pairs.red_edges()
+    }
+
+    #[inline(always)]
+    pub fn blue_edges(&self) -> &[ScoredEdge] {
+        self.pairs.blue_edges()
+    }
+
+    #[inline(always)]
+    pub fn singles_count(&self) -> usize {
+        self.singles.len()
+    }
+
+    #[inline(always)]
+    pub fn blue_count(&self) -> usize {
+        self.pairs.blue_edges.len()
+    }
+
+    #[inline(always)]
+    pub fn red_count(&self) -> usize {
+        self.pairs.red_edges.len()
     }
 }
 
