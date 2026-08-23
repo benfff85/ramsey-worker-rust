@@ -293,14 +293,21 @@ impl HoistTables {
     /// invalidates ~21% of the table against ~10% genuinely changed, in ~0.7 ms against a ~6.7 s
     /// rebuild. Entries left UNKNOWN are refilled by the existing lazy/sharded paths, so a carried
     /// table is indistinguishable from a fresh one to every caller.
-    pub fn carry_forward(
-        &mut self,
-        before: &Graph,
-        after: &Graph,
-        flipped: &[(usize, usize)],
-    ) -> usize {
-        let norm = |(a, b): (usize, usize)| if a < b { (a, b) } else { (b, a) };
-        let flipped: Vec<(usize, usize)> = flipped.iter().map(|&f| norm(f)).collect();
+    pub fn carry_forward(&mut self, before: &Graph, after: &Graph) -> usize {
+        // The delta is DERIVED from the two graphs rather than taken as an argument. A caller can
+        // easily hold a stale edge list — a stage that never engaged the hoist followed by one that
+        // took the full-build path — and a wrong list silently KEEPS entries the real delta
+        // invalidates, feeding a stale `created` to every unit of the stage and publishing it to
+        // peers. Nothing downstream catches that, so the delta must not be trusted from outside.
+        // Cost is one bit compare per edge (~39,621) against a ~6.7 s rebuild.
+        let mut flipped: Vec<(usize, usize)> = Vec::new();
+        for u in 0..self.vertex_count {
+            for v in (u + 1)..self.vertex_count {
+                if before.adjacency[u].get(v) != after.adjacency[u].get(v) {
+                    flipped.push((u, v));
+                }
+            }
+        }
         let mut invalidated = 0;
         for u in 0..self.vertex_count {
             for v in (u + 1)..self.vertex_count {
@@ -901,7 +908,7 @@ mod tests {
                         carried.single_created(&mut before, k, u, v);
                     }
                 }
-                carried.carry_forward(&before, &after, mv);
+                carried.carry_forward(&before, &after);
 
                 let mut fresh = HoistTables::new(n);
                 for u in 0..n {
@@ -926,7 +933,6 @@ mod tests {
         let base = bits(n, seed);
         let mut before = Graph::from_bitstring(&base, n);
         let mut after = before.clone();
-        let mv = vec![(0usize, 1usize)];
         after.flip_edges(&[edge(0, 1)]);
 
         let mut carried = HoistTables::new(n);
@@ -936,9 +942,44 @@ mod tests {
             }
         }
         let total = n * (n - 1) / 2;
-        let invalidated = carried.carry_forward(&before, &after, &mv);
+        let invalidated = carried.carry_forward(&before, &after);
         assert_eq!(carried.filled(), total - invalidated, "filled count must drop by exactly the invalidated count");
         assert!(invalidated < total, "carry invalidated the entire table ({invalidated}/{total}) -- no saving");
+    }
+
+    /// A carry must be correct between ANY two graphs, not just a parent and the child one stage
+    /// later. The worker can hold a stale carry pointer — a stage that never engaged the hoist
+    /// followed by one that took the full-build path — so trusting a separately-recorded edge list
+    /// silently keeps entries that the real delta invalidates. Deriving the delta from the graphs
+    /// themselves makes that unrepresentable.
+    #[test]
+    fn carry_is_correct_between_arbitrary_graphs_not_just_adjacent_stages() {
+        let (n, k) = (10usize, 4usize);
+        let base = bits(n, 11);
+        let mut a = Graph::from_bitstring(&base, n);
+
+        // C is several advances away from A, as it would be after stages that never engaged.
+        let mut c = Graph::from_bitstring(&base, n);
+        c.flip_edges(&[edge(0, 1), edge(2, 3), edge(4, 5), edge(6, 7), edge(1, 8)]);
+
+        let mut carried = HoistTables::new(n);
+        for u in 0..n {
+            for v in (u + 1)..n {
+                carried.single_created(&mut a, k, u, v);
+            }
+        }
+        carried.carry_forward(&a, &c);
+
+        let mut fresh = HoistTables::new(n);
+        let mut probe = c.clone();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                let want = fresh.single_created(&mut probe, k, u, v);
+                let mut cg = c.clone();
+                let got = carried.single_created(&mut cg, k, u, v);
+                assert_eq!(want, got, "edge ({u},{v}) stale after a multi-advance carry");
+            }
+        }
     }
 
 }
