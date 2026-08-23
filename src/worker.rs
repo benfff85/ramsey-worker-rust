@@ -220,6 +220,14 @@ pub struct Worker {
     stats_units: u64,
     stats_batches: u64,
     stats_busy_nanos: u128,
+    /// Cycles that claimed no work, and the wall-clock they consumed INCLUDING the sleep that
+    /// follows. These were invisible: a zero-unit cycle is not counted as a batch and its time is
+    /// not counted as busy, so ~12% of wall-clock did not appear in the throughput line at all.
+    /// Split by cause, because "the stage's work is all claimed" and "there is no stage" call for
+    /// completely different fixes.
+    stats_idle_cycles: u64,
+    stats_idle_nanos: u128,
+    stats_idle_exhausted: u64,
     /// On-demand hoist-table fills and their wall-clock, accumulated over the stats window.
     /// These happen INSIDE the unit loop, so they are counted as "busy" and are otherwise
     /// indistinguishable from real evaluation work in the throughput line.
@@ -315,6 +323,9 @@ impl Worker {
             stats_units: 0,
             stats_batches: 0,
             stats_busy_nanos: 0,
+            stats_idle_cycles: 0,
+            stats_idle_nanos: 0,
+            stats_idle_exhausted: 0,
             stats_fills: 0,
             stats_fill_nanos: 0,
             stats_fills_red: 0,
@@ -409,6 +420,7 @@ impl Worker {
                     if count == 0 {
                         // A race (stage advanced under us) means work is waiting right now; only a
                         // genuinely idle fleet should wait out the poll interval.
+                        let exhausted = self.retry_soon;
                         let wait = if self.retry_soon {
                             self.retry_soon = false;
                             Duration::from_millis(TRANSIENT_RETRY_MILLIS)
@@ -416,6 +428,11 @@ impl Worker {
                             self.poll_interval
                         };
                         sleep(wait).await;
+                        self.stats_idle_cycles += 1;
+                        self.stats_idle_nanos += cycle_start.elapsed().as_nanos();
+                        if exhausted {
+                            self.stats_idle_exhausted += 1;
+                        }
                     } else {
                         let batch = cycle_start.elapsed();
                         log_debug!(
@@ -1480,7 +1497,7 @@ impl Worker {
         let secs = window.as_secs_f64();
         let busy_secs = self.stats_busy_nanos as f64 / 1e9;
         log_info!(
-            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy, {} on-demand fills costing {:.2}s ({:.0}% of busy) [slice {} | misses {} = {} red + {} blue]",
+            "Throughput: {} units in {:.0}s ({:.2}M units/sec) over {} batches, avg {:.0}ms/batch, {:.0}% busy, {} on-demand fills costing {:.2}s ({:.0}% of busy) [slice {} | misses {} = {} red + {} blue] | IDLE {} cycles costing {:.2}s ({:.0}% of wall), {} of them work-exhausted",
             self.stats_units,
             secs,
             self.stats_units as f64 / secs / 1e6,
@@ -1493,7 +1510,11 @@ impl Worker {
             self.stats_fills_slice,
             self.stats_fills.saturating_sub(self.stats_fills_slice),
             self.stats_fills_red,
-            self.stats_fills_blue
+            self.stats_fills_blue,
+            self.stats_idle_cycles,
+            self.stats_idle_nanos as f64 / 1e9,
+            100.0 * (self.stats_idle_nanos as f64 / 1e9) / secs,
+            self.stats_idle_exhausted
         );
         self.stats_window_start = std::time::Instant::now();
         self.stats_units = 0;
@@ -1504,6 +1525,9 @@ impl Worker {
         self.stats_fills_blue = 0;
         self.stats_fills_slice = 0;
         self.stats_busy_nanos = 0;
+        self.stats_idle_cycles = 0;
+        self.stats_idle_nanos = 0;
+        self.stats_idle_exhausted = 0;
     }
 
     fn clear_stage_cache(&mut self) {
