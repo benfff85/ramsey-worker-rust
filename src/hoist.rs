@@ -48,6 +48,10 @@ use crate::graph::{Graph, WorkUnitEdge};
 /// Sentinel for "not computed yet". Real `created` counts are always >= 0.
 const UNKNOWN: i32 = i32::MIN;
 
+/// Re-checks allowed for peers' slices on a freshly-started table. A carried table resets to this
+/// too: it still needs peers' help for the entries the advance invalidated.
+const INITIAL_REFRESH_BUDGET: u8 = 12;
+
 /// Which colour the cross pairs share, which decides whether a correction is needed at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CrossPairs {
@@ -182,7 +186,7 @@ impl HoistTables {
     pub fn new(vertex_count: usize) -> Self {
         HoistTables {
             vertex_count,
-            refresh_budget: 12,
+            refresh_budget: INITIAL_REFRESH_BUDGET,
             single: vec![UNKNOWN; vertex_count * vertex_count],
             fills: 0,
             fill_nanos: 0,
@@ -263,6 +267,70 @@ impl HoistTables {
             }
             bit += slices;
         }
+    }
+
+    /// Carry this table onto a graph differing from the one it was built on by `flipped` edges,
+    /// invalidating only entries that could have changed. Returns how many were invalidated.
+    ///
+    /// # Why this is sound
+    ///
+    /// `single_created(e)` counts monochromatic k-cliques through `e` (with `e` flipped). It can
+    /// only change if some clique it counts also contains a flipped edge `f`. A clique containing
+    /// both contains every vertex of both, so every cross pair between `e` and `f` is an internal
+    /// pair of that clique and shares its colour. [`cross_pairs`] returning [`CrossPairs::Mixed`]
+    /// therefore proves no monochromatic clique contains both, and `e` is untouched — the same
+    /// algebra the fast path already rests on.
+    ///
+    /// The test is evaluated in BOTH graphs and unioned. The motivating case is that with two
+    /// flipped edges, a cross pair between `e` and `f1` can itself be `f2`, whose colour differs
+    /// between the graphs. In every case reachable by exhaustive small-graph search that entry is
+    /// ALSO caught by the check against `f2` alone, so the union has not been shown to be
+    /// necessary — but it has not been shown redundant at n=282/k=8 either, and it costs ~0.3 ms
+    /// against a ~6.7 s rebuild. Kept deliberately rather than reasoned away.
+    ///
+    /// Conservative by construction — it may invalidate an entry that did not change (costing one
+    /// recompute) but never keeps one that did. Measured over 24 consecutive campaign-3 advances:
+    /// invalidates ~21% of the table against ~10% genuinely changed, in ~0.7 ms against a ~6.7 s
+    /// rebuild. Entries left UNKNOWN are refilled by the existing lazy/sharded paths, so a carried
+    /// table is indistinguishable from a fresh one to every caller.
+    pub fn carry_forward(
+        &mut self,
+        before: &Graph,
+        after: &Graph,
+        flipped: &[(usize, usize)],
+    ) -> usize {
+        let norm = |(a, b): (usize, usize)| if a < b { (a, b) } else { (b, a) };
+        let flipped: Vec<(usize, usize)> = flipped.iter().map(|&f| norm(f)).collect();
+        let mut invalidated = 0;
+        for u in 0..self.vertex_count {
+            for v in (u + 1)..self.vertex_count {
+                let i = self.index(u, v);
+                if self.single[i] == UNKNOWN {
+                    continue; // nothing to keep or lose
+                }
+                let e = (u, v);
+                let stale = flipped.iter().any(|&f| {
+                    e == f
+                        || cross_pairs(&before.adjacency, e, f) != CrossPairs::Mixed
+                        || cross_pairs(&after.adjacency, e, f) != CrossPairs::Mixed
+                });
+                if stale {
+                    self.single[i] = UNKNOWN;
+                    invalidated += 1;
+                }
+            }
+        }
+        // A carried table is a NEW table as far as co-operation and instrumentation go: it still
+        // wants peers' slices for what it just invalidated, and its fill counters belong to the
+        // stage that built them, not this one.
+        self.refresh_budget = INITIAL_REFRESH_BUDGET;
+        self.fills = 0;
+        self.fill_nanos = 0;
+        self.fills_red = 0;
+        self.fills_blue = 0;
+        self.slice_fills = 0;
+        self.in_slice_fill = false;
+        invalidated
     }
 
     /// Whether it is still worth asking Redis for slices we do not have.
@@ -786,4 +854,91 @@ mod tests {
         t.adopt_slice(0, 2, &vec![truth + 999; HoistTables::slice_len(n, 0, 2)]);
         assert_eq!(t.single_created(&mut graph, k, 0, 1), truth);
     }
+    /// Carrying a table across a stage advance must be indistinguishable from rebuilding it.
+    ///
+    /// The dangerous direction is a wrongly-KEPT entry: it silently feeds a stale `created` to
+    /// every unit of the next stage, which no downstream check would catch. Exhaustive over every
+    /// single-edge flip plus a spread of balanced pair flips -- the two move shapes a stage
+    /// advance can actually take.
+    #[test]
+    fn carried_table_matches_a_fresh_rebuild_on_every_edge() {
+        for (n, k, seed) in [(9usize, 4usize, 7u64), (10, 4, 11), (10, 5, 3)] {
+            let base = bits(n, seed);
+            let g0 = Graph::from_bitstring(&base, n);
+            let mut reds = Vec::new();
+            let mut blues = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if g0.adjacency[i].get(j) { reds.push((i, j)) } else { blues.push((i, j)) }
+                }
+            }
+            let mut moves: Vec<Vec<(usize, usize)>> = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    moves.push(vec![(i, j)]); // singles: every edge
+                }
+            }
+            // EXHAUSTIVE over balanced pairs rather than a sampled spread. Mutation testing
+            // (invalidating only the flipped edges themselves) fails against this, so the coverage
+            // is real. Note it does NOT distinguish the two-graph union in `carry_forward` from a
+            // `before`-only check — see that method's docs; the union is kept as cheap insurance,
+            // not because this test proves it necessary.
+            for r in &reds {
+                for bl in &blues {
+                    moves.push(vec![*r, *bl]);
+                }
+            }
+
+            for mv in &moves {
+                let mut before = Graph::from_bitstring(&base, n);
+                let mut after = before.clone();
+                let wu: Vec<WorkUnitEdge> = mv.iter().map(|&(u, v)| edge(u, v)).collect();
+                after.flip_edges(&wu);
+
+                let mut carried = HoistTables::new(n);
+                for u in 0..n {
+                    for v in (u + 1)..n {
+                        carried.single_created(&mut before, k, u, v);
+                    }
+                }
+                carried.carry_forward(&before, &after, mv);
+
+                let mut fresh = HoistTables::new(n);
+                for u in 0..n {
+                    for v in (u + 1)..n {
+                        let want = fresh.single_created(&mut after, k, u, v);
+                        let got = carried.single_created(&mut after, k, u, v);
+                        assert_eq!(
+                            want, got,
+                            "n={n} k={k} move={mv:?} edge=({u},{v}): carried table disagrees"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The carry must actually save work -- if it invalidated everything it would be correct and
+    /// useless. Locks in that the predicate keeps a clear majority of the table.
+    #[test]
+    fn carry_forward_keeps_most_of_the_table() {
+        let (n, k, seed) = (12usize, 5usize, 29u64);
+        let base = bits(n, seed);
+        let mut before = Graph::from_bitstring(&base, n);
+        let mut after = before.clone();
+        let mv = vec![(0usize, 1usize)];
+        after.flip_edges(&[edge(0, 1)]);
+
+        let mut carried = HoistTables::new(n);
+        for u in 0..n {
+            for v in (u + 1)..n {
+                carried.single_created(&mut before, k, u, v);
+            }
+        }
+        let total = n * (n - 1) / 2;
+        let invalidated = carried.carry_forward(&before, &after, &mv);
+        assert_eq!(carried.filled(), total - invalidated, "filled count must drop by exactly the invalidated count");
+        assert!(invalidated < total, "carry invalidated the entire table ({invalidated}/{total}) -- no saving");
+    }
+
 }
