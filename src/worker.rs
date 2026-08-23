@@ -234,10 +234,11 @@ pub struct Worker {
     /// Base graph of the stage we most recently set up, so the next stage (one flip away) can be
     /// derived from it instead of rebuilt.
     last_base_graph_id: Option<i32>,
-    /// (parent graph id, edges the advance flipped) for the graph just derived, so the hoist
-    /// engage path can carry the parent's per-edge table forward instead of rebuilding it.
-    /// Consumed once, at engage.
-    hoist_carry: Option<(i32, Vec<(usize, usize)>)>,
+    /// Parent graph id for the graph just derived, so the hoist engage path can carry the parent's
+    /// per-edge table forward instead of rebuilding it. Only a HINT — `carry_forward` derives the
+    /// actual edge delta from the two graphs, so a stale pointer costs extra invalidation and never
+    /// correctness. Cleared whenever the caches it refers to are dropped.
+    hoist_carry: Option<i32>,
     poll_interval: Duration,
     fetch_size: i32,
     publish_size: i32,
@@ -759,9 +760,13 @@ impl Worker {
             // carried entries, so our published slice is still complete and peers still cover the
             // rest -- carrying only removes work, never sharing.
             let mut tables = HoistTables::new(graph_vertex_count);
-            let mut carried_kept = 0usize;
-            if let Some((parent_id, flipped)) = self.hoist_carry.take() {
-                if self.hoist_cache.contains_key(&parent_id)
+            if let Some(parent_id) = self.hoist_carry.take() {
+                // `carry_forward` derives the edge delta from the two graphs, so an out-of-date
+                // parent pointer costs extra invalidation and never correctness. Guarding on the
+                // ids alone would not be enough on its own: the pointer survives a stage that never
+                // engaged the hoist, and the next stage may reach here via the full-build path.
+                if parent_id != base_graph_id
+                    && self.hoist_cache.contains_key(&parent_id)
                     && self.graph_cache.contains_key(&parent_id)
                     && self.graph_cache.contains_key(&base_graph_id)
                 {
@@ -769,21 +774,24 @@ impl Worker {
                     let invalidated = t.carry_forward(
                         &self.graph_cache[&parent_id],
                         &self.graph_cache[&base_graph_id],
-                        &flipped,
                     );
-                    carried_kept = t.filled();
+                    let kept = t.filled();
                     tables = t;
                     log_info!(
-                        "Hoist carried graph {} -> {}: kept {} of {} entries, invalidated {} from {} flip(s)",
+                        "Hoist carried graph {} -> {}: kept {} of {} entries, invalidated {}",
                         parent_id,
                         base_graph_id,
-                        carried_kept,
+                        kept,
                         graph_vertex_count * (graph_vertex_count - 1) / 2,
-                        invalidated,
-                        flipped.len()
+                        invalidated
                     );
                 }
             }
+            // Slices we know are already published. Populated from EVERY sweep, not just the wait
+            // loop: with the wait now skipped at high coverage the loop may not run at all, and an
+            // empty set makes the gap-fill guard below vacuous — every worker would then claim,
+            // fill and republish a second slice on each engage.
+            let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
             let mut adopted = 0usize;
             if self.redis_client.is_some() {
                 let graph_for_fill = self.graph_cache.get_mut(&base_graph_id).unwrap();
@@ -791,6 +799,7 @@ impl Worker {
                 if let Some(redis) = self.redis_client.as_mut() {
                     if let Ok(slices) = redis.get_hoist_slices(base_graph_id, HOIST_FILL_SLICES).await {
                         for (s, values) in slices {
+                            present.insert(s);
                             tables.adopt_slice(s as usize, HOIST_FILL_SLICES as usize, &values);
                         }
                         adopted = tables.filled(); // seeded before we filled our own slice
@@ -813,6 +822,9 @@ impl Worker {
                     if let Err(e) = redis.put_hoist_slice(base_graph_id, slice, &values).await {
                         log_error!("Could not publish hoist slice {slice} for graph {base_graph_id}: {e}");
                     }
+                }
+                present.insert(slice); // our own slice is published (or attempted) — never re-claim it
+                {
                 }
                 // One more sweep for slices that landed while we were filling ours.
                 if let Some(redis) = self.redis_client.as_mut() {
@@ -843,7 +855,6 @@ impl Worker {
                 let edge_total = graph_vertex_count * (graph_vertex_count - 1) / 2;
                 let mut last_known = tables.filled();
                 let mut stagnant = 0u8;
-                let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
                 while should_wait_for_coverage(tables.filled(), edge_total)
                     && wait_started.elapsed() < HOIST_COVERAGE_WAIT
                     && stagnant < HOIST_COVERAGE_STAGNANT_POLLS
@@ -1432,11 +1443,7 @@ impl Worker {
         // Remember what this advance changed so the hoist engage path can carry the parent's
         // per-edge table forward. ~90% of its 39,621 entries survive a 1-2 edge advance, and
         // rebuilding all of them is the largest fixed cost of a short stage.
-        let flipped_edges: Vec<(usize, usize)> = flipped
-            .iter()
-            .filter_map(|&bit| Graph::edge_for_bit_index(bit, config.graph.vertex_count))
-            .collect();
-        self.hoist_carry = Some((prev_id, flipped_edges));
+        self.hoist_carry = Some(prev_id);
         self.graph_cache.insert(graph_id, graph);
         self.clique_collection_cache.insert(graph_id, cc);
         true
@@ -1519,6 +1526,7 @@ impl Worker {
         self.clique_collection_cache.clear();
         self.hoist_cache.clear();
         self.last_base_graph_id = None;
+        self.hoist_carry = None;
     }
 
     /// Resolve the stage to work. Ok(None) means "nothing to do right now"
