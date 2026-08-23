@@ -39,6 +39,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cargo Check and Test
+        env:
+          # .cargo/config.toml sets target-cpu=native, which is right for local perf builds and
+          # wrong here: Swatinem/rust-cache keys on OS+arch+rustc+lockfile (v0-rust-build-Linux-x64-...)
+          # with NO CPU model, and all four matrix jobs run on ubuntu-latest x86_64 sharing that one
+          # key. So a proc-macro .so built with native on a wide-ISA runner gets restored onto a
+          # narrower one, and rustc SIGILLs the moment it dlopens it -- which is exactly how run
+          # 32201099089 died (crash inside libserde_derive 1.5s after "Restored from cache ... full
+          # match: true"). RUSTFLAGS replaces build.rustflags outright, pinning a portable baseline.
+          # Nothing is lost: this step is a correctness gate, and the shipped images set their own
+          # RUSTFLAGS in the Dockerfile regardless.
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           cargo check
           cargo test --verbose
