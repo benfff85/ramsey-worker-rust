@@ -52,11 +52,16 @@ fn assert_carry_matches_rebuild(before_bits: &str, after_bits: &str, label: &str
     assert!(flipped > 0, "{label}: fixtures are identical, nothing is being tested");
 
     let mut carried = full_table(&mut before);
-    let invalidated = carried.carry_forward(&before, &after);
+    let (moved, invalidated) = carried.carry_forward(&before, &after, CLIQUE_SIZE);
+    // Entries are now DERIVED rather than discarded: only the flipped edges themselves cannot be,
+    // so invalidation should equal the number of flips and everything else is corrected in place.
+    assert_eq!(
+        invalidated, flipped,
+        "{label}: only the flipped edges themselves should be invalidated"
+    );
     assert!(
-        invalidated > 0 && invalidated < VERTEX_COUNT * (VERTEX_COUNT - 1) / 2,
-        "{label}: carry invalidated {invalidated} entries — all or nothing means the predicate is \
-         not doing its job"
+        moved > 0 && moved < VERTEX_COUNT * (VERTEX_COUNT - 1) / 2,
+        "{label}: carry moved {moved} entries — all or nothing means the delta is not doing its job"
     );
 
     let mut fresh = HoistTables::new(VERTEX_COUNT);
@@ -76,7 +81,7 @@ fn assert_carry_matches_rebuild(before_bits: &str, after_bits: &str, label: &str
     assert_eq!(
         mismatches, 0,
         "{label}: {mismatches} carried entries disagree with a fresh rebuild ({flipped} edges \
-         flipped, {invalidated} entries invalidated)"
+         flipped, {moved} entries derived)"
     );
 }
 
