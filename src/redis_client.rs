@@ -198,8 +198,13 @@ impl RedisClient {
         // Returns: start_index if work available, -1 if exhausted
         //
         // The TTL rides on the SET rather than a following EXPIRE: SET clears any existing TTL, so
-        // the two must be one call to leave no window where the key is immortal. The exhausted
-        // branch deliberately does not refresh -- a stage with no work left should be allowed to go.
+        // the two must be one call to leave no window where the key is immortal.
+        //
+        // The exhausted branch refreshes too. This is the key the queue manager reads to DETECT
+        // exhaustion, and once the last unit is claimed nothing else writes it -- so without this
+        // a stage whose fleet is paused between full-claim and advance would lose the key and
+        // stall unrecoverably. Workers stop asking about a stage as soon as it advances, so the
+        // refresh cannot keep a dead stage alive.
         //
         // Caveat while a fleet is mid-upgrade: a worker on the old build still issues a bare SET,
         // which strips the TTL a new worker just set. `processed_count` (INCR) and `best_results`
@@ -211,6 +216,7 @@ impl RedisClient {
             local batch = tonumber(ARGV[1])
             local total = tonumber(ARGV[2])
             if current >= total then
+                redis.call('EXPIRE', KEYS[1], ARGV[3])
                 return -1
             end
             local new_end = current + batch
@@ -976,4 +982,38 @@ mod tests {
         );
     }
 
+
+    /// The queue manager detects exhaustion by reading this key. Once the last unit is claimed no
+    /// successful claim writes it again, so if the exhausted path did not refresh, a stage stuck
+    /// between full-claim and advance would lose the key and could never be detected as exhausted.
+    #[tokio::test]
+    #[ignore]
+    async fn an_exhausted_claim_still_refreshes_the_index_ttl() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let key = format!("stage_work_index:{}", stage);
+
+        // Claim the whole space, then shrink the TTL and ask again -- now exhausted.
+        c.claim_work_range(stage, 1000, 1000).await.unwrap().unwrap();
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(5)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        let claimed = c.claim_work_range(stage, 1000, 1000).await.unwrap();
+        let ttl = ttl_of(&mut c, &key).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        assert!(claimed.is_none(), "the space was fully claimed");
+        assert!(
+            ttl > 5,
+            "an exhausted claim must still push the TTL back out, got {}",
+            ttl
+        );
+    }
 }
