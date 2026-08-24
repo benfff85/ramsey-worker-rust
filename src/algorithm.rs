@@ -387,13 +387,12 @@ fn bron_kerbosch_count_inplace(
 
     // Second-to-last level inline: each child would immediately take the leaf
     // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
+    // The AND and the popcount are fused so P is never copied.
     if depth == clique_size - 2 {
         let mut count = 0;
         let candidates = *p;
         for v in candidates.iter_set_bits() {
-            let mut pv = *p;
-            pv.and_assign(&adjacency[v]);
-            count += pv.cardinality() as i32;
+            count += p.and_cardinality(&adjacency[v]) as i32;
             p.clear(v);
         }
         return count;
@@ -401,7 +400,18 @@ fn bron_kerbosch_count_inplace(
 
     let mut count = 0;
     let candidates = *p;
+    // `p` loses one member per iteration, so the entry bound is re-checkable as we go: a child
+    // gets `new_p` = p ∩ adj[v] with v excluded, hence |new_p| <= remaining - 1. Once
+    // `remaining + depth < clique_size` every remaining candidate provably contributes 0, so the
+    // loop can stop rather than making calls that return 0 after a copy, an AND and a popcount.
+    // Count-preserving by construction. `p` is a caller-owned local that is not read afterwards,
+    // so leaving it partially cleared is safe.
+    let mut remaining = p_card;
     for v in candidates.iter_set_bits() {
+        if remaining + depth < clique_size {
+            break;
+        }
+        remaining -= 1;
         let mut new_p = *p;
         new_p.and_assign(&adjacency[v]);
         count += bron_kerbosch_count_inplace(depth + 1, &mut new_p, adjacency, clique_size);
