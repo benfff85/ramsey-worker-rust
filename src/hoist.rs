@@ -67,6 +67,99 @@ pub enum CrossPairs {
 ///
 /// `red_adj` is the BASE graph's red adjacency (unflipped).
 #[inline]
+/// Number of k-cliques containing both edges' endpoints in which **every edge except `e` and `f`**
+/// carries the opposite colour to `e`.
+///
+/// This is the exact amount by which `single(e)` moves when `f` is flipped, and it is what lets a
+/// carried hoist entry be *derived* rather than rebuilt.
+///
+/// # Why this is the delta
+///
+/// `single_G(e)` counts k-cliques that become monochromatic when `e` flips — i.e. cliques
+/// containing `e` whose every other edge already has the colour `e` is about to become, `NOT c_e`.
+/// Flipping some other edge `f` cannot change `c_e`, so the target colour is unchanged and the only
+/// cliques whose membership can move are those containing **both** `e` and `f`. For such a clique,
+/// with all its other edges already `NOT c_e`:
+///
+/// * before the flip it qualifies iff `c_f == NOT c_e`
+/// * after the flip it qualifies iff `c_f == c_e`
+///
+/// Exactly one holds, so the whole population `N` moves in one direction:
+///
+/// ```text
+/// single_{G xor f}(e) = single_G(e) + N   when c_f == c_e
+/// single_{G xor f}(e) = single_G(e) - N   when c_f != c_e
+/// ```
+///
+/// Sanity check against what this module already did: when `cross_pairs(e, f) == Mixed` the cross
+/// edges cannot all be `NOT c_e`, so `N == 0` — the entries `carry_forward` used to keep are
+/// precisely the `N == 0` case of this formula.
+///
+/// # Why it is cheap
+///
+/// `W = V(e) | V(f)` is 3 or 4 vertices. If any edge inside `W` other than `e` and `f` is the wrong
+/// colour, `N` is zero and we are done — which is the common case. Otherwise it is a count of
+/// `(k - |W|)`-cliques in the common `NOT c_e`-neighbourhood of `W`, about 18 vertices at n=282,
+/// against the ~168 us uncapped traversal a rebuild costs.
+pub fn shared_created(graph: &Graph, clique_size: usize, e: (usize, usize), f: (usize, usize)) -> i32 {
+    let norm = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    let (ne, nf) = (norm(e.0, e.1), norm(f.0, f.1));
+    if ne == nf {
+        return 0;
+    }
+    // Count in the colour e is about to BECOME. `complement_adjacency` is kept in lockstep, so
+    // this is a borrow rather than a rebuild.
+    let c_e = graph.adjacency[ne.0].get(ne.1);
+    let adj: &[BitMatrix] = if c_e {
+        &graph.complement_adjacency
+    } else {
+        &graph.adjacency
+    };
+
+    // Stack-only: this runs once per table entry per flipped edge (~40k times a stage), so a heap
+    // allocation here would cost more than the work it is wrapping.
+    let mut buf = [ne.0, ne.1, nf.0, nf.1];
+    buf.sort_unstable();
+    let mut len = 0usize;
+    for i in 0..4 {
+        if i == 0 || buf[i] != buf[i - 1] {
+            buf[len] = buf[i];
+            len += 1;
+        }
+    }
+    let w = &buf[..len];
+    if w.len() > clique_size {
+        return 0;
+    }
+
+    // Every edge inside W except e and f must already be the target colour.
+    for i in 0..w.len() {
+        for j in (i + 1)..w.len() {
+            let pr = (w[i], w[j]);
+            if pr == ne || pr == nf {
+                continue;
+            }
+            if !adj[pr.0].get(pr.1) {
+                return 0;
+            }
+        }
+    }
+    if w.len() == clique_size {
+        return 1; // the clique is exactly W
+    }
+
+    // Extend through the common target-colour neighbourhood of every vertex of W.
+    //
+    // NOTE on the contract: `count_cliques_through_vertex_set` documents that its seeds must
+    // already form a clique in this colour, and W deliberately does NOT — `e` is by definition the
+    // opposite colour, and `f` is exempt because its colour is the thing being flipped. That is
+    // sound here because the function only ever intersects the seeds' adjacency rows and clears
+    // them, i.e. it counts EXTENSIONS and never inspects edges among the seeds; the W-internal
+    // colours have already been checked above, with e and f correctly exempted. The exhaustive
+    // test against the brute-force definition is what holds this down.
+    count_cliques_through_vertex_set(adj, w, clique_size)
+}
+
 pub fn cross_pairs(red_adj: &[BitMatrix], r: (usize, usize), b: (usize, usize)) -> CrossPairs {
     let (x, y) = r;
     let (u, v) = b;
@@ -293,13 +386,17 @@ impl HoistTables {
     /// invalidates ~21% of the table against ~10% genuinely changed, in ~0.7 ms against a ~6.7 s
     /// rebuild. Entries left UNKNOWN are refilled by the existing lazy/sharded paths, so a carried
     /// table is indistinguishable from a fresh one to every caller.
-    pub fn carry_forward(&mut self, before: &Graph, after: &Graph) -> usize {
+    pub fn carry_forward(
+        &mut self,
+        before: &Graph,
+        after: &Graph,
+        clique_size: usize,
+    ) -> (usize, usize) {
         // The delta is DERIVED from the two graphs rather than taken as an argument. A caller can
         // easily hold a stale edge list — a stage that never engaged the hoist followed by one that
-        // took the full-build path — and a wrong list silently KEEPS entries the real delta
-        // invalidates, feeding a stale `created` to every unit of the stage and publishing it to
+        // took the full-build path — and a wrong list silently corrupts every entry it should have
+        // moved, feeding bad `created` values to every unit of the stage and publishing them to
         // peers. Nothing downstream catches that, so the delta must not be trusted from outside.
-        // Cost is one bit compare per edge (~39,621) against a ~6.7 s rebuild.
         let mut flipped: Vec<(usize, usize)> = Vec::new();
         for u in 0..self.vertex_count {
             for v in (u + 1)..self.vertex_count {
@@ -308,28 +405,46 @@ impl HoistTables {
                 }
             }
         }
-        let mut invalidated = 0;
-        for u in 0..self.vertex_count {
-            for v in (u + 1)..self.vertex_count {
-                let i = self.index(u, v);
-                if self.single[i] == UNKNOWN {
-                    continue; // nothing to keep or lose
-                }
-                let e = (u, v);
-                let stale = flipped.iter().any(|&f| {
-                    e == f
-                        || cross_pairs(&before.adjacency, e, f) != CrossPairs::Mixed
-                        || cross_pairs(&after.adjacency, e, f) != CrossPairs::Mixed
-                });
-                if stale {
-                    self.single[i] = UNKNOWN;
-                    invalidated += 1;
+
+        // Entries are UPDATED, not discarded. `shared_created` gives the exact amount `single(e)`
+        // moves when `f` flips, so the previous behaviour — throwing away ~23% of the table and
+        // rebuilding it at ~168 us an entry — is replaced by an arithmetic correction on the few
+        // entries that actually move. Only the flipped edges themselves cannot be derived (their
+        // own `single` measures the reverse flip), and there are one or two of those per stage.
+        let mut moved = 0usize;
+        let mut invalidated = 0usize;
+        let mut working = before.clone();
+        for &f in &flipped {
+            let c_f = working.adjacency[f.0].get(f.1);
+            for u in 0..self.vertex_count {
+                for v in (u + 1)..self.vertex_count {
+                    let i = self.index(u, v);
+                    if self.single[i] == UNKNOWN {
+                        continue;
+                    }
+                    let e = (u, v);
+                    if e == f {
+                        self.single[i] = UNKNOWN;
+                        invalidated += 1;
+                        continue;
+                    }
+                    let shared = shared_created(&working, clique_size, e, f);
+                    if shared != 0 {
+                        let c_e = working.adjacency[u].get(v);
+                        self.single[i] += if c_f == c_e { shared } else { -shared };
+                        moved += 1;
+                    }
                 }
             }
+            working.flip_edges(&[WorkUnitEdge {
+                vertex_one: f.0 as u16,
+                vertex_two: f.1 as u16,
+            }]);
         }
-        // A carried table is a NEW table as far as co-operation and instrumentation go: it still
-        // wants peers' slices for what it just invalidated, and its fill counters belong to the
-        // stage that built them, not this one.
+
+        // A carried table is a NEW table as far as co-operation and instrumentation go: its fill
+        // counters belong to the stage that built them, not this one. The refresh budget is reset
+        // so a table with holes (the flipped edges) can still ask peers for them.
         self.refresh_budget = INITIAL_REFRESH_BUDGET;
         self.fills = 0;
         self.fill_nanos = 0;
@@ -337,7 +452,7 @@ impl HoistTables {
         self.fills_blue = 0;
         self.slice_fills = 0;
         self.in_slice_fill = false;
-        invalidated
+        (moved, invalidated)
     }
 
     /// Whether it is still worth asking Redis for slices we do not have.
@@ -908,7 +1023,7 @@ mod tests {
                         carried.single_created(&mut before, k, u, v);
                     }
                 }
-                carried.carry_forward(&before, &after);
+                carried.carry_forward(&before, &after, k);
 
                 let mut fresh = HoistTables::new(n);
                 for u in 0..n {
@@ -942,9 +1057,13 @@ mod tests {
             }
         }
         let total = n * (n - 1) / 2;
-        let invalidated = carried.carry_forward(&before, &after);
-        assert_eq!(carried.filled(), total - invalidated, "filled count must drop by exactly the invalidated count");
-        assert!(invalidated < total, "carry invalidated the entire table ({invalidated}/{total}) -- no saving");
+        let (moved, invalidated) = carried.carry_forward(&before, &after, k);
+        // Only the flipped edge itself cannot be derived, so exactly one entry is dropped and the
+        // rest are corrected in place. This is what replaced discarding ~23% of the table.
+        assert_eq!(invalidated, 1, "only the flipped edge itself should be invalidated");
+        assert_eq!(carried.filled(), total - 1, "everything except the flipped edge must survive");
+        assert!(moved > 0, "a single flip must move at least one entry, or the carry is a no-op");
+        assert!(moved < total, "a single flip must not move the entire table");
     }
 
     /// A carry must be correct between ANY two graphs, not just a parent and the child one stage
@@ -968,7 +1087,7 @@ mod tests {
                 carried.single_created(&mut a, k, u, v);
             }
         }
-        carried.carry_forward(&a, &c);
+        carried.carry_forward(&a, &c, k);
 
         let mut fresh = HoistTables::new(n);
         let mut probe = c.clone();
@@ -982,4 +1101,143 @@ mod tests {
         }
     }
 
+
+    /// Brute-force reference for `shared_created`: enumerate every k-subset containing both edges'
+    /// endpoints and apply the definition literally.
+    fn brute_shared(g: &Graph, k: usize, e: (usize, usize), f: (usize, usize), n: usize) -> i32 {
+        let c_e = g.adjacency[e.0].get(e.1);
+        let t = !c_e; // the colour every edge except e and f must have
+        let mut w = vec![e.0, e.1, f.0, f.1];
+        w.sort_unstable();
+        w.dedup();
+        if w.len() > k {
+            return 0;
+        }
+        let norm = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+        let (ne, nf) = (norm(e.0, e.1), norm(f.0, f.1));
+        let mut count = 0;
+        // every subset of size k containing w
+        let rest: Vec<usize> = (0..n).filter(|z| !w.contains(z)).collect();
+        let need = k - w.len();
+        let mut idx: Vec<usize> = (0..need).collect();
+        loop {
+            if need == 0 || idx[need - 1] < rest.len() {
+                let mut c = w.clone();
+                for &i in idx.iter().take(need) {
+                    c.push(rest[i]);
+                }
+                let mut ok = true;
+                'pair: for i in 0..c.len() {
+                    for j in (i + 1)..c.len() {
+                        let pr = norm(c[i], c[j]);
+                        if pr == ne || pr == nf {
+                            continue;
+                        }
+                        if g.adjacency[pr.0].get(pr.1) != t {
+                            ok = false;
+                            break 'pair;
+                        }
+                    }
+                }
+                if ok {
+                    count += 1;
+                }
+            }
+            if need == 0 {
+                break;
+            }
+            // next combination
+            let mut i = need;
+            loop {
+                if i == 0 {
+                    return count;
+                }
+                i -= 1;
+                if idx[i] + 1 <= rest.len() - (need - i) {
+                    idx[i] += 1;
+                    for j in (i + 1)..need {
+                        idx[j] = idx[j - 1] + 1;
+                    }
+                    break;
+                }
+            }
+            if idx[need - 1] >= rest.len() {
+                break;
+            }
+        }
+        count
+    }
+
+    /// `shared_created` is the whole basis of deriving a carried entry instead of rebuilding it.
+    /// Checked exhaustively against the definition, over every ordered pair of distinct edges.
+    #[test]
+    fn shared_created_matches_the_definition() {
+        for (n, k, seed) in [(8usize, 4usize, 5u64), (9, 4, 7), (9, 5, 11)] {
+            let g = Graph::from_bitstring(&bits(n, seed), n);
+            for u in 0..n {
+                for v in (u + 1)..n {
+                    for x in 0..n {
+                        for y in (x + 1)..n {
+                            if (u, v) == (x, y) {
+                                continue;
+                            }
+                            let want = brute_shared(&g, k, (u, v), (x, y), n);
+                            let got = shared_created(&g, k, (u, v), (x, y));
+                            assert_eq!(
+                                want, got,
+                                "n={n} k={k} e=({u},{v}) f=({x},{y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The identity the incremental carry rests on:
+    ///   single_{G xor f}(e) = single_G(e) +- shared_created(G, e, f)
+    /// with the sign set by whether f already had e's colour. If this holds, a carried entry never
+    /// needs rebuilding.
+    #[test]
+    fn the_carry_identity_holds_for_every_edge_and_every_flip() {
+        for (n, k, seed) in [(8usize, 4usize, 5u64), (9, 4, 7), (9, 5, 11), (10, 5, 3)] {
+            let base = bits(n, seed);
+            for x in 0..n {
+                for y in (x + 1)..n {
+                    let f = (x, y);
+                    let mut g = Graph::from_bitstring(&base, n);
+                    let mut after = g.clone();
+                    after.flip_edges(&[edge(x, y)]);
+
+                    for u in 0..n {
+                        for v in (u + 1)..n {
+                            if (u, v) == f {
+                                continue;
+                            }
+                            let e = (u, v);
+                            let c_e = g.adjacency[u].get(v);
+                            let c_f = g.adjacency[x].get(y);
+                            let nshared = shared_created(&g, k, e, f);
+
+                            let mut t0 = HoistTables::new(n);
+                            let before_val = t0.single_created(&mut g, k, u, v);
+                            let mut t1 = HoistTables::new(n);
+                            let mut after_mut = after.clone();
+                            let after_val = t1.single_created(&mut after_mut, k, u, v);
+
+                            let predicted = if c_f == c_e {
+                                before_val + nshared
+                            } else {
+                                before_val - nshared
+                            };
+                            assert_eq!(
+                                after_val, predicted,
+                                "n={n} k={k} e={e:?} f={f:?}: before={before_val}                                  shared={nshared} c_e={c_e} c_f={c_f}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

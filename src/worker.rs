@@ -798,18 +798,20 @@ impl Worker {
                     && self.graph_cache.contains_key(&base_graph_id)
                 {
                     let mut t = self.hoist_cache[&parent_id].clone();
-                    let invalidated = t.carry_forward(
+                    let (moved, invalidated) = t.carry_forward(
                         &self.graph_cache[&parent_id],
                         &self.graph_cache[&base_graph_id],
+                        self.clique_size,
                     );
                     let kept = t.filled();
                     tables = t;
                     log_info!(
-                        "Hoist carried graph {} -> {}: kept {} of {} entries, invalidated {}",
+                        "Hoist carried graph {} -> {}: kept {} of {} entries, {} derived, {} invalidated",
                         parent_id,
                         base_graph_id,
                         kept,
                         graph_vertex_count * (graph_vertex_count - 1) / 2,
+                        moved,
                         invalidated
                     );
                 }
