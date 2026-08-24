@@ -107,3 +107,26 @@ fn carry_survives_two_stage_advances_at_once() {
     let g = bases();
     assert_carry_matches_rebuild(&g[0], &g[2], "993915 -> 993917 (skipped a stage)");
 }
+
+/// Ground-truth check on the counting kernel itself, independent of anything in this repo today.
+///
+/// These three graphs' `clique_count` values were computed and recorded in the campaign database by
+/// an EARLIER build, so they are an external oracle: if a kernel optimisation ever changes a count,
+/// this fails even though every internal consistency test still agrees with itself. Counting all
+/// mono-8-cliques of a 282-vertex graph exercises `bron_kerbosch_count_inplace` at full production
+/// depth, which is where ~74% of worker compute sits.
+#[test]
+#[ignore]
+fn the_kernel_reproduces_recorded_campaign_clique_counts() {
+    // (graph id, clique_count as recorded in `ramsey-dev`.graph)
+    let expected = [("993915", 744488i32), ("993916", 744489), ("993917", 744489)];
+    let g = bases();
+    for (i, (id, want)) in expected.iter().enumerate() {
+        let mut graph = Graph::from_bitstring(&g[i], VERTEX_COUNT);
+        let got = ramsey_worker_rust::algorithm::get_cliques_comprehensive(&mut graph, CLIQUE_SIZE);
+        assert_eq!(
+            got, *want,
+            "graph {id}: kernel counted {got} mono-{CLIQUE_SIZE}-cliques, campaign DB recorded {want}"
+        );
+    }
+}

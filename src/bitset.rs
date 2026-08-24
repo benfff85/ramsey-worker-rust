@@ -127,6 +127,20 @@ impl BitMatrix {
 
     /// Perform logical AND with another BitMatrix in place (unrolled for 5 words)
     #[inline]
+    /// `|self & other|` without materialising the intersection.
+    ///
+    /// The counting kernel's second-to-last level does exactly this once per candidate, and it is
+    /// the most-executed operation in the worker: copy P, AND it with a row, popcount, discard.
+    /// Fusing the three removes a 40-byte copy and store per candidate.
+    #[inline]
+    pub fn and_cardinality(&self, other: &BitMatrix) -> u32 {
+        (self.data[0] & other.data[0]).count_ones()
+            + (self.data[1] & other.data[1]).count_ones()
+            + (self.data[2] & other.data[2]).count_ones()
+            + (self.data[3] & other.data[3]).count_ones()
+            + (self.data[4] & other.data[4]).count_ones()
+    }
+
     pub fn and_assign(&mut self, other: &BitMatrix) {
         self.data[0] &= other.data[0];
         self.data[1] &= other.data[1];
