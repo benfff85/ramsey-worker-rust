@@ -106,6 +106,16 @@ const STAGE_CHECK_INTERVAL_UNITS: i64 = 4096;
 /// this threshold only became worth having after that change.
 const HOIST_WAIT_SKIP_PERMILLE: u32 = 950;
 
+/// Whether this increment is the one that carried a stage's processed count over its total —
+/// i.e. whether this worker is the one that finished the stage.
+///
+/// Redis `INCRBY` is atomic, so exactly one worker's return value straddles `total_pairs`. That
+/// worker announces the completion and every other reporter stays quiet, which is what keeps the
+/// queue manager from getting one event per straggler.
+fn increment_completed_stage(new_count: i64, added: i64, total_pairs: i64) -> bool {
+    total_pairs > 0 && new_count >= total_pairs && new_count - added < total_pairs
+}
+
 /// Whether peers' slices are still worth waiting for, given what we already hold.
 fn should_wait_for_coverage(known: usize, total: usize) -> bool {
     total > 0 && (known * 1000) < (total * HOIST_WAIT_SKIP_PERMILLE as usize)
@@ -1217,12 +1227,18 @@ impl Worker {
             self.mw_client.submit_results(&processed_results).await?;
         }
 
-        // Update processed count
+        // Update processed count, and announce the stage if this report is the one that finished
+        // it. The QM otherwise only notices on its next poll, which floors the stage duration.
         if units_done > 0 {
             if let Some(redis) = self.redis_client.as_mut() {
-                let _ = redis
+                if let Ok(new_count) = redis
                     .increment_processed_count(stage_id, campaign_id_for_counter, units_done)
-                    .await;
+                    .await
+                {
+                    if increment_completed_stage(new_count, units_done, total_pairs) {
+                        let _ = redis.publish_stage_exhausted(stage_id).await;
+                    }
+                }
             }
         }
 
@@ -1831,4 +1847,40 @@ mod tests {
         assert!(should_wait_for_coverage(at - 1, total));
     }
 
+
+    /// Exactly one worker must announce a stage's completion, or the queue manager gets a burst of
+    /// redundant events every time a straggler reports. `INCRBY` is atomic, so the worker whose
+    /// increment carried the count over the total is the unique one that sees the crossing.
+    #[test]
+    fn only_the_increment_that_crosses_the_total_completes_the_stage() {
+        // new_count, added, total
+        assert!(
+            increment_completed_stage(100, 10, 95),
+            "carried the count past the total"
+        );
+        assert!(
+            increment_completed_stage(95, 10, 95),
+            "landed exactly on the total"
+        );
+        assert!(
+            increment_completed_stage(95, 1, 95),
+            "a single-unit increment can be the one that finishes it"
+        );
+        assert!(
+            !increment_completed_stage(110, 10, 95),
+            "a straggler reporting after the total was already passed must stay quiet"
+        );
+        assert!(
+            !increment_completed_stage(90, 10, 95),
+            "work still outstanding"
+        );
+    }
+
+    /// A stage whose total is unknown (config missing, or a strategy that does not enumerate a
+    /// fixed space) must never be announced complete — the queue manager would advance it early.
+    #[test]
+    fn an_unknown_total_never_completes_a_stage() {
+        assert!(!increment_completed_stage(100, 10, 0));
+        assert!(!increment_completed_stage(100, 10, -1));
+    }
 }

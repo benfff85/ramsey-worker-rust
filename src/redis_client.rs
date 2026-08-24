@@ -101,6 +101,16 @@ fn parse_stage_advance(payload: &str) -> Option<(i32, i32)> {
 /// improvement. Must match the QM's RedisListenerConfig.BEST_RESULT_CHANNEL.
 pub const BEST_RESULT_CHANNEL: &str = "best_result_events";
 
+/// Pub/sub channel workers announce a stage's COMPLETION on — the moment its last work unit is
+/// reported. Must match the QM's RedisListenerConfig.STAGE_EXHAUSTED_CHANNEL.
+///
+/// Separate from [`BEST_RESULT_CHANNEL`] because the two want opposite handling. A new best is the
+/// weakest qualifying improvement so far, so the QM deliberately waits out a settle window for a
+/// better one. Completion is the opposite: every unit in the work space has been evaluated and
+/// reported, so the top-N set is FINAL and nothing better can arrive. Waiting buys nothing and
+/// costs the fleet its whole tail, so this one is acted on immediately.
+pub const STAGE_EXHAUSTED_CHANNEL: &str = "stage_exhausted_events";
+
 /// Best result for a stage - stored in Redis for stage progression
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BestResult {
@@ -747,6 +757,25 @@ impl RedisClient {
         let _: i64 = self
             .connection
             .publish(BEST_RESULT_CHANNEL, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Announce that a stage's last work unit has been reported, so the queue manager can advance
+    /// immediately instead of discovering it on its next poll.
+    ///
+    /// Measured on campaign 3 before this existed: 66% of exhaustion-driven stages ended within
+    /// 100 ms of a whole second (a flat distribution would be 20%), because the poll interval
+    /// floored the stage duration. That cost ~500 ms of a 4128 ms mean stage — ~11.6% of fleet
+    /// wall-clock spent with every worker idle and nothing left to claim.
+    ///
+    /// Fire-and-forget like [`Self::publish_best_result`]: pub/sub has no delivery guarantee and
+    /// the QM keeps its polling fallback, so a dropped message costs latency, never correctness.
+    pub async fn publish_stage_exhausted(&mut self, stage_id: i32) -> Result<(), Box<dyn Error>> {
+        let payload = format!("{{\"stageId\":{}}}", stage_id);
+        let _: i64 = self
+            .connection
+            .publish(STAGE_EXHAUSTED_CHANNEL, payload)
             .await?;
         Ok(())
     }
