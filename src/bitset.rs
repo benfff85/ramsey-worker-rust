@@ -127,6 +127,25 @@ impl BitMatrix {
 
     /// Perform logical AND with another BitMatrix in place (unrolled for 5 words)
     #[inline]
+    /// AND `other` into `self` and return the resulting popcount, in one pass.
+    ///
+    /// The counting kernel's general levels build a child candidate set and the child then
+    /// immediately measures it. Done separately that is two passes over the words; fused it is one,
+    /// and the caller can hand the count down so the child never recomputes it.
+    #[inline]
+    pub fn and_assign_cardinality(&mut self, other: &BitMatrix) -> u32 {
+        self.data[0] &= other.data[0];
+        self.data[1] &= other.data[1];
+        self.data[2] &= other.data[2];
+        self.data[3] &= other.data[3];
+        self.data[4] &= other.data[4];
+        self.data[0].count_ones()
+            + self.data[1].count_ones()
+            + self.data[2].count_ones()
+            + self.data[3].count_ones()
+            + self.data[4].count_ones()
+    }
+
     /// `|self & other|` without materialising the intersection.
     ///
     /// The counting kernel's second-to-last level does exactly this once per candidate, and it is
