@@ -366,11 +366,25 @@ fn bron_kerbosch_count_inplace(
     adjacency: &[BitMatrix],
     clique_size: usize,
 ) -> i32 {
+    let card = p.cardinality() as usize;
+    bron_kerbosch_count_inplace_card(depth, p, card, adjacency, clique_size)
+}
+
+/// As above, but the caller has already measured `p`.
+///
+/// Every general level builds a child's candidate set and the child then immediately measures it.
+/// Fusing the AND with its popcount and handing the result down removes one full pass over the
+/// words per node — and this is the hottest recursion in the worker.
+fn bron_kerbosch_count_inplace_card(
+    depth: usize,
+    p: &mut BitMatrix,
+    p_card: usize,
+    adjacency: &[BitMatrix],
+    clique_size: usize,
+) -> i32 {
     if depth == clique_size {
         return 1;
     }
-
-    let p_card = p.cardinality() as usize;
 
     // Leaf shortcut: P is the set of common neighbors of every committed
     // vertex, so with one slot left each candidate completes exactly one
@@ -413,8 +427,14 @@ fn bron_kerbosch_count_inplace(
         }
         remaining -= 1;
         let mut new_p = *p;
-        new_p.and_assign(&adjacency[v]);
-        count += bron_kerbosch_count_inplace(depth + 1, &mut new_p, adjacency, clique_size);
+        let new_card = new_p.and_assign_cardinality(&adjacency[v]) as usize;
+        count += bron_kerbosch_count_inplace_card(
+            depth + 1,
+            &mut new_p,
+            new_card,
+            adjacency,
+            clique_size,
+        );
         p.clear(v);
     }
 
@@ -467,9 +487,7 @@ fn bron_kerbosch_count_no_x_with_limit(
         let mut count = 0;
         let candidates = *p;
         for v in candidates.iter_set_bits() {
-            let mut pv = *p;
-            pv.and_assign(&adjacency[v]);
-            count += pv.cardinality() as i32;
+            count += p.and_cardinality(&adjacency[v]) as i32;
             if count > limit {
                 return (count, true);
             }
