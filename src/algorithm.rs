@@ -399,6 +399,36 @@ fn bron_kerbosch_count_inplace_card(
         return 0;
     }
 
+    // Third-to-last level inline: every child of this level is a `clique_size - 2` node, whose
+    // whole body is the fused loop just below. Folding it here removes a call and its three entry
+    // branches per candidate, and this level spawns the most children of any general level.
+    //
+    // Identical by construction: the child's only non-loop exits are `p_card < 2` (reproduced as
+    // the `cv >= 2` guard) and the bound check, which cannot fail here because `cv >= 2` implies
+    // `(depth + 1) + cv >= clique_size`.
+    if depth == clique_size - 3 {
+        let mut count = 0;
+        let candidates = *p;
+        let mut remaining = p_card;
+        for v in candidates.iter_set_bits() {
+            if remaining + depth < clique_size {
+                break;
+            }
+            remaining -= 1;
+            let mut pv = *p;
+            let cv = pv.and_assign_cardinality(&adjacency[v]) as usize;
+            if cv >= 2 {
+                let inner = pv;
+                for w in inner.iter_set_bits() {
+                    count += pv.and_cardinality(&adjacency[w]) as i32;
+                    pv.clear(w);
+                }
+            }
+            p.clear(v);
+        }
+        return count;
+    }
+
     // Second-to-last level inline: each child would immediately take the leaf
     // shortcut, so fold it in — one AND + popcount per candidate, no recursion.
     // The AND and the popcount are fused so P is never copied.
