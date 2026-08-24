@@ -156,6 +156,20 @@ pub struct RedisClient {
 /// hour expires.
 const STAGE_KEY_TTL_SECS: i64 = 3600;
 
+/// How finely the end of a stage's work space is handed out.
+///
+/// A stage ends when its SLOWEST worker finishes, so a worker that claims a full batch when the
+/// space is nearly drained holds the whole fleet idle for that batch's duration -- measured at
+/// ~177 ms against a ~2.9 s stage. Handing out at most `1/N` of what is left lets workers converge
+/// on the end of the stage together instead.
+///
+/// The floor of `batch / N` is what keeps this bounded. Without it the drain is geometric
+/// (`remaining * (N-1)/N` per claim) and never terminates cleanly; with it the tail costs about
+/// `log(N)/log(N/(N-1)) + N` claims, roughly 24 at N=8 against 8 untapered. Each extra claim is a
+/// Redis round trip plus a worker cycle, so this trades ~16 cheap claims per stage against ~77 ms
+/// of idle per worker per stage.
+const STAGE_TAIL_SPLIT: i64 = 8;
+
 impl RedisClient {
     /// Create a new Redis client with timeout configuration
     pub async fn new(host: &str, port: u16) -> Result<Self, Box<dyn Error>> {
@@ -196,6 +210,10 @@ impl RedisClient {
     /// Prevents counter from exceeding total_pairs by checking before incrementing.
     /// Returns Some((start_index, end_index)) if work is available, None if all work claimed.
     /// Includes retry logic for transient network failures.
+    ///
+    /// The returned range may be SMALLER than `batch_size`: near the end of a stage the script
+    /// tapers what it hands out (see [`STAGE_TAIL_SPLIT`]) so the fleet finishes together rather
+    /// than idling behind one worker's last full batch. Always use the returned end.
     pub async fn claim_work_range(
         &mut self,
         stage_id: i32,
@@ -223,15 +241,22 @@ impl RedisClient {
         let script = redis::Script::new(
             r#"
             local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-            local batch = tonumber(ARGV[1])
             local total = tonumber(ARGV[2])
             if current >= total then
                 redis.call('EXPIRE', KEYS[1], ARGV[3])
-                return -1
+                return {-1, -1}
             end
+            local batch = tonumber(ARGV[1])
+            local split = tonumber(ARGV[4])
+            local remaining = total - current
+            local share = math.ceil(remaining / split)
+            local minimum = math.ceil(batch / split)
+            if share < minimum then share = minimum end
+            if batch > share then batch = share end
             local new_end = current + batch
+            if new_end > total then new_end = total end
             redis.call('SET', KEYS[1], new_end, 'EX', ARGV[3])
-            return current
+            return {current, new_end}
             "#,
         );
 
@@ -242,20 +267,22 @@ impl RedisClient {
                 .arg(batch_size)
                 .arg(total_pairs)
                 .arg(STAGE_KEY_TTL_SECS)
-                .invoke_async::<i64>(&mut self.connection)
+                .arg(STAGE_TAIL_SPLIT)
+                .invoke_async::<(i64, i64)>(&mut self.connection)
                 .await
             {
-                Ok(start_index) => {
+                Ok((start_index, end_index)) => {
                     if start_index < 0 {
                         // All work has been claimed
                         return Ok(None);
                     }
 
-                    let end_index = start_index + batch_size;
-                    // Clamp end_index to total_pairs
-                    let clamped_end = end_index.min(total_pairs);
-
-                    return Ok(Some((start_index, clamped_end)));
+                    // The GRANTED end, straight from the script. The caller must never re-derive
+                    // it as start + batch_size: the script may hand out less than was asked for,
+                    // and a caller that assumed otherwise would process units another worker
+                    // claimed -- duplicated effort, and a counter that no longer means what the
+                    // queue manager thinks it means.
+                    return Ok(Some((start_index, end_index)));
                 }
                 Err(e) => {
                     if attempt == 2 {
@@ -1022,8 +1049,9 @@ mod tests {
         let stage = scratch_stage_id();
         let key = format!("stage_work_index:{}", stage);
 
-        // Claim the whole space, then shrink the TTL and ask again -- now exhausted.
-        c.claim_work_range(stage, 1000, 1000).await.unwrap().unwrap();
+        // Drain the whole space, then shrink the TTL and ask again -- now exhausted. Drained in a
+        // loop rather than one call because the tail taper hands out the last stretch in pieces.
+        while c.claim_work_range(stage, 1000, 1000).await.unwrap().is_some() {}
         let _: () = redis::cmd("EXPIRE")
             .arg(&key)
             .arg(5)
@@ -1043,6 +1071,105 @@ mod tests {
             ttl > 5,
             "an exhausted claim must still push the TTL back out, got {}",
             ttl
+        );
+    }
+
+    /// Drain a whole space the way a fleet does and record every range handed out.
+    async fn drain(c: &mut RedisClient, stage: i32, batch: i64, total: i64) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        while let Some(r) = c.claim_work_range(stage, batch, total).await.unwrap() {
+            out.push(r);
+            assert!(out.len() < 10_000, "claiming did not terminate");
+        }
+        out
+    }
+
+    /// The property everything else depends on: every unit is claimed exactly once. A gap is a
+    /// silently skipped work unit -- a possible improvement the fleet never evaluates -- and an
+    /// overlap is two workers duplicating effort. This guards the tiling across the taper change.
+    #[tokio::test]
+    #[ignore]
+    async fn claims_tile_the_whole_space_exactly_once() {
+        let mut c = test_client().await;
+        for (batch, total) in [(1000i64, 10_000i64), (1000, 10_500), (997, 10_000), (10_000, 999)] {
+            let stage = scratch_stage_id();
+            let ranges = drain(&mut c, stage, batch, total).await;
+            let _: () = redis::cmd("DEL")
+                .arg(format!("stage_work_index:{}", stage))
+                .query_async(&mut c.connection)
+                .await
+                .unwrap();
+
+            assert_eq!(ranges[0].0, 0, "batch={batch} total={total}: must start at 0");
+            for w in ranges.windows(2) {
+                assert_eq!(
+                    w[0].1, w[1].0,
+                    "batch={batch} total={total}: gap or overlap between {:?} and {:?}",
+                    w[0], w[1]
+                );
+            }
+            assert_eq!(
+                ranges.last().unwrap().1,
+                total,
+                "batch={batch} total={total}: must finish exactly at the total"
+            );
+            for r in &ranges {
+                assert!(r.1 > r.0, "batch={batch} total={total}: empty range {:?}", r);
+            }
+        }
+    }
+
+    /// A stage ends when its SLOWEST worker finishes, so handing the last worker a full-size batch
+    /// leaves the rest of the fleet idle for its whole duration. The tail is split instead, so
+    /// workers converge on the end of the stage together.
+    #[tokio::test]
+    #[ignore]
+    async fn the_tail_is_handed_out_in_smaller_pieces() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let (batch, total) = (1000i64, 100_000i64);
+
+        let ranges = drain(&mut c, stage, batch, total).await;
+        let _: () = redis::cmd("DEL")
+            .arg(format!("stage_work_index:{}", stage))
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+
+        let sizes: Vec<i64> = ranges.iter().map(|(s, e)| e - s).collect();
+        let last = *sizes.last().unwrap();
+        assert!(
+            last < batch,
+            "the final claim should be a fraction of a full batch, got {last} of {batch}"
+        );
+        assert!(
+            sizes[0] == batch,
+            "a claim taken while the stage is still full must not be tapered, got {}",
+            sizes[0]
+        );
+    }
+
+    /// Tapering must not degenerate into a flood of tiny claims: each one costs a Redis round trip
+    /// and a whole worker cycle, which is exactly the overhead the batch size exists to amortise.
+    #[tokio::test]
+    #[ignore]
+    async fn tapering_does_not_explode_the_claim_count() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let (batch, total) = (1000i64, 100_000i64);
+
+        let ranges = drain(&mut c, stage, batch, total).await;
+        let _: () = redis::cmd("DEL")
+            .arg(format!("stage_work_index:{}", stage))
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+
+        let untapered = (total + batch - 1) / batch; // 100
+        assert!(
+            (ranges.len() as i64) < untapered * 2,
+            "taper turned {untapered} claims into {}; the tail must stay bounded",
+            ranges.len()
         );
     }
 }

@@ -152,10 +152,12 @@ const TARGET_BATCH_LOOP_MILLIS: u128 = 200;
 /// targets that — so this only needs to stay above what the target implies at plausible throughput.
 /// 4M covers ~20M units/sec, comfortably above today's 12M.
 ///
-/// Cost of a larger batch is stage-TAIL latency, not wasted work: `claim_work_range` clamps the end
-/// index to `total_pairs`, and a stage cannot finish until its last full batch does, so the tail is
-/// ~one batch duration (~200 ms of a ~5 s stage). Abandonment is unaffected — a worker drops a
-/// superseded stage every [`STAGE_CHECK_INTERVAL_UNITS`], not at batch boundaries.
+/// Cost of a larger batch used to be stage-TAIL latency: a stage cannot finish until its last
+/// claimed batch does, so the whole fleet idled behind one worker for ~one batch duration. The
+/// claim script now tapers what it hands out as the space drains (`STAGE_TAIL_SPLIT`), so the tail
+/// is a fraction of a batch and this constant no longer trades throughput against turnover.
+/// Abandonment is unaffected — a worker drops a superseded stage every
+/// [`STAGE_CHECK_INTERVAL_UNITS`], not at batch boundaries.
 const MAX_FETCH_SIZE: i32 = 4_000_000;
 /// Most the batch may grow in a single step, so one unusually fast batch cannot overshoot.
 const MAX_FETCH_GROWTH: i64 = 4;
