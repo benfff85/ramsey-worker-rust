@@ -132,6 +132,20 @@ pub struct RedisClient {
     connection: ConnectionManager,
 }
 
+/// Lifetime for per-stage Redis keys, REFRESHED on every write.
+///
+/// The queue manager deletes a stage's keys when it advances, but a worker that claims or submits
+/// against a just-retired stage RECREATES them afterwards, and nothing deletes them a second time.
+/// Measured on the live instance: 713,374 keys / 653 MB had accumulated, and adding the missing
+/// `processed_count` delete only cut its leak by 19% — stragglers recreated it on 81% of stages.
+/// Deletion cannot win that race; expiry can.
+///
+/// Refreshed rather than set-once because a live stage must never lose its keys: stages are ~3.4 s
+/// on campaign 3 today, but earlier eras ran 95-minute sweeps. Since workers write constantly while
+/// a stage is live, the TTL is continually pushed out, and only a stage nobody has touched for an
+/// hour expires.
+const STAGE_KEY_TTL_SECS: i64 = 3600;
+
 impl RedisClient {
     /// Create a new Redis client with timeout configuration
     pub async fn new(host: &str, port: u16) -> Result<Self, Box<dyn Error>> {
@@ -192,6 +206,7 @@ impl RedisClient {
             end
             local new_end = current + batch
             redis.call('SET', KEYS[1], new_end)
+            redis.call('EXPIRE', KEYS[1], ARGV[3])
             return current
             "#,
         );
@@ -202,6 +217,7 @@ impl RedisClient {
                 .key(&index_key)
                 .arg(batch_size)
                 .arg(total_pairs)
+                .arg(STAGE_KEY_TTL_SECS)
                 .invoke_async::<i64>(&mut self.connection)
                 .await
             {
@@ -344,11 +360,13 @@ impl RedisClient {
         let script = redis::Script::new(
             r#"
             if redis.call('SISMEMBER', KEYS[2], ARGV[3]) == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[5])
                 local b = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
                 if b[2] then return {0, tonumber(b[2])} else return {0, -1} end
             end
             redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
             redis.call('ZREMRANGEBYRANK', KEYS[1], ARGV[4], -1)
+            redis.call('EXPIRE', KEYS[1], ARGV[5])
             local rank = redis.call('ZRANK', KEYS[1], ARGV[2])
             local kept = 0
             if rank then kept = 1 end
@@ -364,6 +382,7 @@ impl RedisClient {
             .arg(&json)
             .arg(hash)
             .arg(max_results as i64)
+            .arg(STAGE_KEY_TTL_SECS)
             .invoke_async(&mut self.connection)
             .await?;
 
@@ -566,10 +585,11 @@ impl RedisClient {
     ) -> Result<i64, Box<dyn Error>> {
         let stage_key = format!("processed_count:{}", stage_id);
         let campaign_key = format!("processed_total:{}", campaign_id);
-        let (new_count, _): (i64, i64) = redis::pipe()
+        let (new_count, _, _): (i64, i64, i64) = redis::pipe()
             .atomic()
             .incr(&stage_key, count)
             .incr(&campaign_key, count)
+            .expire(&stage_key, STAGE_KEY_TTL_SECS)
             .query_async(&mut self.connection)
             .await?;
         Ok(new_count)
@@ -802,4 +822,150 @@ mod tests {
         a.set(10, 2_000_000_000);
         assert_eq!(a.latest_for(10), Some(2_000_000_000));
     }
+    // ===== Live-Redis integration tests (run with --ignored; needs Redis on 36002) =====
+    //
+    // Every per-stage key must carry a TTL. The queue manager deletes them on stage advance, but
+    // stragglers still writing against a retired stage recreate them afterwards, so deletion
+    // cannot win that race and the keyspace grows without bound (measured 3.90 keys/stage).
+    // Expiry is what actually bounds it, so each write path is checked for a live TTL here.
+
+    async fn test_client() -> RedisClient {
+        RedisClient::new("127.0.0.1", 36002)
+            .await
+            .expect("live Redis on 127.0.0.1:36002 required for --ignored tests")
+    }
+
+    async fn ttl_of(c: &mut RedisClient, key: &str) -> i64 {
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut c.connection)
+            .await
+            .expect("TTL")
+    }
+
+    /// A unique stage id per run so concurrent fleets on this Redis can never collide with it.
+    fn scratch_stage_id() -> i32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        -((nanos % 1_000_000) as i32) - 1 // negative: production stage ids are positive
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn claiming_work_gives_the_index_key_a_ttl() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let key = format!("stage_work_index:{}", stage);
+
+        c.claim_work_range(stage, 10, 1000).await.unwrap().unwrap();
+        let ttl = ttl_of(&mut c, &key).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        assert!(ttl > 0, "stage_work_index must expire, got TTL {}", ttl);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn counting_processed_work_gives_the_counter_a_ttl_but_not_the_campaign_total() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let campaign = scratch_stage_id();
+        let stage_key = format!("processed_count:{}", stage);
+        let campaign_key = format!("processed_total:{}", campaign);
+
+        c.increment_processed_count(stage, campaign, 5).await.unwrap();
+        let stage_ttl = ttl_of(&mut c, &stage_key).await;
+        let campaign_ttl = ttl_of(&mut c, &campaign_key).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&stage_key)
+            .arg(&campaign_key)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        assert!(stage_ttl > 0, "processed_count must expire, got TTL {}", stage_ttl);
+        assert_eq!(
+            campaign_ttl, -1,
+            "the campaign total is differenced across stage turnovers and must never expire"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn recording_a_result_gives_the_best_results_key_a_ttl() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let key = format!("best_results:{}", stage);
+
+        c.add_to_top_results(stage, 1, &[], 12345, "ttl-test-novel-hash", 10)
+            .await
+            .unwrap();
+        let ttl = ttl_of(&mut c, &key).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        assert!(ttl > 0, "best_results must expire, got TTL {}", ttl);
+    }
+
+    /// A stage that keeps rediscovering already-visited graphs still writes nothing new, but it is
+    /// very much alive — its TTL must keep getting pushed out or the key vanishes underneath it.
+    #[tokio::test]
+    #[ignore]
+    async fn a_repeat_visit_still_refreshes_the_best_results_ttl() {
+        let mut c = test_client().await;
+        let stage = scratch_stage_id();
+        let key = format!("best_results:{}", stage);
+        let hash = format!("ttl-test-visited-{}", stage);
+
+        c.add_to_top_results(stage, 1, &[], 12345, "ttl-test-novel-hash", 10)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SADD")
+            .arg("processed_graph_hashes")
+            .arg(&hash)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        // Shrink the TTL, then submit a graph we have already visited.
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(5)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        let (kept, _) = c
+            .add_to_top_results(stage, 1, &[], 999, &hash, 10)
+            .await
+            .unwrap();
+        let ttl = ttl_of(&mut c, &key).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SREM")
+            .arg("processed_graph_hashes")
+            .arg(&hash)
+            .query_async(&mut c.connection)
+            .await
+            .unwrap();
+        assert!(!kept, "an already-visited graph must be rejected");
+        assert!(
+            ttl > 5,
+            "the repeat-visit path must push the TTL back out, got {}",
+            ttl
+        );
+    }
+
 }
