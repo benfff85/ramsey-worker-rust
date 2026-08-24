@@ -196,6 +196,15 @@ impl RedisClient {
 
         // Lua script: atomically check and increment, never exceeding total_pairs
         // Returns: start_index if work available, -1 if exhausted
+        //
+        // The TTL rides on the SET rather than a following EXPIRE: SET clears any existing TTL, so
+        // the two must be one call to leave no window where the key is immortal. The exhausted
+        // branch deliberately does not refresh -- a stage with no work left should be allowed to go.
+        //
+        // Caveat while a fleet is mid-upgrade: a worker on the old build still issues a bare SET,
+        // which strips the TTL a new worker just set. `processed_count` (INCR) and `best_results`
+        // (ZADD) keep theirs because those commands preserve TTLs, which is why only this key reads
+        // back as immortal until every fleet on the campaign is upgraded.
         let script = redis::Script::new(
             r#"
             local current = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -205,8 +214,7 @@ impl RedisClient {
                 return -1
             end
             local new_end = current + batch
-            redis.call('SET', KEYS[1], new_end)
-            redis.call('EXPIRE', KEYS[1], ARGV[3])
+            redis.call('SET', KEYS[1], new_end, 'EX', ARGV[3])
             return current
             "#,
         );
