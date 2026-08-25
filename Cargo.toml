@@ -19,7 +19,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 # framework and the Linux worker container has no GPU device nodes at all, so this must never enter
 # the Docker build. Every use site is behind #[cfg(target_os = "macos")].
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.32"
+metal = "0.33"
 
 [profile.release]
 lto = "fat"          # Link-Time Optimization for better inlining across crates
