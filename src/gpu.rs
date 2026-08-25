@@ -336,6 +336,34 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
             let _ = n;
         }
 
+        /// Submit work without waiting, so the CPU can keep classifying while the GPU runs.
+        ///
+        /// A synchronous dispatch cannot help here: the GPU is slower than the CPU fleet at this
+        /// kernel, so alternating between them is strictly worse than the CPU alone. The hybrid only
+        /// pays if the two overlap, which means committing the command buffer and returning.
+        pub fn dispatch(&mut self, reqs: &[CorrectionRequest]) -> Option<Pending> {
+            if reqs.is_empty() {
+                return Some(Pending { cb: None, out: None, len: 0 });
+            }
+            let (bs, bm, bo) = self.encode(reqs)?;
+            let cb = self.queue.new_command_buffer();
+            self.encode_pass(&cb, &bs, &bm, &bo, reqs.len());
+            cb.commit();
+            Some(Pending { cb: Some(cb.to_owned()), out: Some(bo), len: reqs.len() })
+        }
+
+        /// Block until a dispatched batch is done and read its results.
+        pub fn collect(&mut self, p: Pending) -> &[i32] {
+            self.results.clear();
+            if let (Some(cb), Some(bo)) = (p.cb, p.out) {
+                cb.wait_until_completed();
+                self.results.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(bo.contents() as *const i32, p.len)
+                });
+            }
+            &self.results
+        }
+
         /// Evaluate every request. Returns counts in request order.
         ///
         /// Only `clique_size - n` of 4 or 5 is implemented; anything else would be miscounted, so it
@@ -355,39 +383,9 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
                 seeds.extend_from_slice(&r.seeds);
                 meta.push(r.n | if r.blue { 0x10 } else { 0 });
             }
-            let bs = self.device.new_buffer_with_data(
-                seeds.as_ptr() as *const _,
-                (seeds.len() * size_of::<u16>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let bm = self.device.new_buffer_with_data(
-                meta.as_ptr() as *const _,
-                meta.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let bo = self.device.new_buffer(
-                (reqs.len() * size_of::<i32>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let cs = self.clique_size as u32;
-            let cnt = reqs.len() as u32;
-
+            let (bs, bm, bo) = self.encode(reqs)?;
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.pipeline);
-            enc.set_buffer(0, Some(&self.red), 0);
-            enc.set_buffer(1, Some(&self.blue), 0);
-            enc.set_buffer(2, Some(&bs), 0);
-            enc.set_buffer(3, Some(&bm), 0);
-            enc.set_buffer(4, Some(&bo), 0);
-            enc.set_bytes(5, size_of::<u32>() as u64, &cs as *const u32 as *const _);
-            enc.set_bytes(6, size_of::<u32>() as u64, &cnt as *const u32 as *const _);
-            let tg = self.pipeline.max_total_threads_per_threadgroup().min(256);
-            enc.dispatch_threads(
-                MTLSize::new(reqs.len() as u64, 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
-            enc.end_encoding();
+            self.encode_pass(&cb, &bs, &bm, &bo, reqs.len());
             cb.commit();
             cb.wait_until_completed();
 
@@ -397,8 +395,71 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
             });
             Some(&self.results)
         }
+
+        fn encode(
+            &self,
+            reqs: &[CorrectionRequest],
+        ) -> Option<(metal::Buffer, metal::Buffer, metal::Buffer)> {
+            let mut seeds = Vec::with_capacity(reqs.len() * 4);
+            let mut meta = Vec::with_capacity(reqs.len());
+            for r in reqs {
+                let need = self.clique_size.checked_sub(r.n as usize)?;
+                if !(1..=5).contains(&need) {
+                    return None;
+                }
+                seeds.extend_from_slice(&r.seeds);
+                meta.push(r.n | if r.blue { 0x10 } else { 0 });
+            }
+            Some((
+                self.device.new_buffer_with_data(
+                    seeds.as_ptr() as *const _,
+                    (seeds.len() * size_of::<u16>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                self.device.new_buffer_with_data(
+                    meta.as_ptr() as *const _,
+                    meta.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                self.device.new_buffer(
+                    (reqs.len() * size_of::<i32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            ))
+        }
+
+        fn encode_pass(
+            &self,
+            cb: &metal::CommandBufferRef,
+            bs: &metal::Buffer,
+            bm: &metal::Buffer,
+            bo: &metal::Buffer,
+            n: usize,
+        ) {
+            let cs = self.clique_size as u32;
+            let cnt = n as u32;
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipeline);
+            enc.set_buffer(0, Some(&self.red), 0);
+            enc.set_buffer(1, Some(&self.blue), 0);
+            enc.set_buffer(2, Some(bs), 0);
+            enc.set_buffer(3, Some(bm), 0);
+            enc.set_buffer(4, Some(bo), 0);
+            enc.set_bytes(5, size_of::<u32>() as u64, &cs as *const u32 as *const _);
+            enc.set_bytes(6, size_of::<u32>() as u64, &cnt as *const u32 as *const _);
+            let tg = self.pipeline.max_total_threads_per_threadgroup().min(256);
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+            enc.end_encoding();
+        }
+    }
+
+    /// A dispatched batch that has not been collected yet.
+    pub struct Pending {
+        cb: Option<metal::CommandBuffer>,
+        out: Option<metal::Buffer>,
+        len: usize,
     }
 }
 
 #[cfg(target_os = "macos")]
-pub use backend::CorrectionEngine;
+pub use backend::{CorrectionEngine, Pending};
