@@ -3,6 +3,7 @@ pub mod bitset;
 pub mod client;
 pub mod clique_collection;
 pub mod enumeration;
+pub mod gpu;
 pub mod graph;
 pub mod hash;
 pub mod hoist;

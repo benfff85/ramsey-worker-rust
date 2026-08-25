@@ -15,6 +15,12 @@ serde_json = "1.0.150"
 sha2 = "0.11"
 tokio = { version = "1.52.3", features = ["full"] }
 
+# GPU offload for the pair-move correction. macOS-only by construction: Metal is a macOS userspace
+# framework and the Linux worker container has no GPU device nodes at all, so this must never enter
+# the Docker build. Every use site is behind #[cfg(target_os = "macos")].
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.32"
+
 [profile.release]
 lto = "fat"          # Link-Time Optimization for better inlining across crates
 codegen-units = 1    # Single codegen unit for best optimization (slower compile)

@@ -3,7 +3,8 @@ use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::{Graph, WorkUnitEdge};
-use crate::hoist::HoistTables;
+use crate::gpu::CorrectionRequest;
+use crate::hoist::{HoistTables, PairOutcome};
 use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
 use std::sync::Arc;
@@ -269,6 +270,18 @@ pub struct Worker {
     base_graph_clique_count: Option<i32>,
     publish_results: bool,
     top_results_count: usize,
+    /// GPU-assisted correction, when the host has a Metal device and `HOIST_GPU_ENABLED` is set.
+    ///
+    /// The correction is ~88% of a worker's compute and the GPU is idle, but it is SLOWER than the
+    /// whole CPU fleet at this kernel — it only pays by running CONCURRENTLY with the CPU, which is
+    /// why corrections are deferred in chunks and collected a chunk late rather than dispatched and
+    /// waited on. Measured standalone: 6.98 -> 36.93 M units/sec for one worker, bit-identical over
+    /// 3M units. Never available in the Linux worker container, which has no GPU device nodes.
+    gpu_enabled: bool,
+    #[cfg(target_os = "macos")]
+    gpu: Option<crate::gpu::CorrectionEngine>,
+    /// Base graph the GPU engine currently holds, so it is re-uploaded once per stage, not per batch.
+    gpu_graph: Option<i32>,
     // Counter-based mode state
     stage_config: Option<StageConfig>,
     enumerator: Option<Box<dyn WorkEnumerator + Send>>,
@@ -341,6 +354,12 @@ impl Worker {
             stats_fills_red: 0,
             stats_fills_blue: 0,
             stats_fills_slice: 0,
+            gpu_enabled: std::env::var("HOIST_GPU_ENABLED")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false),
+            #[cfg(target_os = "macos")]
+            gpu: None,
+            gpu_graph: None,
             current_fetch_size: fetch_size,
             last_base_graph_id: None,
             hoist_carry: None,
@@ -584,6 +603,94 @@ impl Worker {
     }
 
     /// Counter-based work cycle: claim index ranges and enumerate locally
+
+    /// Record a finished unit: keep it if it beats the running threshold, queue it for publishing.
+    ///
+    /// An associated function over the individual fields rather than a `&mut self` method, because
+    /// the caller holds a mutable borrow of `graph_cache` across the whole unit loop. Extracted so
+    /// the inline path and the GPU-deferred path cannot diverge — a second copy of this is exactly
+    /// where a hybrid would start producing different results from the CPU.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_candidate(
+        mut redis: Option<&mut RedisClient>,
+        mw_client: &MiddlewareClient,
+        publish_results: bool,
+        top_results_count: usize,
+        publish_size: i32,
+        stage_id: i32,
+        base_graph_id: i32,
+        edges_to_flip: &[WorkUnitEdge],
+        count: i32,
+        base_bitstring: &str,
+        derived_vertex_count: usize,
+        top_threshold: &mut Option<i32>,
+        processed_results: &mut Vec<WorkResult>,
+    ) -> Result<(), Box<dyn Error>> {
+            // Track as a potential best result (stored in top-N sorted set)
+            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
+            let should_submit = match *top_threshold {
+                None => true, // Set is not full, accept any result
+                Some(threshold) => count < threshold,
+            };
+            if should_submit {
+                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
+                // Only computed for record-breakers (count < best novel), so it's rare.
+                let hash = crate::hash::derived_graph_hash(
+                    base_bitstring,
+                    derived_vertex_count,
+                    edges_to_flip,
+                );
+                if let Some(redis) = redis.as_deref_mut() {
+                    if let Ok((kept, new_threshold)) = redis
+                        .add_to_top_results(
+                            stage_id,
+                            base_graph_id,
+                            edges_to_flip,
+                            count,
+                            &hash,
+                            top_results_count,
+                        )
+                        .await
+                    {
+                        // Only a real insert is news; a rejected (already-visited) candidate
+                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
+                        // fallback, so a dropped message costs latency, not correctness.
+                        if kept {
+                            let _ = redis.publish_best_result(stage_id, count).await;
+                        }
+                        // Update threshold in-place so early termination tightens
+                        // within this batch rather than staying stale for all 250K units.
+                        if let Some(t) = new_threshold {
+                            *top_threshold = Some(match *top_threshold {
+                                Some(current) => current.min(t),
+                                None => t,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Collect results for publishing
+            if publish_results {
+                let result = WorkResult {
+                    id: None,
+                    base_graph_id,
+                    stage_id,
+                    edges_to_flip: edges_to_flip.to_vec(),
+                    clique_count: count,
+                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                };
+                processed_results.push(result);
+
+                if processed_results.len() >= publish_size as usize {
+                    mw_client.submit_results(&processed_results).await?;
+                    processed_results.clear();
+                }
+            }
+
+        Ok(())
+    }
+
     async fn cycle_counter_based(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
         // Ensure we have stage config cached
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
@@ -1012,6 +1119,47 @@ impl Worker {
             None
         };
 
+        // Point the GPU engine at this stage's base graph. Uploading the adjacency is cheap next to
+        // a dispatch but not free, so it happens once per stage rather than once per batch.
+        #[cfg(target_os = "macos")]
+        let gpu_active = {
+            if self.gpu_enabled && engage {
+                if self.gpu.is_none() {
+                    self.gpu = crate::gpu::CorrectionEngine::new(graph, self.vertex_count, clique_size);
+                    self.gpu_graph = self.gpu.as_ref().map(|_| base_graph_id);
+                    if self.gpu.is_none() {
+                        log_error!("HOIST_GPU_ENABLED set but no Metal device — staying on CPU");
+                    }
+                } else if self.gpu_graph != Some(base_graph_id) {
+                    if let Some(e) = self.gpu.as_mut() {
+                        e.set_graph(graph);
+                    }
+                    self.gpu_graph = Some(base_graph_id);
+                }
+                self.gpu.is_some()
+            } else {
+                false
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let gpu_active = false;
+
+        /// A unit whose correction is still in flight on the GPU.
+        struct Deferred {
+            edges: [WorkUnitEdge; 2],
+            base_total: i32,
+            broken: i32,
+            base: i32,
+            limit: i32,
+        }
+        /// Corrections per dispatch: big enough to amortise the dispatch, small enough that the CPU
+        /// always has a chunk to classify while the GPU works on the previous one.
+        const GPU_CHUNK: usize = 32_768;
+        let mut defer_reqs: Vec<CorrectionRequest> = Vec::new();
+        let mut defer_units: Vec<Deferred> = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut inflight: Option<(crate::gpu::Pending, Vec<Deferred>)> = None;
+
         // Fetch the current threshold for top-N results (None = accept anything).
         // Declared mut so it can be tightened in-loop as the sorted set fills up,
         // eliminating the burst of unfiltered submissions when a fresh stage starts.
@@ -1043,6 +1191,46 @@ impl Worker {
                 break;
             }
             units_done += 1;
+
+            // Hand the GPU a chunk and collect the PREVIOUS one — collected only now, so it ran
+            // while the CPU was classifying these units. Dispatching and waiting would just
+            // alternate the two and is measurably worse than the CPU alone.
+            #[cfg(target_os = "macos")]
+            if gpu_active && defer_reqs.len() >= GPU_CHUNK {
+                if let Some((pending, owed)) = inflight.take() {
+                    let results: Vec<i32> =
+                        self.gpu.as_mut().unwrap().collect(pending).to_vec();
+                    for (d, corr) in owed.iter().zip(results.iter()) {
+                        if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
+                            let count = d.base_total - d.broken + created;
+                            Self::record_candidate(
+                                self.redis_client.as_mut(),
+                                &self.mw_client,
+                                self.publish_results,
+                                self.top_results_count,
+                                self.publish_size,
+                                stage_id,
+                                base_graph_id,
+                                &d.edges,
+                                count,
+                                &base_bitstring,
+                                derived_vertex_count,
+                                &mut top_threshold,
+                                &mut processed_results,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                let pending = self
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .dispatch(&defer_reqs)
+                    .ok_or("GPU rejected a correction batch")?;
+                inflight = Some((pending, std::mem::take(&mut defer_units)));
+                defer_reqs.clear();
+            }
             let unit = enumerator.index_to_work_unit(idx);
             // Stack buffer, not a per-unit heap allocation. This was profiled at 0.2% and
             // deliberately left alone in the 2026-07-15 kernel round — correctly, when a unit cost
@@ -1114,17 +1302,39 @@ impl Worker {
                     // the limit are rejected without computing the correction — which is 98% of
                     // this loop's cost. Exact, not a prune: see `pair_created_bounded`.
                     WorkUnit::PairFlip(red_edge, blue_edge) => {
-                        match tables.pair_created_bounded(
-                            graph,
-                            clique_size,
-                            (red_edge.vertex_one as usize, red_edge.vertex_two as usize),
-                            (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize),
-                            early_limit,
-                        ) {
-                            Some(created) => (created, false),
-                            // Provably over the limit. The count is never read once `exceeded`
-                            // is set — the loop continues immediately.
-                            None => (0, true),
+                        let r = (red_edge.vertex_one as usize, red_edge.vertex_two as usize);
+                        let b = (blue_edge.vertex_one as usize, blue_edge.vertex_two as usize);
+                        if gpu_active {
+                            // Same bound, same rejections — only the correction is deferred, and
+                            // `pair_created_bounded` is written in terms of this, so the two paths
+                            // cannot disagree about which units need one.
+                            match tables.pair_classify(graph, clique_size, r, b, early_limit) {
+                                PairOutcome::Resolved(created) => (created, false),
+                                PairOutcome::Rejected => (0, true),
+                                PairOutcome::NeedsCorrection { base, seeds, n, blue } => {
+                                    defer_reqs.push(CorrectionRequest { seeds, n, blue });
+                                    defer_units.push(Deferred {
+                                        edges: [edge_buf[0].clone(), edge_buf[1].clone()],
+                                        base_total,
+                                        broken,
+                                        base,
+                                        limit: early_limit,
+                                    });
+                                    // Finished later, out of order. A deferred unit settles against
+                                    // a slightly staler — and therefore looser — threshold, so this
+                                    // can only cost extra work, never reject a candidate it should
+                                    // have kept.
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match tables.pair_created_bounded(graph, clique_size, r, b, early_limit)
+                            {
+                                Some(created) => (created, false),
+                                // Provably over the limit. The count is never read once `exceeded`
+                                // is set — the loop continues immediately.
+                                None => (0, true),
+                            }
                         }
                     }
                 },
@@ -1142,66 +1352,82 @@ impl Worker {
             }
             let count = base_total - broken + new;
 
-            // Track as a potential best result (stored in top-N sorted set)
-            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
-            let should_submit = match top_threshold {
-                None => true, // Set is not full, accept any result
-                Some(threshold) => count < threshold,
-            };
-            if should_submit {
-                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
-                // Only computed for record-breakers (count < best novel), so it's rare.
-                let hash = crate::hash::derived_graph_hash(
-                    &base_bitstring,
-                    derived_vertex_count,
-                    edges_to_flip,
-                );
-                if let Some(redis) = self.redis_client.as_mut() {
-                    if let Ok((kept, new_threshold)) = redis
-                        .add_to_top_results(
+            Self::record_candidate(
+                self.redis_client.as_mut(),
+                &self.mw_client,
+                self.publish_results,
+                self.top_results_count,
+                self.publish_size,
+                stage_id,
+                base_graph_id,
+                edges_to_flip,
+                count,
+                &base_bitstring,
+                derived_vertex_count,
+                &mut top_threshold,
+                &mut processed_results,
+            )
+            .await?;
+        }
+
+        // Drain whatever is still in flight or unbatched before the batch is reported.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((pending, owed)) = inflight.take() {
+                let results: Vec<i32> = self.gpu.as_mut().unwrap().collect(pending).to_vec();
+                for (d, corr) in owed.iter().zip(results.iter()) {
+                    if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
+                        let count = d.base_total - d.broken + created;
+                        Self::record_candidate(
+                            self.redis_client.as_mut(),
+                            &self.mw_client,
+                            self.publish_results,
+                            self.top_results_count,
+                            self.publish_size,
                             stage_id,
                             base_graph_id,
-                            edges_to_flip,
+                            &d.edges,
                             count,
-                            &hash,
-                            self.top_results_count,
+                            &base_bitstring,
+                            derived_vertex_count,
+                            &mut top_threshold,
+                            &mut processed_results,
                         )
-                        .await
-                    {
-                        // Only a real insert is news; a rejected (already-visited) candidate
-                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
-                        // fallback, so a dropped message costs latency, not correctness.
-                        if kept {
-                            let _ = redis.publish_best_result(stage_id, count).await;
-                        }
-                        // Update threshold in-place so early termination tightens
-                        // within this batch rather than staying stale for all 250K units.
-                        if let Some(t) = new_threshold {
-                            top_threshold = Some(match top_threshold {
-                                Some(current) => current.min(t),
-                                None => t,
-                            });
-                        }
+                        .await?;
                     }
                 }
             }
-
-            // Collect results for publishing
-            if self.publish_results {
-                let result = WorkResult {
-                    id: None,
-                    base_graph_id,
-                    stage_id,
-                    edges_to_flip: edges_to_flip.to_vec(),
-                    clique_count: count,
-                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
-                };
-                processed_results.push(result);
-
-                if processed_results.len() >= self.publish_size as usize {
-                    self.mw_client.submit_results(&processed_results).await?;
-                    processed_results.clear();
+            if !defer_reqs.is_empty() {
+                let owed = std::mem::take(&mut defer_units);
+                let results: Vec<i32> = self
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .run(&defer_reqs)
+                    .ok_or("GPU rejected a correction batch")?
+                    .to_vec();
+                for (d, corr) in owed.iter().zip(results.iter()) {
+                    if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
+                        let count = d.base_total - d.broken + created;
+                        Self::record_candidate(
+                            self.redis_client.as_mut(),
+                            &self.mw_client,
+                            self.publish_results,
+                            self.top_results_count,
+                            self.publish_size,
+                            stage_id,
+                            base_graph_id,
+                            &d.edges,
+                            count,
+                            &base_bitstring,
+                            derived_vertex_count,
+                            &mut top_threshold,
+                            &mut processed_results,
+                        )
+                        .await?;
+                    }
                 }
+                defer_reqs.clear();
             }
         }
 
