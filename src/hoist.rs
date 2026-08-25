@@ -52,6 +52,17 @@ const UNKNOWN: i32 = i32::MIN;
 /// too: it still needs peers' help for the entries the advance invalidated.
 const INITIAL_REFRESH_BUDGET: u8 = 12;
 
+/// What `pair_classify` decided about a unit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PairOutcome {
+    /// Exact `created`, no correction needed.
+    Resolved(i32),
+    /// Provably over the limit.
+    Rejected,
+    /// Needs the correction term before `created` is known.
+    NeedsCorrection { base: i32, seeds: [u16; 4], n: u8, blue: bool },
+}
+
 /// Which colour the cross pairs share, which decides whether a correction is needed at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CrossPairs {
@@ -556,25 +567,84 @@ impl HoistTables {
         b: (usize, usize),
         limit: i32,
     ) -> Option<i32> {
+        match self.pair_classify(graph, clique_size, r, b, limit) {
+            PairOutcome::Rejected => None,
+            PairOutcome::Resolved(created) => Some(created),
+            PairOutcome::NeedsCorrection { base, seeds, n, blue } => {
+                let adj = if blue {
+                    &graph.complement_adjacency
+                } else {
+                    &graph.adjacency
+                };
+                let s: [usize; 4] = [
+                    seeds[0] as usize,
+                    seeds[1] as usize,
+                    seeds[2] as usize,
+                    seeds[3] as usize,
+                ];
+                let c = count_cliques_through_vertex_set(adj, &s[..n as usize], clique_size);
+                Self::finish_pair(base, c, limit)
+            }
+        }
+    }
+
+    /// Everything `pair_created_bounded` does up to the point the correction is needed.
+    ///
+    /// Splitting it out lets a caller defer the correction — batch many of them, compute them
+    /// elsewhere, and finish later with [`Self::finish_pair`] — without duplicating the bound logic
+    /// that decides which units need one at all. `pair_created_bounded` is written in terms of this,
+    /// so the two cannot drift apart.
+    pub fn pair_classify(
+        &mut self,
+        graph: &mut Graph,
+        clique_size: usize,
+        r: (usize, usize),
+        b: (usize, usize),
+        limit: i32,
+    ) -> PairOutcome {
         let c_b = self.single_created(graph, clique_size, b.0, b.1);
         let d_r = self.single_created(graph, clique_size, r.0, r.1);
         let base = c_b + d_r;
-        let created = match cross_pairs(&graph.adjacency, r, b) {
-            CrossPairs::Mixed => base,
+        match cross_pairs(&graph.adjacency, r, b) {
+            CrossPairs::Mixed => {
+                if base > limit {
+                    PairOutcome::Rejected
+                } else {
+                    PairOutcome::Resolved(base)
+                }
+            }
             CrossPairs::AllRed => {
                 // created >= D_r, so this rejects without touching the correction.
                 if d_r > limit {
-                    return None;
+                    return PairOutcome::Rejected;
                 }
-                base - correction(&graph.adjacency, r, b, clique_size)
+                let (seeds, n) = forced_vertices(r, b);
+                PairOutcome::NeedsCorrection {
+                    base,
+                    seeds: [seeds[0] as u16, seeds[1] as u16, seeds[2] as u16, seeds[3] as u16],
+                    n: n as u8,
+                    blue: false,
+                }
             }
             CrossPairs::AllBlue => {
                 if c_b > limit {
-                    return None;
+                    return PairOutcome::Rejected;
                 }
-                base - correction(&graph.complement_adjacency, r, b, clique_size)
+                let (seeds, n) = forced_vertices(r, b);
+                PairOutcome::NeedsCorrection {
+                    base,
+                    seeds: [seeds[0] as u16, seeds[1] as u16, seeds[2] as u16, seeds[3] as u16],
+                    n: n as u8,
+                    blue: true,
+                }
             }
-        };
+        }
+    }
+
+    /// Apply a deferred correction and re-apply the limit, exactly as the inline path does.
+    #[inline]
+    pub fn finish_pair(base: i32, correction: i32, limit: i32) -> Option<i32> {
+        let created = base - correction;
         if created > limit { None } else { Some(created) }
     }
 
