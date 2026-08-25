@@ -1,4 +1,4 @@
-use crate::bitset::BitMatrix;
+use crate::bitset::{BitMatrix, BITSET_SIZE};
 use crate::graph::{Graph, WorkUnitEdge};
 
 /// Replicates TargetedCliqueCheckServiceBitSet.getNewCliques
@@ -318,6 +318,29 @@ pub fn count_cliques_through_vertex_set(
     seeds: &[usize],
     clique_size: usize,
 ) -> i32 {
+    count_through_seeds(adjacency, seeds, clique_size, true)
+}
+
+/// The same count, forced through the full-width bitset recursion.
+///
+/// Exists so the compressed path can be checked against the code it replaces; production always
+/// calls [`count_cliques_through_vertex_set`].
+#[doc(hidden)]
+pub fn count_cliques_through_vertex_set_reference(
+    adjacency: &[BitMatrix],
+    seeds: &[usize],
+    clique_size: usize,
+) -> i32 {
+    count_through_seeds(adjacency, seeds, clique_size, false)
+}
+
+#[inline]
+fn count_through_seeds(
+    adjacency: &[BitMatrix],
+    seeds: &[usize],
+    clique_size: usize,
+    compress: bool,
+) -> i32 {
     if seeds.is_empty() || seeds.len() > clique_size {
         return 0;
     }
@@ -329,7 +352,91 @@ pub fn count_cliques_through_vertex_set(
     for &w in seeds {
         p.clear(w);
     }
+
+    // Below this point the recursion only ever manipulates subsets of P, and P is small: measured
+    // over 400k corrections on real campaign graphs, |P| peaks at 32 when the two edges are
+    // disjoint and 49 when they share a vertex. Relabelling those into a dense 0..|P| index space
+    // lets every AND and popcount below run on a single `u64` instead of five, which is where the
+    // time goes. The full-width path stays for the case the relabelling cannot represent.
+    if compress {
+        let card = p.cardinality() as usize;
+        if card <= 64 {
+            let need = clique_size - seeds.len();
+            if card < need {
+                return 0;
+            }
+            return count_compressed(&p, adjacency, card, need);
+        }
+    }
     bron_kerbosch_count_inplace(seeds.len(), &mut p, adjacency, clique_size)
+}
+
+/// Build the induced subgraph on `p` over a dense index space, then count `need`-cliques in it.
+fn count_compressed(p: &BitMatrix, adjacency: &[BitMatrix], m: usize, need: usize) -> i32 {
+    // No 288-byte index array and no full-width row copies: with |P| ~ 17 the pairwise probe is
+    // fewer operations than restricting each row and translating its surviving bits.
+    let mut verts = [0u16; 64];
+    let mut i = 0;
+    for v in p.iter_set_bits() {
+        verts[i] = v as u16;
+        i += 1;
+    }
+    debug_assert_eq!(i, m);
+
+    let mut local = [0u64; 64];
+    for a in 0..m {
+        let row = &adjacency[verts[a] as usize];
+        let mut mask = 0u64;
+        for (b, &vb) in verts.iter().enumerate().take(m) {
+            if row.get(vb as usize) {
+                mask |= 1u64 << b;
+            }
+        }
+        local[a] = mask;
+    }
+
+    let full = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
+    count_dense(full, need, &local)
+}
+
+/// Count `need`-cliques among the candidates in `p`, on the dense masks.
+///
+/// Mirrors `bron_kerbosch_count_inplace` level for level — the leaf shortcut, the "not enough left"
+/// bound, the fused second-to-last level, and removing each candidate after use so a clique is
+/// counted once — with `u64` masks standing in for the 320-bit sets.
+fn count_dense(mut p: u64, need: usize, local: &[u64; 64]) -> i32 {
+    match need {
+        0 => 1,
+        1 => p.count_ones() as i32,
+        2 => {
+            // Second-to-last level: each remaining candidate completes with exactly one more, so
+            // this is the number of edges inside p.
+            let mut c = 0;
+            while p != 0 {
+                let v = p.trailing_zeros() as usize;
+                p &= p - 1;
+                c += (p & local[v]).count_ones() as i32;
+            }
+            c
+        }
+        _ => {
+            let mut c = 0;
+            let mut remaining = p.count_ones() as usize;
+            while p != 0 {
+                if remaining < need {
+                    break;
+                }
+                remaining -= 1;
+                let v = p.trailing_zeros() as usize;
+                p &= p - 1; // clear before the AND: local[v] has no self-bit, so this matches
+                let pv = p & local[v];
+                if (pv.count_ones() as usize) + 1 >= need {
+                    c += count_dense(pv, need - 1, local);
+                }
+            }
+            c
+        }
+    }
 }
 
 pub fn get_cliques_comprehensive(graph: &mut Graph, clique_size: usize) -> i32 {
