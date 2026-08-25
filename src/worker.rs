@@ -584,6 +584,94 @@ impl Worker {
     }
 
     /// Counter-based work cycle: claim index ranges and enumerate locally
+
+    /// Record a finished unit: keep it if it beats the running threshold, queue it for publishing.
+    ///
+    /// An associated function over the individual fields rather than a `&mut self` method, because
+    /// the caller holds a mutable borrow of `graph_cache` across the whole unit loop. Extracted so
+    /// the inline path and the GPU-deferred path cannot diverge — a second copy of this is exactly
+    /// where a hybrid would start producing different results from the CPU.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_candidate(
+        mut redis: Option<&mut RedisClient>,
+        mw_client: &MiddlewareClient,
+        publish_results: bool,
+        top_results_count: usize,
+        publish_size: i32,
+        stage_id: i32,
+        base_graph_id: i32,
+        edges_to_flip: &[WorkUnitEdge],
+        count: i32,
+        base_bitstring: &str,
+        derived_vertex_count: usize,
+        top_threshold: &mut Option<i32>,
+        processed_results: &mut Vec<WorkResult>,
+    ) -> Result<(), Box<dyn Error>> {
+            // Track as a potential best result (stored in top-N sorted set)
+            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
+            let should_submit = match *top_threshold {
+                None => true, // Set is not full, accept any result
+                Some(threshold) => count < threshold,
+            };
+            if should_submit {
+                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
+                // Only computed for record-breakers (count < best novel), so it's rare.
+                let hash = crate::hash::derived_graph_hash(
+                    base_bitstring,
+                    derived_vertex_count,
+                    edges_to_flip,
+                );
+                if let Some(redis) = redis.as_deref_mut() {
+                    if let Ok((kept, new_threshold)) = redis
+                        .add_to_top_results(
+                            stage_id,
+                            base_graph_id,
+                            edges_to_flip,
+                            count,
+                            &hash,
+                            top_results_count,
+                        )
+                        .await
+                    {
+                        // Only a real insert is news; a rejected (already-visited) candidate
+                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
+                        // fallback, so a dropped message costs latency, not correctness.
+                        if kept {
+                            let _ = redis.publish_best_result(stage_id, count).await;
+                        }
+                        // Update threshold in-place so early termination tightens
+                        // within this batch rather than staying stale for all 250K units.
+                        if let Some(t) = new_threshold {
+                            *top_threshold = Some(match *top_threshold {
+                                Some(current) => current.min(t),
+                                None => t,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Collect results for publishing
+            if publish_results {
+                let result = WorkResult {
+                    id: None,
+                    base_graph_id,
+                    stage_id,
+                    edges_to_flip: edges_to_flip.to_vec(),
+                    clique_count: count,
+                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
+                };
+                processed_results.push(result);
+
+                if processed_results.len() >= publish_size as usize {
+                    mw_client.submit_results(&processed_results).await?;
+                    processed_results.clear();
+                }
+            }
+
+        Ok(())
+    }
+
     async fn cycle_counter_based(&mut self, stage_id: i32) -> Result<usize, Box<dyn Error>> {
         // Ensure we have stage config cached
         if self.stage_config.is_none() || self.stage_config.as_ref().unwrap().stage_id != stage_id {
@@ -1142,67 +1230,22 @@ impl Worker {
             }
             let count = base_total - broken + new;
 
-            // Track as a potential best result (stored in top-N sorted set)
-            // Submit if: threshold is None (set not full) OR count < threshold (better than worst)
-            let should_submit = match top_threshold {
-                None => true, // Set is not full, accept any result
-                Some(threshold) => count < threshold,
-            };
-            if should_submit {
-                // Derived-graph hash so the set stays novel-only (slot 0 = best novel).
-                // Only computed for record-breakers (count < best novel), so it's rare.
-                let hash = crate::hash::derived_graph_hash(
-                    &base_bitstring,
-                    derived_vertex_count,
-                    edges_to_flip,
-                );
-                if let Some(redis) = self.redis_client.as_mut() {
-                    if let Ok((kept, new_threshold)) = redis
-                        .add_to_top_results(
-                            stage_id,
-                            base_graph_id,
-                            edges_to_flip,
-                            count,
-                            &hash,
-                            self.top_results_count,
-                        )
-                        .await
-                    {
-                        // Only a real insert is news; a rejected (already-visited) candidate
-                        // changes nothing for the QM. Fire-and-forget — the QM keeps a polling
-                        // fallback, so a dropped message costs latency, not correctness.
-                        if kept {
-                            let _ = redis.publish_best_result(stage_id, count).await;
-                        }
-                        // Update threshold in-place so early termination tightens
-                        // within this batch rather than staying stale for all 250K units.
-                        if let Some(t) = new_threshold {
-                            top_threshold = Some(match top_threshold {
-                                Some(current) => current.min(t),
-                                None => t,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Collect results for publishing
-            if self.publish_results {
-                let result = WorkResult {
-                    id: None,
-                    base_graph_id,
-                    stage_id,
-                    edges_to_flip: edges_to_flip.to_vec(),
-                    clique_count: count,
-                    work_unit_analysis_type: WorkUnitAnalysisType::TARGETED,
-                };
-                processed_results.push(result);
-
-                if processed_results.len() >= self.publish_size as usize {
-                    self.mw_client.submit_results(&processed_results).await?;
-                    processed_results.clear();
-                }
-            }
+            Self::record_candidate(
+                self.redis_client.as_mut(),
+                &self.mw_client,
+                self.publish_results,
+                self.top_results_count,
+                self.publish_size,
+                stage_id,
+                base_graph_id,
+                edges_to_flip,
+                count,
+                &base_bitstring,
+                derived_vertex_count,
+                &mut top_threshold,
+                &mut processed_results,
+            )
+            .await?;
         }
 
         let loop_elapsed = loop_started.elapsed();
