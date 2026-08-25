@@ -159,6 +159,68 @@ static inline uint f_k5(thread uint *p, device const uint *adj) {
     return total;
 }
 
+// ---- compressed path -------------------------------------------------------------------------
+// |P| never exceeds 32 for disjoint edge pairs on real campaign graphs (measured: max 32 for n=4,
+// 49 for n=3), so the induced subgraph on P fits in 32 x uint = 128 bytes per thread. That is the
+// difference between spilling and not: the full-width recursion carries a 40-byte candidate set per
+// level, which is what wrecked occupancy in the first version of this kernel.
+
+// Metal has no recursion, so the levels are an explicit chain: each calls only the level below.
+// need = clique_size - n, which is 4 when the flipped edges are disjoint and 5 when they share a
+// vertex, so the chain bottoms out at cd2 (the number of edges inside the candidate set).
+
+static inline uint cd2(uint p, thread const uint *loc) {
+    uint c = 0;
+    while (p != 0) { uint v = ctz(p); p &= p - 1; c += popcount(p & loc[v]); }
+    return c;
+}
+
+static inline uint cd3(uint p, thread const uint *loc) {
+    uint c = 0; uint rem = popcount(p);
+    while (p != 0) {
+        if (rem < 3) { break; }
+        rem -= 1;
+        uint v = ctz(p); p &= p - 1;
+        uint pv = p & loc[v];
+        if (popcount(pv) >= 2) { c += cd2(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cd4(uint p, thread const uint *loc) {
+    uint c = 0; uint rem = popcount(p);
+    while (p != 0) {
+        if (rem < 4) { break; }
+        rem -= 1;
+        uint v = ctz(p); p &= p - 1;
+        uint pv = p & loc[v];
+        if (popcount(pv) >= 3) { c += cd3(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cd5(uint p, thread const uint *loc) {
+    uint c = 0; uint rem = popcount(p);
+    while (p != 0) {
+        if (rem < 5) { break; }
+        rem -= 1;
+        uint v = ctz(p); p &= p - 1;
+        uint pv = p & loc[v];
+        if (popcount(pv) >= 4) { c += cd4(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cdense(uint p, uint need, thread const uint *loc) {
+    if (need == 0) { return 1; }
+    if (need == 1) { return popcount(p); }
+    if (need == 2) { return cd2(p, loc); }
+    if (need == 3) { return cd3(p, loc); }
+    if (need == 4) { return cd4(p, loc); }
+    if (need == 5) { return cd5(p, loc); }
+    return 0;   // unreachable: the host rejects need outside 1..=5
+}
+
 kernel void corrections(device const uint   *red    [[buffer(0)]],
                         device const uint   *blue   [[buffer(1)]],
                         device const ushort *seeds  [[buffer(2)]],
@@ -189,6 +251,26 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
     uint c = card(p);
     uint total = 0;
     if (n + c < clique)      { total = 0; }
+    else if (c <= 32) {
+        // Relabel P into a dense index space and finish on 32-bit masks.
+        uint verts[32]; uint m = 0;
+        for (uint wi = 0; wi < RW && m < c; ++wi) {
+            uint word = p[wi];
+            while (word != 0) { uint b = ctz(word); word &= word - 1; verts[m++] = wi*32 + b; }
+        }
+        uint loc[32];
+        for (uint a = 0; a < m; ++a) {
+            device const uint *row = adj + verts[a]*RW;
+            uint mask = 0;
+            for (uint b = 0; b < m; ++b) {
+                uint vb = verts[b];
+                if ((row[vb >> 5] >> (vb & 31)) & 1u) { mask |= (1u << b); }
+            }
+            loc[a] = mask;
+        }
+        uint full = (m == 32) ? 0xFFFFFFFFu : ((1u << m) - 1u);
+        total = cdense(full, need, loc);
+    }
     else if (need == 1)      { total = c; }
     else if (need == 2)      { total = f_k2(p, adj); }
     else if (need == 3)      { total = f_k3(p, adj); }
