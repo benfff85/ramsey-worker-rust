@@ -13,6 +13,30 @@ pub fn get_new_cliques_with_limit(
     flipped_edges: &[WorkUnitEdge],
     threshold: i32,
 ) -> (i32, bool) {
+    new_cliques(graph, clique_size, flipped_edges, threshold, true)
+}
+
+/// The same count, forced through the full-width bitset recursion.
+///
+/// Exists so the compressed path can be checked against the code it replaces; production always
+/// calls [`get_new_cliques_with_limit`].
+#[doc(hidden)]
+pub fn get_new_cliques_with_limit_reference(
+    graph: &mut Graph,
+    clique_size: usize,
+    flipped_edges: &[WorkUnitEdge],
+    threshold: i32,
+) -> (i32, bool) {
+    new_cliques(graph, clique_size, flipped_edges, threshold, false)
+}
+
+fn new_cliques(
+    graph: &mut Graph,
+    clique_size: usize,
+    flipped_edges: &[WorkUnitEdge],
+    threshold: i32,
+    compress: bool,
+) -> (i32, bool) {
     let mut new_clique_count = 0;
     let mut exceeded = false;
 
@@ -33,8 +57,9 @@ pub fn get_new_cliques_with_limit(
             // Use the no-X variant with limit for targeted search; the two seed
             // vertices are accounted for by starting at depth 2.
             let remaining = threshold - new_clique_count;
-            let (count, over) =
-                bron_kerbosch_count_no_x_with_limit(2, &mut p, &graph.adjacency, clique_size, remaining);
+            let (count, over) = bron_kerbosch_count_no_x_with_limit(
+                2, &mut p, &graph.adjacency, clique_size, remaining, compress,
+            );
             new_clique_count += count;
             if over {
                 exceeded = true;
@@ -58,8 +83,9 @@ pub fn get_new_cliques_with_limit(
             p.clear(v2);
 
             let remaining = threshold - new_clique_count;
-            let (count, over) =
-                bron_kerbosch_count_no_x_with_limit(2, &mut p, &graph.adjacency, clique_size, remaining);
+            let (count, over) = bron_kerbosch_count_no_x_with_limit(
+                2, &mut p, &graph.adjacency, clique_size, remaining, compress,
+            );
             new_clique_count += count;
             if over {
                 exceeded = true;
@@ -399,6 +425,88 @@ fn count_compressed(p: &BitMatrix, adjacency: &[BitMatrix], m: usize, need: usiz
     count_dense(full, need, &local)
 }
 
+/// Relabel `p` and count `need`-cliques on dense masks, honouring the early-exit limit.
+fn count_dense_limited_from(
+    p: &BitMatrix,
+    adjacency: &[BitMatrix],
+    m: usize,
+    need: usize,
+    limit: i32,
+) -> (i32, bool) {
+    let mut verts = [0u16; 64];
+    let mut i = 0;
+    for v in p.iter_set_bits() {
+        verts[i] = v as u16;
+        i += 1;
+    }
+    let mut local = [0u64; 64];
+    for a in 0..m {
+        let row = &adjacency[verts[a] as usize];
+        let mut mask = 0u64;
+        for (b, &vb) in verts.iter().enumerate().take(m) {
+            if row.get(vb as usize) {
+                mask |= 1u64 << b;
+            }
+        }
+        local[a] = mask;
+    }
+    let full = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
+    count_dense_limited(full, need, &local, limit)
+}
+
+/// As `count_dense`, but stops once the count provably exceeds `limit`.
+///
+/// Mirrors `bron_kerbosch_count_no_x_with_limit` level for level, including the `exceeded` flag: a
+/// caller that only checked the count would silently accept a short count from an aborted search.
+fn count_dense_limited(mut p: u64, need: usize, local: &[u64; 64], limit: i32) -> (i32, bool) {
+    match need {
+        0 => {
+            if limit <= 0 {
+                (1, true)
+            } else {
+                (1, false)
+            }
+        }
+        1 => {
+            let found = p.count_ones() as i32;
+            (found, found > limit)
+        }
+        2 => {
+            let mut c = 0;
+            while p != 0 {
+                let v = p.trailing_zeros() as usize;
+                p &= p - 1;
+                c += (p & local[v]).count_ones() as i32;
+                if c > limit {
+                    return (c, true);
+                }
+            }
+            (c, false)
+        }
+        _ => {
+            let mut c = 0;
+            let mut remaining = p.count_ones() as usize;
+            while p != 0 {
+                if remaining < need {
+                    break;
+                }
+                remaining -= 1;
+                let v = p.trailing_zeros() as usize;
+                p &= p - 1;
+                let pv = p & local[v];
+                if (pv.count_ones() as usize) + 1 >= need {
+                    let (sub, exc) = count_dense_limited(pv, need - 1, local, limit - c);
+                    c += sub;
+                    if exc || c > limit {
+                        return (c, true);
+                    }
+                }
+            }
+            (c, false)
+        }
+    }
+}
+
 /// Count `need`-cliques among the candidates in `p`, on the dense masks.
 ///
 /// Mirrors `bron_kerbosch_count_inplace` level for level — the leaf shortcut, the "not enough left"
@@ -593,6 +701,7 @@ fn bron_kerbosch_count_no_x_with_limit(
     adjacency: &[BitMatrix],
     clique_size: usize,
     limit: i32,
+    compress: bool,
 ) -> (i32, bool) {
     if depth == clique_size {
         // Found a clique - check if we've exceeded limit
@@ -614,6 +723,13 @@ fn bron_kerbosch_count_no_x_with_limit(
     // Subsumes the empty-P check (depth < clique_size - 1 here).
     if depth + p_card < clique_size {
         return (0, false);
+    }
+
+    // Seeding on one edge leaves |P| ~ 70, so unlike the pair correction this cannot compress at the
+    // top. One level down it fits, and everything below then runs on single u64 masks instead of
+    // five words. Same reasoning as `count_through_seeds`; see there.
+    if compress && p_card <= 64 {
+        return count_dense_limited_from(p, adjacency, p_card, clique_size - depth, limit);
     }
 
     // Second-to-last level inline: each child would immediately take the leaf
@@ -640,8 +756,9 @@ fn bron_kerbosch_count_no_x_with_limit(
         new_p.and_assign(&adjacency[v]);
 
         let remaining = limit - count;
-        let (sub_count, exceeded) =
-            bron_kerbosch_count_no_x_with_limit(depth + 1, &mut new_p, adjacency, clique_size, remaining);
+        let (sub_count, exceeded) = bron_kerbosch_count_no_x_with_limit(
+            depth + 1, &mut new_p, adjacency, clique_size, remaining, compress,
+        );
         count += sub_count;
 
         if exceeded || count > limit {
