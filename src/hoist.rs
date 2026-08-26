@@ -174,6 +174,25 @@ pub fn shared_created(graph: &Graph, clique_size: usize, e: (usize, usize), f: (
 pub fn cross_pairs(red_adj: &[BitMatrix], r: (usize, usize), b: (usize, usize)) -> CrossPairs {
     let (x, y) = r;
     let (u, v) = b;
+
+    // Fast path: with four distinct vertices NO guard below can fire. `a == c` is impossible, and
+    // neither cross pair can coincide with `r` or `b` because that would need a shared endpoint. It
+    // is worth special-casing because it is ~98.6% of units — a red edge shares a vertex with only
+    // ~280 of the ~19,800 blue edges — so the guards are 20 wasted comparisons on almost every unit.
+    if x != u && x != v && y != u && y != v {
+        let xu = red_adj[x].get(u);
+        let xv = red_adj[x].get(v);
+        let yu = red_adj[y].get(u);
+        let yv = red_adj[y].get(v);
+        return if xu & xv & yu & yv {
+            CrossPairs::AllRed
+        } else if !(xu | xv | yu | yv) {
+            CrossPairs::AllBlue
+        } else {
+            CrossPairs::Mixed
+        };
+    }
+
     let mut all_red = true;
     let mut all_blue = true;
     for a in [x, y] {
