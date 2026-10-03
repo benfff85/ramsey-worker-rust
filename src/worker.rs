@@ -167,8 +167,9 @@ const MAX_FETCH_GROWTH: i64 = 4;
 const STATS_INTERVAL_SECS: u64 = 30;
 /// Default number of correction requests per asynchronous Metal dispatch. It is parsed once per
 /// native worker process from `HOIST_GPU_CHUNK` so fleet tuning does not require a rebuild; Docker
-/// workers never enable the Metal path.
-const DEFAULT_GPU_CHUNK: usize = 32_768;
+/// workers never enable the Metal path. 65,536 is the configuration measured end to end on
+/// 2026-10-03 (campaign 10); the former 32,768 remains available through the variable.
+const DEFAULT_GPU_CHUNK: usize = 65_536;
 const MIN_GPU_CHUNK: usize = 1_024;
 const MAX_GPU_CHUNK: usize = 1_048_576;
 
@@ -183,23 +184,17 @@ fn configured_gpu_chunk() -> usize {
     parse_gpu_chunk(raw.as_deref())
 }
 
-/// The wider n=3 compressed GPU kernel is a startup-only experiment switch. Keep the legacy
-/// fallback available for a one-variable fleet A/B rather than making a shader change irreversible.
-fn parse_gpu_dense64(raw: Option<&str>) -> bool {
-    raw.map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false)
-}
-
-fn configured_gpu_dense64() -> bool {
-    let raw = std::env::var("GPU_DENSE64").ok();
-    parse_gpu_dense64(raw.as_deref())
-}
-
-/// Kill switch for the exact row selector (env ROW_SELECTOR, default on). Off takes the unchanged
-/// per-unit loop, so the selector can be measured or rolled back with a restart, not a rebuild.
-fn parse_row_selector(raw: Option<&str>) -> bool {
+/// Startup switches that default ON — `GPU_BUCKETING`, `GPU_DENSE64` and `ROW_SELECTOR`. Only an
+/// explicit `false`/`0` disables one, so a launcher that passes no environment (the 2026-10-01
+/// reboot did exactly that) still runs the configuration measured end to end on 2026-10-03. Each
+/// stays a restart-level rollback for a one-variable A/B.
+fn parse_switch_default_on(raw: Option<&str>) -> bool {
     raw.map(|value| !(value.eq_ignore_ascii_case("false") || value == "0"))
         .unwrap_or(true)
+}
+
+fn switch_default_on(name: &str) -> bool {
+    parse_switch_default_on(std::env::var(name).ok().as_deref())
 }
 
 /// Which stage to actually work, given the middleware's answer and the newest announced stage.
@@ -335,11 +330,11 @@ pub struct Worker {
     /// Correction requests per asynchronous Metal dispatch; read once at startup so live tuning
     /// changes only this scheduling parameter.
     gpu_chunk: usize,
-    /// Shape-only GPU request packing. Disabled by default so the existing dispatch order remains
-    /// available as an immediate scheduling rollback; Linux workers never enter the Metal path.
+    /// Shape-only GPU request packing (env GPU_BUCKETING, default on; `false` restores the original
+    /// dispatch order). Linux workers never enter the Metal path.
     gpu_bucketing: bool,
-    /// Enables the n=3, 33--64 candidate compressed Metal kernel. Kept separate from packing so
-    /// its fleet effect can be measured or rolled back without changing work order.
+    /// The n=3, 33--64 candidate compressed Metal kernel (env GPU_DENSE64, default on). Kept
+    /// separate from packing so it can be measured or rolled back without changing work order.
     gpu_dense64: bool,
     /// Exact row-level retirement of pair units (env ROW_SELECTOR, default on). Off leaves every
     /// pair on the per-unit loop.
@@ -425,11 +420,9 @@ impl Worker {
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false),
             gpu_chunk: configured_gpu_chunk(),
-            gpu_bucketing: std::env::var("GPU_BUCKETING")
-                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-                .unwrap_or(false),
-            gpu_dense64: configured_gpu_dense64(),
-            row_selector_enabled: parse_row_selector(std::env::var("ROW_SELECTOR").ok().as_deref()),
+            gpu_bucketing: switch_default_on("GPU_BUCKETING"),
+            gpu_dense64: switch_default_on("GPU_DENSE64"),
+            row_selector_enabled: switch_default_on("ROW_SELECTOR"),
             #[cfg(target_os = "macos")]
             gpu: None,
             gpu_graph: None,
@@ -2298,23 +2291,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_dense64_flag_is_opt_in_and_parses_explicit_true_values() {
-        assert!(!parse_gpu_dense64(None));
-        assert!(!parse_gpu_dense64(Some("false")));
-        assert!(!parse_gpu_dense64(Some("0")));
-        assert!(parse_gpu_dense64(Some("true")));
-        assert!(parse_gpu_dense64(Some("TRUE")));
-        assert!(parse_gpu_dense64(Some("1")));
-    }
-
-    #[test]
-    fn row_selector_defaults_on_and_only_explicit_false_disables_it() {
-        assert!(parse_row_selector(None));
-        assert!(parse_row_selector(Some("true")));
-        assert!(parse_row_selector(Some("1")));
-        assert!(!parse_row_selector(Some("false")));
-        assert!(!parse_row_selector(Some("FALSE")));
-        assert!(!parse_row_selector(Some("0")));
+    fn switches_default_on_and_only_explicit_false_disables_them() {
+        assert!(parse_switch_default_on(None));
+        assert!(parse_switch_default_on(Some("true")));
+        assert!(parse_switch_default_on(Some("1")));
+        assert!(!parse_switch_default_on(Some("false")));
+        assert!(!parse_switch_default_on(Some("FALSE")));
+        assert!(!parse_switch_default_on(Some("0")));
     }
 
     /// Waiting for peers is worth ~90 ms only while there is enough of the table missing for their
