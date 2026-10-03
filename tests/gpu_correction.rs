@@ -11,7 +11,7 @@
 #![cfg(target_os = "macos")]
 
 use ramsey_worker_rust::algorithm::count_cliques_through_vertex_set;
-use ramsey_worker_rust::gpu::{CorrectionEngine, CorrectionRequest};
+use ramsey_worker_rust::gpu::{CorrectionDispatchPlan, CorrectionEngine, CorrectionRequest};
 use ramsey_worker_rust::graph::Graph;
 
 const FIXTURE: &str = include_str!("fixtures/campaign3-consecutive-bases.txt");
@@ -104,8 +104,21 @@ fn check_graph(bits: &str, label: &str) {
     }
     assert!(shared > 1_000, "{label}: too few shared-vertex seeds to exercise need=5");
 
-    let got = engine.run(&reqs).expect("engine rejected a request shape");
+    let got = engine
+        .run(&reqs)
+        .expect("engine rejected a request shape")
+        .to_vec();
     assert_eq!(got.len(), want.len(), "{label}: result count");
+
+    // The worker groups only the n=3/n=4 correction shapes before Metal dispatch.
+    // Scatter must restore exactly the existing GPU order before candidate finalization.
+    let shape_plan = CorrectionDispatchPlan::by_shape(&reqs, engine.thread_execution_width());
+    let shape_dispatched = engine
+        .run(shape_plan.requests())
+        .expect("engine rejected a shape-bucketed request")
+        .to_vec();
+    let shape = shape_plan.scatter(&shape_dispatched);
+    assert_eq!(shape, got, "{label}: shape-bucketed GPU answers differ from current order");
 
     let mut mismatches = 0;
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
@@ -137,6 +150,17 @@ fn gpu_matches_cpu_on_a_real_campaign_graph() {
 #[ignore]
 fn gpu_matches_cpu_on_a_second_campaign_graph() {
     check_graph(&bases()[2], "graph 993917");
+}
+
+/// Any graph passed as `LIVE_GRAPH` (a 39,621-character edge string), so the check covers the
+/// candidate-set sizes of the campaign actually being run, not just the campaign-3 fixture.
+/// Fails rather than skips when unset, so it cannot pass vacuously.
+#[test]
+#[ignore]
+fn gpu_matches_cpu_on_a_live_graph() {
+    let bits = std::env::var("LIVE_GRAPH").expect("set LIVE_GRAPH to a 282-vertex edge string");
+    assert_eq!(bits.trim().len(), V * (V - 1) / 2, "LIVE_GRAPH has the wrong length");
+    check_graph(bits.trim(), "LIVE_GRAPH");
 }
 
 /// Throughput of the engine against the CPU primitive it would replace.

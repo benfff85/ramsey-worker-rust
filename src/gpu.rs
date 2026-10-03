@@ -38,6 +38,113 @@ pub struct CorrectionRequest {
     pub blue: bool,
 }
 
+/// A possibly reordered and padded GPU correction batch.
+///
+/// The worker finalizes results in original enumeration order because that is where its local
+/// top-N threshold tightens. The GPU does not need that ordering, so a dispatch can group the two
+/// correction shapes (three or four forced vertices) and later scatter answers back exactly.
+#[derive(Clone, Debug)]
+pub struct CorrectionDispatchPlan {
+    requests: Vec<CorrectionRequest>,
+    dispatch_to_original: Vec<Option<usize>>,
+    original_len: usize,
+}
+
+impl CorrectionDispatchPlan {
+    /// Preserve the current one-request-in, one-result-out dispatch behavior.
+    pub fn identity(requests: &[CorrectionRequest]) -> Self {
+        CorrectionDispatchPlan {
+            requests: requests.to_vec(),
+            dispatch_to_original: (0..requests.len()).map(Some).collect(),
+            original_len: requests.len(),
+        }
+    }
+
+    /// Group only by correction seed shape, padding each bucket to the Metal SIMD width.
+    ///
+    /// This is intentionally cheaper than candidate-size bucketing: it avoids a CPU
+    /// common-neighborhood prepass, preserving the overlap window that makes the hybrid path pay.
+    pub fn by_shape(requests: &[CorrectionRequest], thread_execution_width: usize) -> Self {
+        let width = thread_execution_width.max(1);
+        if requests.is_empty() || width == 1 {
+            return Self::identity(requests);
+        }
+
+        let mut shapes: Vec<u8> = Vec::new();
+        let mut buckets: Vec<Vec<usize>> = Vec::new();
+        for (original, request) in requests.iter().enumerate() {
+            let bucket = match shapes.iter().position(|known| *known == request.n) {
+                Some(index) => index,
+                None => {
+                    shapes.push(request.n);
+                    buckets.push(Vec::new());
+                    buckets.len() - 1
+                }
+            };
+            buckets[bucket].push(original);
+        }
+        Self::from_buckets(requests, buckets, width)
+    }
+
+    fn from_buckets(
+        requests: &[CorrectionRequest],
+        buckets: Vec<Vec<usize>>,
+        thread_execution_width: usize,
+    ) -> Self {
+        let width = thread_execution_width.max(1);
+        let mut dispatch_requests = Vec::with_capacity(requests.len());
+        let mut dispatch_to_original = Vec::with_capacity(requests.len());
+        for bucket in buckets {
+            for &original in &bucket {
+                dispatch_requests.push(requests[original]);
+                dispatch_to_original.push(Some(original));
+            }
+            let padding = (width - (bucket.len() % width)) % width;
+            for offset in 0..padding {
+                let duplicate = bucket[offset % bucket.len()];
+                dispatch_requests.push(requests[duplicate]);
+                dispatch_to_original.push(None);
+            }
+        }
+
+        CorrectionDispatchPlan {
+            requests: dispatch_requests,
+            dispatch_to_original,
+            original_len: requests.len(),
+        }
+    }
+
+    pub fn requests(&self) -> &[CorrectionRequest] {
+        &self.requests
+    }
+
+    /// Restore GPU answers to the original request order and discard padded duplicates.
+    pub fn scatter(&self, dispatch_results: &[i32]) -> Vec<i32> {
+        assert_eq!(
+            dispatch_results.len(),
+            self.dispatch_to_original.len(),
+            "GPU result count must match the dispatch plan"
+        );
+        let mut original_results = vec![0; self.original_len];
+        let mut filled = vec![false; self.original_len];
+        for (&result, original) in dispatch_results.iter().zip(self.dispatch_to_original.iter()) {
+            if let Some(original) = original {
+                assert!(
+                    !filled[*original],
+                    "a real correction may have only one dispatch result"
+                );
+                original_results[*original] = result;
+                filled[*original] = true;
+            }
+        }
+        assert!(
+            filled.iter().all(|was_filled| *was_filled),
+            "every real correction must receive a dispatch result"
+        );
+        original_results
+    }
+}
+
 /// Words per adjacency row: 282 vertices rounded up to 320 bits.
 pub const ROW_WORDS: usize = 10;
 
@@ -62,6 +169,41 @@ pub fn flatten_adjacency(graph: &Graph, vertex_count: usize) -> (Vec<u32>, Vec<u
         }
     }
     (red, blue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(n: u8, seed: u16) -> CorrectionRequest {
+        CorrectionRequest {
+            seeds: [seed, seed + 1, seed + 2, seed + 3],
+            n,
+            blue: false,
+        }
+    }
+
+    #[test]
+    fn shape_dispatch_groups_seed_shapes_and_restores_original_order() {
+        let requests = [
+            request(4, 0),
+            request(3, 10),
+            request(4, 20),
+            request(3, 30),
+            request(3, 40),
+        ];
+        let plan = CorrectionDispatchPlan::by_shape(&requests, 4);
+
+        // n=4 contributes two real requests plus two pads; n=3 contributes three plus one pad.
+        assert_eq!(plan.requests().len(), 8);
+        let dispatch_results: Vec<i32> = (0..plan.requests().len())
+            .map(|slot| 2000 + slot as i32)
+            .collect();
+        let restored = plan.scatter(&dispatch_results);
+        assert_eq!(restored.len(), requests.len());
+        assert!(restored.iter().all(|result| *result >= 2000));
+        assert_ne!(restored, dispatch_results[..requests.len()]);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -221,6 +363,72 @@ static inline uint cdense(uint p, uint need, thread const uint *loc) {
     return 0;   // unreachable: the host rejects need outside 1..=5
 }
 
+// n=3 candidates occasionally exceed the 32-bit compressed path, but none of the sampled
+// production candidates exceeded 64 vertices. Keep this deliberately separate from the 32-bit
+// path: it is opt-in at dispatch time so the benchmark can compare it with the established
+// full-width fallback on identical requests.
+static inline uint cd2_64(ulong p, thread const ulong *loc) {
+    uint c = 0;
+    while (p != 0) {
+        uint v = uint(ctz(p));
+        p &= p - 1;
+        c += uint(popcount(p & loc[v]));
+    }
+    return c;
+}
+
+static inline uint cd3_64(ulong p, thread const ulong *loc) {
+    uint c = 0;
+    uint rem = uint(popcount(p));
+    while (p != 0) {
+        if (rem < 3) { break; }
+        rem -= 1;
+        uint v = uint(ctz(p));
+        p &= p - 1;
+        ulong pv = p & loc[v];
+        if (popcount(pv) >= 2) { c += cd2_64(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cd4_64(ulong p, thread const ulong *loc) {
+    uint c = 0;
+    uint rem = uint(popcount(p));
+    while (p != 0) {
+        if (rem < 4) { break; }
+        rem -= 1;
+        uint v = uint(ctz(p));
+        p &= p - 1;
+        ulong pv = p & loc[v];
+        if (popcount(pv) >= 3) { c += cd3_64(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cd5_64(ulong p, thread const ulong *loc) {
+    uint c = 0;
+    uint rem = uint(popcount(p));
+    while (p != 0) {
+        if (rem < 5) { break; }
+        rem -= 1;
+        uint v = uint(ctz(p));
+        p &= p - 1;
+        ulong pv = p & loc[v];
+        if (popcount(pv) >= 4) { c += cd4_64(pv, loc); }
+    }
+    return c;
+}
+
+static inline uint cdense64(ulong p, uint need, thread const ulong *loc) {
+    if (need == 0) { return 1; }
+    if (need == 1) { return uint(popcount(p)); }
+    if (need == 2) { return cd2_64(p, loc); }
+    if (need == 3) { return cd3_64(p, loc); }
+    if (need == 4) { return cd4_64(p, loc); }
+    if (need == 5) { return cd5_64(p, loc); }
+    return 0;
+}
+
 kernel void corrections(device const uint   *red    [[buffer(0)]],
                         device const uint   *blue   [[buffer(1)]],
                         device const ushort *seeds  [[buffer(2)]],
@@ -228,6 +436,7 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
                         device       int    *out    [[buffer(4)]],
                         constant     uint   &clique [[buffer(5)]],
                         constant     uint   &count  [[buffer(6)]],
+                        constant     uint   &dense64_enabled [[buffer(7)]],
                         uint gid [[thread_position_in_grid]])
 {
     if (gid >= count) { return; }
@@ -271,6 +480,31 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
         uint full = (m == 32) ? 0xFFFFFFFFu : ((1u << m) - 1u);
         total = cdense(full, need, loc);
     }
+    else if (n == 3 && c <= 64 && dense64_enabled != 0) {
+        // n=3 only: preserve the dense32 branch above, and only replace the proven generic
+        // fallback when P has 33--64 vertices.
+        ushort verts[64]; uint m = 0;
+        for (uint wi = 0; wi < RW && m < c; ++wi) {
+            uint word = p[wi];
+            while (word != 0) {
+                uint b = ctz(word);
+                word &= word - 1;
+                verts[m++] = ushort(wi*32 + b);
+            }
+        }
+        ulong loc[64];
+        for (uint a = 0; a < m; ++a) {
+            device const uint *row = adj + uint(verts[a])*RW;
+            ulong mask = 0;
+            for (uint b = 0; b < m; ++b) {
+                uint vb = uint(verts[b]);
+                if ((row[vb >> 5] >> (vb & 31)) & 1u) { mask |= (1ul << b); }
+            }
+            loc[a] = mask;
+        }
+        ulong full = (m == 64) ? ~0ul : ((1ul << m) - 1ul);
+        total = cdense64(full, need, loc);
+    }
     else if (need == 1)      { total = c; }
     else if (need == 2)      { total = f_k2(p, adj); }
     else if (need == 3)      { total = f_k3(p, adj); }
@@ -288,12 +522,27 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
         blue: metal::Buffer,
         vertex_count: usize,
         clique_size: usize,
+        dense64_enabled: u32,
         results: Vec<i32>,
     }
 
     impl CorrectionEngine {
         /// `None` when no Metal device is present, so callers fall back to the CPU path.
         pub fn new(graph: &Graph, vertex_count: usize, clique_size: usize) -> Option<Self> {
+            Self::new_with_dense64(graph, vertex_count, clique_size, true)
+        }
+
+        /// Construct an engine with the n=3, 33--64 compressed path explicitly selected.
+        ///
+        /// Direct constructor users get the enabled default; the worker passes its startup flag.
+        /// The switch also lets the GPU integration test compare this kernel against the established
+        /// generic fallback on the same input.
+        pub fn new_with_dense64(
+            graph: &Graph,
+            vertex_count: usize,
+            clique_size: usize,
+            dense64_enabled: bool,
+        ) -> Option<Self> {
             let device = Device::system_default()?;
             let lib = device
                 .new_library_with_source(SHADER, &metal::CompileOptions::new())
@@ -320,6 +569,7 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
                 blue,
                 vertex_count,
                 clique_size,
+                dense64_enabled: u32::from(dense64_enabled),
                 results: Vec::new(),
             })
         }
@@ -334,6 +584,12 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
                 std::ptr::copy_nonoverlapping(b.as_ptr(), self.blue.contents() as *mut u32, b.len());
             }
             let _ = n;
+        }
+
+        /// Native SIMD width for this exact pipeline. Dispatch packing must use this rather than
+        /// assuming a particular Apple GPU generation's width.
+        pub fn thread_execution_width(&self) -> usize {
+            self.pipeline.thread_execution_width() as usize
         }
 
         /// Submit work without waiting, so the CPU can keep classifying while the GPU runs.
@@ -438,6 +694,7 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
         ) {
             let cs = self.clique_size as u32;
             let cnt = n as u32;
+            let dense64_enabled = self.dense64_enabled;
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.pipeline);
             enc.set_buffer(0, Some(&self.red), 0);
@@ -447,6 +704,11 @@ kernel void corrections(device const uint   *red    [[buffer(0)]],
             enc.set_buffer(4, Some(bo), 0);
             enc.set_bytes(5, size_of::<u32>() as u64, &cs as *const u32 as *const _);
             enc.set_bytes(6, size_of::<u32>() as u64, &cnt as *const u32 as *const _);
+            enc.set_bytes(
+                7,
+                size_of::<u32>() as u64,
+                &dense64_enabled as *const u32 as *const _,
+            );
             let tg = self.pipeline.max_total_threads_per_threadgroup().min(256);
             enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
             enc.end_encoding();

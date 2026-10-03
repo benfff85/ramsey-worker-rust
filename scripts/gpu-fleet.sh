@@ -24,8 +24,18 @@ export WORK_UNIT_PUBLISH_COUNT="${WORK_UNIT_PUBLISH_COUNT:-10000}"
 export WORK_UNIT_POLL_FREQ="${WORK_UNIT_POLL_FREQ:-1000}"
 export PUBLISH_RESULTS="${PUBLISH_RESULTS:-false}"
 export HOIST_GPU_ENABLED=true
+# Measured configuration (2026-10-03, campaign 10, mirrored A/B with m1 paused): everything on is
+# +108% fleet throughput against the pre-selector build; within it dense-64 is +6.6% and the GPU
+# set +4.1% (small, below the ~5% between-block spread). The worker defaults these on as well, so a
+# launcher that passes no environment still gets them; set any to false for a restart-level A/B.
+export HOIST_GPU_CHUNK="${HOIST_GPU_CHUNK:-65536}"
+export GPU_BUCKETING="${GPU_BUCKETING:-true}"
+export GPU_DENSE64="${GPU_DENSE64:-true}"
+export ROW_SELECTOR="${ROW_SELECTOR:-true}"
 
-BIN=./target/release/ramsey-worker-rust
+# Leave the checked-out release binary as the default.  An absolute override lets a separately
+# built candidate be tested without overwriting that known-good artifact.
+BIN="${RAMSEY_GPU_WORKER_BIN:-./target/release/ramsey-worker-rust}"
 [ -x "$BIN" ] || { echo "$(date -u +%FT%TZ) missing $BIN — cargo build --release first"; exit 1; }
 
 pids=()
