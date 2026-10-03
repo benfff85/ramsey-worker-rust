@@ -3,7 +3,9 @@ use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::{Graph, WorkUnitEdge};
-use crate::gpu::{CorrectionDispatchPlan, CorrectionRequest};
+use crate::gpu::CorrectionRequest;
+#[cfg(target_os = "macos")]
+use crate::gpu::CorrectionDispatchPlan;
 use crate::hoist::{HoistTables, PairOutcome};
 use crate::model::{StageConfig, WorkEnumerationStrategy, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
