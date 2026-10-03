@@ -3,10 +3,11 @@ use crate::client::MiddlewareClient;
 use crate::clique_collection::CliqueCollection;
 use crate::enumeration::{WorkEnumerator, WorkUnit, create_enumerator};
 use crate::graph::{Graph, WorkUnitEdge};
-use crate::gpu::CorrectionRequest;
+use crate::gpu::{CorrectionDispatchPlan, CorrectionRequest};
 use crate::hoist::{HoistTables, PairOutcome};
-use crate::model::{StageConfig, WorkResult, WorkUnitAnalysisType};
+use crate::model::{StageConfig, WorkEnumerationStrategy, WorkResult, WorkUnitAnalysisType};
 use crate::redis_client::{RedisClient, StageAnnouncements, watch_stage_advances};
+use crate::separable::{RowSelectorScratch, SeparableRowPlan};
 use std::sync::Arc;
 use crate::sa::{SaConfig, run_sa};
 use crate::tabu::{TabuConfig, run_tabu};
@@ -164,6 +165,35 @@ const MAX_FETCH_GROWTH: i64 = 4;
 /// times a second, so per-batch logging scaled with the fleet's speed rather than with anything
 /// worth reading.
 const STATS_INTERVAL_SECS: u64 = 30;
+/// Default number of correction requests per asynchronous Metal dispatch. It is parsed once per
+/// native worker process from `HOIST_GPU_CHUNK` so fleet tuning does not require a rebuild; Docker
+/// workers never enable the Metal path.
+const DEFAULT_GPU_CHUNK: usize = 32_768;
+const MIN_GPU_CHUNK: usize = 1_024;
+const MAX_GPU_CHUNK: usize = 1_048_576;
+
+fn parse_gpu_chunk(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| (MIN_GPU_CHUNK..=MAX_GPU_CHUNK).contains(&value))
+        .unwrap_or(DEFAULT_GPU_CHUNK)
+}
+
+fn configured_gpu_chunk() -> usize {
+    let raw = std::env::var("HOIST_GPU_CHUNK").ok();
+    parse_gpu_chunk(raw.as_deref())
+}
+
+/// The wider n=3 compressed GPU kernel is a startup-only experiment switch. Keep the legacy
+/// fallback available for a one-variable fleet A/B rather than making a shader change irreversible.
+fn parse_gpu_dense64(raw: Option<&str>) -> bool {
+    raw.map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+fn configured_gpu_dense64() -> bool {
+    let raw = std::env::var("GPU_DENSE64").ok();
+    parse_gpu_dense64(raw.as_deref())
+}
 
 /// Which stage to actually work, given the middleware's answer and the newest announced stage.
 ///
@@ -180,6 +210,20 @@ fn effective_stage_id(mw_stage_id: i32, announced: Option<i32>) -> i32 {
         Some(a) if a > mw_stage_id => a,
         _ => mw_stage_id,
     }
+}
+
+/// A selected row may be charged as its full logical width only while its stage remains current.
+/// The selector can evaluate far fewer than that width, so the ordinary every-N-evaluated-units
+/// check is not enough at this commit boundary.
+#[inline]
+fn may_commit_selected_row(
+    announcements: &StageAnnouncements,
+    campaign_id: i32,
+    stage_id: i32,
+) -> bool {
+    !announcements
+        .latest_for(campaign_id)
+        .is_some_and(|announced| announced != stage_id)
 }
 
 /// Next batch size, from the previous batch's measured cost.
@@ -216,6 +260,9 @@ pub struct Worker {
     /// evaluation. Keyed by GRAPH id and pruned with the other per-graph caches, so it can never
     /// outlive the graph it describes.
     hoist_cache: HashMap<i32, HoistTables>,
+    /// Immutable metadata for exact row-level retirement once a graph's hoist table is complete.
+    /// Kept beside the table and pruned with it: its per-edge terms describe that graph only.
+    separable_cache: HashMap<i32, SeparableRowPlan>,
     /// Kill switch for the hoisted path (env HOIST_ENABLED). Off falls back to the seeded kernel,
     /// which computes exactly the same values.
     hoist_enabled: bool,
@@ -278,6 +325,15 @@ pub struct Worker {
     /// waited on. Measured standalone: 6.98 -> 36.93 M units/sec for one worker, bit-identical over
     /// 3M units. Never available in the Linux worker container, which has no GPU device nodes.
     gpu_enabled: bool,
+    /// Correction requests per asynchronous Metal dispatch; read once at startup so live tuning
+    /// changes only this scheduling parameter.
+    gpu_chunk: usize,
+    /// Shape-only GPU request packing. Disabled by default so the existing dispatch order remains
+    /// available as an immediate scheduling rollback; Linux workers never enter the Metal path.
+    gpu_bucketing: bool,
+    /// Enables the n=3, 33--64 candidate compressed Metal kernel. Kept separate from packing so
+    /// its fleet effect can be measured or rolled back without changing work order.
+    gpu_dense64: bool,
     #[cfg(target_os = "macos")]
     gpu: Option<crate::gpu::CorrectionEngine>,
     /// Base graph the GPU engine currently holds, so it is re-uploaded once per stage, not per batch.
@@ -339,6 +395,7 @@ impl Worker {
             graph_cache: HashMap::new(),
             clique_collection_cache: HashMap::new(),
             hoist_cache: HashMap::new(),
+            separable_cache: HashMap::new(),
             hoist_enabled,
             stage_announcements: Arc::new(StageAnnouncements::default()),
             retry_soon: false,
@@ -357,6 +414,11 @@ impl Worker {
             gpu_enabled: std::env::var("HOIST_GPU_ENABLED")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false),
+            gpu_chunk: configured_gpu_chunk(),
+            gpu_bucketing: std::env::var("GPU_BUCKETING")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false),
+            gpu_dense64: configured_gpu_dense64(),
             #[cfg(target_os = "macos")]
             gpu: None,
             gpu_graph: None,
@@ -1111,6 +1173,33 @@ impl Worker {
             }
         }
 
+        // The exact row selector is only valid once every single-edge value is already known.
+        // Building it from a partial table would fill holes locally and defeat the co-operative
+        // hoist ramp; waiting also keeps the ordinary loop as the unambiguous fallback during
+        // short stages. The plan is immutable for a graph id, so build it once and retain it
+        // beside the per-graph caches.
+        let can_build_separable_plan = engage
+            && !publish_results
+            && config.strategy == WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES
+            && self
+                .hoist_cache
+                .get(&base_graph_id)
+                .is_some_and(HoistTables::is_complete)
+            && !self.separable_cache.contains_key(&base_graph_id);
+        if can_build_separable_plan {
+            let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
+            let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
+            let tables = self.hoist_cache.get_mut(&base_graph_id).unwrap();
+            let plan = SeparableRowPlan::build(graph, self.clique_size, clique_collection, tables);
+            log_info!(
+                "Separable row selector ready for graph {}: {} red x {} blue pair rows",
+                base_graph_id,
+                plan.red_len(),
+                plan.blue_len()
+            );
+            self.separable_cache.insert(base_graph_id, plan);
+        }
+
         let graph = self.graph_cache.get_mut(&base_graph_id).unwrap();
         let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
         let mut hoist = if engage {
@@ -1125,7 +1214,12 @@ impl Worker {
         let gpu_active = {
             if self.gpu_enabled && engage {
                 if self.gpu.is_none() {
-                    self.gpu = crate::gpu::CorrectionEngine::new(graph, self.vertex_count, clique_size);
+                    self.gpu = crate::gpu::CorrectionEngine::new_with_dense64(
+                        graph,
+                        self.vertex_count,
+                        clique_size,
+                        self.gpu_dense64,
+                    );
                     self.gpu_graph = self.gpu.as_ref().map(|_| base_graph_id);
                     if self.gpu.is_none() {
                         log_error!("HOIST_GPU_ENABLED set but no Metal device — staying on CPU");
@@ -1152,13 +1246,14 @@ impl Worker {
             base: i32,
             limit: i32,
         }
-        /// Corrections per dispatch: big enough to amortise the dispatch, small enough that the CPU
-        /// always has a chunk to classify while the GPU works on the previous one.
-        const GPU_CHUNK: usize = 32_768;
         let mut defer_reqs: Vec<CorrectionRequest> = Vec::new();
         let mut defer_units: Vec<Deferred> = Vec::new();
         #[cfg(target_os = "macos")]
-        let mut inflight: Option<(crate::gpu::Pending, Vec<Deferred>)> = None;
+        let mut inflight: Option<(
+            crate::gpu::Pending,
+            Vec<Deferred>,
+            CorrectionDispatchPlan,
+        )> = None;
 
         // Fetch the current threshold for top-N results (None = accept anything).
         // Declared mut so it can be tightened in-loop as the sorted set fills up,
@@ -1171,6 +1266,19 @@ impl Worker {
                 .unwrap_or(None)
         };
 
+        // The plan is used only under the same preconditions that created it. It is intentionally
+        // optional: no threshold, partial ranges, an incomplete table, or any non-sequential
+        // strategy continues through the byte-for-byte existing per-unit path below.
+        let separable_plan = if !publish_results
+            && config.strategy == WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES
+        {
+            self.separable_cache.get(&base_graph_id)
+        } else {
+            None
+        };
+        let mut row_selector_scratch = separable_plan
+            .map(|plan| RowSelectorScratch::new(plan.blue_len()));
+
         let mut processed_results: Vec<WorkResult> = Vec::new();
 
         // Process each work unit in the range
@@ -1178,28 +1286,109 @@ impl Worker {
         let announcements = Arc::clone(&self.stage_announcements);
         let mut units_done: i64 = 0;
         let mut abandoned = false;
-        for idx in start_index..end_index {
-            // Abandon promptly when this stage has been superseded — everything computed past that
-            // point is written to keys the queue manager has already cleared.
-            if units_done % STAGE_CHECK_INTERVAL_UNITS == 0
-                && units_done > 0
-                && announcements
-                    .latest_for(campaign_id_for_counter)
-                    .is_some_and(|announced| announced != stage_id)
+        let mut idx = start_index;
+        // A selected row is classified one retained pair at a time, then only afterwards counts
+        // as its full logical width. That ordering is important: if a new stage arrives during
+        // its retained work, do not claim its retired units as processed.
+        let mut selected_row: Option<(usize, usize)> = None;
+        let mut evaluated_since_stage_check = 0i64;
+        while idx < end_index || selected_row.is_some() {
+            // Retired units are intentionally not charged here: checking every 4k *evaluated*
+            // units is at least as responsive in wall time, and each newly selected row below
+            // gets an unconditional boundary check before its logical count advances.
+            if evaluated_since_stage_check >= STAGE_CHECK_INTERVAL_UNITS
+                && !may_commit_selected_row(&announcements, campaign_id_for_counter, stage_id)
             {
                 abandoned = true;
                 break;
             }
-            units_done += 1;
+            if evaluated_since_stage_check >= STAGE_CHECK_INTERVAL_UNITS {
+                evaluated_since_stage_check = 0;
+            }
+
+            let unit = if let Some((red_index, selected_offset)) = selected_row {
+                let selected = row_selector_scratch
+                    .as_ref()
+                    .expect("selected row requires selector scratch")
+                    .selected();
+                if selected_offset == selected.len() {
+                    // A row's cheap retirements become processed work only at this instant. A
+                    // stage announcement may have arrived while its selected pairs were running;
+                    // never report the unevaluated remainder against the retired stage.
+                    if !may_commit_selected_row(&announcements, campaign_id_for_counter, stage_id)
+                    {
+                        abandoned = true;
+                        break;
+                    }
+                    let plan = separable_plan.expect("selected row requires selector plan");
+                    // This whole row is now complete: both selected evaluation and exact logical
+                    // retirement succeeded, so it contributes the same `blue_len` units the
+                    // original enumerator would have contributed one by one.
+                    idx += plan.blue_len() as i64;
+                    units_done += plan.blue_len() as i64;
+                    selected_row = None;
+                    continue;
+                }
+                let blue_index = selected[selected_offset];
+                selected_row = Some((red_index, selected_offset + 1));
+                let plan = separable_plan.expect("selected row requires selector plan");
+                let r = plan.red_edge(red_index);
+                let b = plan.blue_edge(blue_index);
+                WorkUnit::PairFlip(
+                    WorkUnitEdge {
+                        vertex_one: r.0 as u16,
+                        vertex_two: r.1 as u16,
+                    },
+                    WorkUnitEdge {
+                        vertex_one: b.0 as u16,
+                        vertex_two: b.1 as u16,
+                    },
+                )
+            } else {
+                // Use exact retirement only for a whole red row that is entirely inside this
+                // already-claimed range. Singles, partial rows, missing thresholds, and every
+                // other enumeration strategy take the untouched per-index path.
+                if let (Some(plan), Some(threshold)) = (separable_plan, top_threshold) {
+                    if let Some(red_index) = plan.complete_row_starting_at(idx, end_index) {
+                        // Do not advance a logical row after a stage switch. In particular, this
+                        // prevents an empty selector row from reporting work it did not own long
+                        // enough to settle.
+                        if !may_commit_selected_row(
+                            &announcements,
+                            campaign_id_for_counter,
+                            stage_id,
+                        ) {
+                            abandoned = true;
+                            break;
+                        }
+                        plan.select_row(
+                            graph,
+                            red_index,
+                            threshold,
+                            row_selector_scratch
+                                .as_mut()
+                                .expect("selector plan requires selector scratch"),
+                        );
+                        selected_row = Some((red_index, 0));
+                        continue;
+                    }
+                }
+                let unit = enumerator.index_to_work_unit(idx);
+                idx += 1;
+                units_done += 1;
+                unit
+            };
+            evaluated_since_stage_check += 1;
 
             // Hand the GPU a chunk and collect the PREVIOUS one — collected only now, so it ran
             // while the CPU was classifying these units. Dispatching and waiting would just
             // alternate the two and is measurably worse than the CPU alone.
             #[cfg(target_os = "macos")]
-            if gpu_active && defer_reqs.len() >= GPU_CHUNK {
-                if let Some((pending, owed)) = inflight.take() {
-                    let results: Vec<i32> =
+            if gpu_active && defer_reqs.len() >= self.gpu_chunk {
+                if let Some((pending, owed, plan)) = inflight.take() {
+                    let dispatched: Vec<i32> =
                         self.gpu.as_mut().unwrap().collect(pending).to_vec();
+                    let results = plan.scatter(&dispatched);
                     for (d, corr) in owed.iter().zip(results.iter()) {
                         if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
                             let count = d.base_total - d.broken + created;
@@ -1222,16 +1411,21 @@ impl Worker {
                         }
                     }
                 }
+                let plan = if self.gpu_bucketing {
+                    let width = self.gpu.as_ref().unwrap().thread_execution_width();
+                    CorrectionDispatchPlan::by_shape(&defer_reqs, width)
+                } else {
+                    CorrectionDispatchPlan::identity(&defer_reqs)
+                };
                 let pending = self
                     .gpu
                     .as_mut()
                     .unwrap()
-                    .dispatch(&defer_reqs)
+                    .dispatch(plan.requests())
                     .ok_or("GPU rejected a correction batch")?;
-                inflight = Some((pending, std::mem::take(&mut defer_units)));
+                inflight = Some((pending, std::mem::take(&mut defer_units), plan));
                 defer_reqs.clear();
             }
-            let unit = enumerator.index_to_work_unit(idx);
             // Stack buffer, not a per-unit heap allocation. This was profiled at 0.2% and
             // deliberately left alone in the 2026-07-15 kernel round — correctly, when a unit cost
             // 13.5us of Bron-Kerbosch. The hoist and then the correction bound removed everything
@@ -1373,8 +1567,9 @@ impl Worker {
         // Drain whatever is still in flight or unbatched before the batch is reported.
         #[cfg(target_os = "macos")]
         {
-            if let Some((pending, owed)) = inflight.take() {
-                let results: Vec<i32> = self.gpu.as_mut().unwrap().collect(pending).to_vec();
+            if let Some((pending, owed, plan)) = inflight.take() {
+                let dispatched: Vec<i32> = self.gpu.as_mut().unwrap().collect(pending).to_vec();
+                let results = plan.scatter(&dispatched);
                 for (d, corr) in owed.iter().zip(results.iter()) {
                     if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
                         let count = d.base_total - d.broken + created;
@@ -1399,13 +1594,20 @@ impl Worker {
             }
             if !defer_reqs.is_empty() {
                 let owed = std::mem::take(&mut defer_units);
-                let results: Vec<i32> = self
+                let plan = if self.gpu_bucketing {
+                    let width = self.gpu.as_ref().unwrap().thread_execution_width();
+                    CorrectionDispatchPlan::by_shape(&defer_reqs, width)
+                } else {
+                    CorrectionDispatchPlan::identity(&defer_reqs)
+                };
+                let dispatched: Vec<i32> = self
                     .gpu
                     .as_mut()
                     .unwrap()
-                    .run(&defer_reqs)
+                    .run(plan.requests())
                     .ok_or("GPU rejected a correction batch")?
                     .to_vec();
+                let results = plan.scatter(&dispatched);
                 for (d, corr) in owed.iter().zip(results.iter()) {
                     if let Some(created) = HoistTables::finish_pair(d.base, *corr, d.limit) {
                         let count = d.base_total - d.broken + created;
@@ -1725,6 +1927,7 @@ impl Worker {
                 self.graph_cache.remove(&id);
                 self.clique_collection_cache.remove(&id);
                 self.hoist_cache.remove(&id);
+                self.separable_cache.remove(&id);
             }
         }
     }
@@ -1793,6 +1996,7 @@ impl Worker {
         self.graph_cache.clear();
         self.clique_collection_cache.clear();
         self.hoist_cache.clear();
+        self.separable_cache.clear();
         self.last_base_graph_id = None;
         self.hoist_carry = None;
     }
@@ -1929,6 +2133,24 @@ mod tests {
 
     const MS: u128 = 1_000_000;
 
+    #[test]
+    fn selected_row_cannot_commit_after_its_stage_is_superseded() {
+        let announcements = StageAnnouncements::default();
+        assert!(
+            may_commit_selected_row(&announcements, 3, 100),
+            "an absent announcement must not block the current stage"
+        );
+        announcements.set(3, 101);
+        assert!(
+            !may_commit_selected_row(&announcements, 3, 100),
+            "a selected row must not claim its retired units after a newer stage arrives"
+        );
+        assert!(
+            may_commit_selected_row(&announcements, 4, 100),
+            "an announcement for another campaign must not block this worker"
+        );
+    }
+
     /// The gate sits just past the singles block, so every pair unit is hoisted.
     ///
     /// Replaced a 5M gate plus two generations of predictor. The predictors failed because the
@@ -2052,6 +2274,26 @@ mod tests {
         let next = next_fetch_size(size, floor, size as i64, nanos);
         assert_eq!(next, size, "should not move when already on target");
     }
+
+    #[test]
+    fn gpu_chunk_config_is_bounded_and_defaults_safely() {
+        assert_eq!(parse_gpu_chunk(None), DEFAULT_GPU_CHUNK);
+        assert_eq!(parse_gpu_chunk(Some("65536")), 65_536);
+        assert_eq!(parse_gpu_chunk(Some("1023")), DEFAULT_GPU_CHUNK);
+        assert_eq!(parse_gpu_chunk(Some("1048577")), DEFAULT_GPU_CHUNK);
+        assert_eq!(parse_gpu_chunk(Some("not-a-number")), DEFAULT_GPU_CHUNK);
+    }
+
+    #[test]
+    fn gpu_dense64_flag_is_opt_in_and_parses_explicit_true_values() {
+        assert!(!parse_gpu_dense64(None));
+        assert!(!parse_gpu_dense64(Some("false")));
+        assert!(!parse_gpu_dense64(Some("0")));
+        assert!(parse_gpu_dense64(Some("true")));
+        assert!(parse_gpu_dense64(Some("TRUE")));
+        assert!(parse_gpu_dense64(Some("1")));
+    }
+
     /// Waiting for peers is worth ~90 ms only while there is enough of the table missing for their
     /// slices to fill. Measured over 800 stage engages after the hoist carry landed: below 85%
     /// coverage the wait returns 2,593-24,751 entries (worth 436-4,158 ms of on-demand fills

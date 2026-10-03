@@ -24,8 +24,20 @@ export WORK_UNIT_PUBLISH_COUNT="${WORK_UNIT_PUBLISH_COUNT:-10000}"
 export WORK_UNIT_POLL_FREQ="${WORK_UNIT_POLL_FREQ:-1000}"
 export PUBLISH_RESULTS="${PUBLISH_RESULTS:-false}"
 export HOIST_GPU_ENABLED=true
+# On the shared M4 GPU, 65,536 corrections per dispatch measured 8.4% faster than the former
+# 32,768 default in an m1-silenced A/B/A/B fleet trial (2026-08-31). Keep an env override so a
+# future hardware-specific sweep remains a restart, not a source edit.
+export HOIST_GPU_CHUNK="${HOIST_GPU_CHUNK:-65536}"
+# Keep shape packing reversible at supervisor restart granularity. This defaults to the legacy
+# order, while the promoted deployment explicitly sets it true after its A/B/A/B validation.
+export GPU_BUCKETING="${GPU_BUCKETING:-false}"
+# Keep the n=3 33--64 compressed kernel independently reversible for its fleet A/B. It stays off
+# until its own validation is promoted, so a restart can return to the generic fallback exactly.
+export GPU_DENSE64="${GPU_DENSE64:-false}"
 
-BIN=./target/release/ramsey-worker-rust
+# Leave the checked-out release binary as the default.  An absolute override lets a separately
+# built candidate be tested without overwriting that known-good artifact.
+BIN="${RAMSEY_GPU_WORKER_BIN:-./target/release/ramsey-worker-rust}"
 [ -x "$BIN" ] || { echo "$(date -u +%FT%TZ) missing $BIN — cargo build --release first"; exit 1; }
 
 pids=()

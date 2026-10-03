@@ -10,6 +10,7 @@ pub mod hoist;
 pub mod logging;
 pub mod model;
 pub mod redis_client;
+pub mod separable;
 pub mod sa;
 pub mod tabu;
 pub mod vds;
