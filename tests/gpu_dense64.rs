@@ -17,8 +17,16 @@ const CLIQUE_SIZE: usize = 8;
 const ORACLE_REQUESTS: usize = 5_000;
 const BENCH_REQUESTS: usize = 131_072;
 
+/// The campaign-3 fixture, or any graph passed as `LIVE_GRAPH` (a 39,621-character edge string).
 fn graph() -> Graph {
-    let bits = FIXTURE.lines().find(|line| !line.trim().is_empty()).unwrap().trim();
+    let live = std::env::var("LIVE_GRAPH").ok();
+    let bits = match live.as_deref() {
+        Some(bits) => {
+            assert_eq!(bits.trim().len(), VERTICES * (VERTICES - 1) / 2, "LIVE_GRAPH length");
+            bits.trim()
+        }
+        None => FIXTURE.lines().find(|line| !line.trim().is_empty()).unwrap().trim(),
+    };
     Graph::from_bitstring(bits, VERTICES)
 }
 

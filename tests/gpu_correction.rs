@@ -152,6 +152,17 @@ fn gpu_matches_cpu_on_a_second_campaign_graph() {
     check_graph(&bases()[2], "graph 993917");
 }
 
+/// Any graph passed as `LIVE_GRAPH` (a 39,621-character edge string), so the check covers the
+/// candidate-set sizes of the campaign actually being run, not just the campaign-3 fixture.
+/// Fails rather than skips when unset, so it cannot pass vacuously.
+#[test]
+#[ignore]
+fn gpu_matches_cpu_on_a_live_graph() {
+    let bits = std::env::var("LIVE_GRAPH").expect("set LIVE_GRAPH to a 282-vertex edge string");
+    assert_eq!(bits.trim().len(), V * (V - 1) / 2, "LIVE_GRAPH has the wrong length");
+    check_graph(bits.trim(), "LIVE_GRAPH");
+}
+
 /// Throughput of the engine against the CPU primitive it would replace.
 ///
 /// Reported for `n = 4` (both edges disjoint), which dominates production: a red and a blue edge

@@ -195,6 +195,13 @@ fn configured_gpu_dense64() -> bool {
     parse_gpu_dense64(raw.as_deref())
 }
 
+/// Kill switch for the exact row selector (env ROW_SELECTOR, default on). Off takes the unchanged
+/// per-unit loop, so the selector can be measured or rolled back with a restart, not a rebuild.
+fn parse_row_selector(raw: Option<&str>) -> bool {
+    raw.map(|value| !(value.eq_ignore_ascii_case("false") || value == "0"))
+        .unwrap_or(true)
+}
+
 /// Which stage to actually work, given the middleware's answer and the newest announced stage.
 ///
 /// The middleware serves its active-stage answer from a short-lived cache, so it can name a stage
@@ -334,6 +341,9 @@ pub struct Worker {
     /// Enables the n=3, 33--64 candidate compressed Metal kernel. Kept separate from packing so
     /// its fleet effect can be measured or rolled back without changing work order.
     gpu_dense64: bool,
+    /// Exact row-level retirement of pair units (env ROW_SELECTOR, default on). Off leaves every
+    /// pair on the per-unit loop.
+    row_selector_enabled: bool,
     #[cfg(target_os = "macos")]
     gpu: Option<crate::gpu::CorrectionEngine>,
     /// Base graph the GPU engine currently holds, so it is re-uploaded once per stage, not per batch.
@@ -419,6 +429,7 @@ impl Worker {
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false),
             gpu_dense64: configured_gpu_dense64(),
+            row_selector_enabled: parse_row_selector(std::env::var("ROW_SELECTOR").ok().as_deref()),
             #[cfg(target_os = "macos")]
             gpu: None,
             gpu_graph: None,
@@ -1179,6 +1190,7 @@ impl Worker {
         // short stages. The plan is immutable for a graph id, so build it once and retain it
         // beside the per-graph caches.
         let can_build_separable_plan = engage
+            && self.row_selector_enabled
             && !publish_results
             && config.strategy == WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES
             && self
@@ -1269,7 +1281,8 @@ impl Worker {
         // The plan is used only under the same preconditions that created it. It is intentionally
         // optional: no threshold, partial ranges, an incomplete table, or any non-sequential
         // strategy continues through the byte-for-byte existing per-unit path below.
-        let separable_plan = if !publish_results
+        let separable_plan = if self.row_selector_enabled
+            && !publish_results
             && config.strategy == WorkEnumerationStrategy::SEQUENTIAL_WITH_SINGLES
         {
             self.separable_cache.get(&base_graph_id)
@@ -2292,6 +2305,16 @@ mod tests {
         assert!(parse_gpu_dense64(Some("true")));
         assert!(parse_gpu_dense64(Some("TRUE")));
         assert!(parse_gpu_dense64(Some("1")));
+    }
+
+    #[test]
+    fn row_selector_defaults_on_and_only_explicit_false_disables_it() {
+        assert!(parse_row_selector(None));
+        assert!(parse_row_selector(Some("true")));
+        assert!(parse_row_selector(Some("1")));
+        assert!(!parse_row_selector(Some("false")));
+        assert!(!parse_row_selector(Some("FALSE")));
+        assert!(!parse_row_selector(Some("0")));
     }
 
     /// Waiting for peers is worth ~90 ms only while there is enough of the table missing for their

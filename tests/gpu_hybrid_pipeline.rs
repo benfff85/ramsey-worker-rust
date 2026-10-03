@@ -37,8 +37,21 @@ fn chunk_size() -> usize {
         .unwrap_or(32_768)
 }
 
+/// The campaign-3 fixture, or any graph passed as `LIVE_GRAPH` (a 39,621-character edge string).
 fn base() -> String {
-    FIXTURE.lines().next().unwrap().trim().to_string()
+    match std::env::var("LIVE_GRAPH") {
+        Ok(bits) => {
+            assert_eq!(bits.trim().len(), V * (V - 1) / 2, "LIVE_GRAPH length");
+            bits.trim().to_string()
+        }
+        Err(_) => FIXTURE.lines().next().unwrap().trim().to_string(),
+    }
+}
+
+/// Created-count limit for the replay. The fixture default suits campaign 3; `LIVE_LIMIT` lets a
+/// different campaign's graph be replayed (a very large limit sends every correction to the GPU).
+fn replay_limit() -> i32 {
+    std::env::var("LIVE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(744_600)
 }
 
 /// The classify decision, mirroring `HoistTables::pair_created_bounded` exactly.
@@ -113,7 +126,8 @@ fn hybrid_pipeline_vs_cpu_only() {
 
     // A realistic slice of the work space: a contiguous run of (red, blue) pairs.
     const UNITS: usize = 3_000_000;
-    let limit = 744_600i32;
+    let limit = replay_limit();
+    eprintln!("replay limit (created count): {limit}");
     let mut units = Vec::with_capacity(UNITS);
     'outer: for &r in reds.iter() {
         for &b in blues.iter() {
