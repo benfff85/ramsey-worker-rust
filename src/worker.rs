@@ -199,6 +199,37 @@ fn switch_default_on(name: &str) -> bool {
     parse_switch_default_on(std::env::var(name).ok().as_deref())
 }
 
+/// Whether this claim evaluates through the hoist tables.
+///
+/// The `HOIST_MIN_STAGE_INDEX` gate exists because building a table from nothing costs seconds,
+/// so a stage must be worth it. With the carry that premise only holds for a stage reached by a
+/// full rebuild (a kick, a first stage): a stage derived incrementally from a parent whose table
+/// this worker holds gets a ~99.99%-complete table in milliseconds, so gating it makes its 39,621
+/// singles take the seeded kernel — profiled at ~30% of a native worker's busy time (2026-10-03).
+/// Early engagement changes only WHICH exact path computes a unit, never a value: the hoisted and
+/// seeded paths agree unit for unit. With `early` off this is exactly the original gate.
+fn should_engage_hoist(
+    hoist_enabled: bool,
+    early: bool,
+    start_index: i64,
+    has_own_table: bool,
+    derived_from_tabled_parent: bool,
+) -> bool {
+    hoist_enabled
+        && (start_index >= HOIST_MIN_STAGE_INDEX
+            || (early && (has_own_table || derived_from_tabled_parent)))
+}
+
+/// Batch size for a claim. A new stage restarts at the floor because it may start unhoisted; a
+/// stage that engages early is hoisted from its first unit, so it resumes the size the previous
+/// hoisted stage had grown to instead of re-climbing the x4 ramp (~7 small claims per stage).
+fn claim_size(current: i32, resume: Option<i32>, engaging_early: bool) -> i32 {
+    match resume {
+        Some(size) if engaging_early => size.max(current),
+        _ => current,
+    }
+}
+
 /// Which stage to actually work, given the middleware's answer and the newest announced stage.
 ///
 /// The middleware serves its active-stage answer from a short-lived cache, so it can name a stage
@@ -341,6 +372,16 @@ pub struct Worker {
     /// Exact row-level retirement of pair units (env ROW_SELECTOR, default on). Off leaves every
     /// pair on the per-unit loop.
     row_selector_enabled: bool,
+    /// Engage the hoist from a stage's first unit when its table can be carried (env
+    /// HOIST_EARLY_ENGAGE, default on). Off restores the original `HOIST_MIN_STAGE_INDEX` gate.
+    hoist_early: bool,
+    /// Parent graph this stage's graph was derived from incrementally, if it was. A stage reached
+    /// by a full rebuild (kick, first stage) has none and keeps the original gate.
+    stage_derived_from: Option<i32>,
+    /// Whether the stage being worked has engaged the hoist; decides the next stage's resume size.
+    stage_hoisted: bool,
+    /// Batch size a hoisted stage had grown to, offered to the next stage if it engages early.
+    resume_fetch_size: Option<i32>,
     #[cfg(target_os = "macos")]
     gpu: Option<crate::gpu::CorrectionEngine>,
     /// Base graph the GPU engine currently holds, so it is re-uploaded once per stage, not per batch.
@@ -425,6 +466,10 @@ impl Worker {
             gpu_bucketing: switch_default_on("GPU_BUCKETING"),
             gpu_dense64: switch_default_on("GPU_DENSE64"),
             row_selector_enabled: switch_default_on("ROW_SELECTOR"),
+            hoist_early: switch_default_on("HOIST_EARLY_ENGAGE"),
+            stage_derived_from: None,
+            stage_hoisted: false,
+            resume_fetch_size: None,
             #[cfg(target_os = "macos")]
             gpu: None,
             gpu_graph: None,
@@ -785,6 +830,9 @@ impl Worker {
                         self.last_base_graph_id = Some(graph_id);
                         self.prune_graph_caches(graph_id);
                     } else {
+                    // A full rebuild (kick, first stage, cache miss) has no carried table, so it
+                    // must never inherit an earlier stage's parent and engage early.
+                    self.stage_derived_from = None;
                     log_info!(
                         "Building graph from stage_config (first time for graph {})",
                         config.base_graph_id
@@ -909,9 +957,20 @@ impl Worker {
         }
 
         let config = self.stage_config.as_ref().unwrap();
-        let batch_size = self.current_fetch_size as i64;
         let total_pairs = config.total_pairs;
         let base_graph_id = config.base_graph_id;
+        // Early engagement is decided from what this worker already holds, before claiming, so
+        // the first claim of a carried stage can resume a hoisted batch size.
+        let has_own_table = self.hoist_cache.contains_key(&base_graph_id);
+        let derived_from_tabled_parent = self.stage_derived_from.is_some_and(|parent| {
+            parent != base_graph_id
+                && self.hoist_cache.contains_key(&parent)
+                && self.graph_cache.contains_key(&parent)
+        });
+        let engaging_early =
+            self.hoist_enabled && self.hoist_early && (has_own_table || derived_from_tabled_parent);
+        let batch_size =
+            claim_size(self.current_fetch_size, self.resume_fetch_size, engaging_early) as i64;
         // Base graph bitstring + vertex count for derived-graph hashing (the novelty
         // filter). Captured once per batch — constant for the stage's base graph.
         // vertex_count must equal the QM's (config value) so the hashes agree.
@@ -933,6 +992,11 @@ impl Worker {
                 return Ok(0);
             }
         };
+        if engaging_early && self.resume_fetch_size.is_some() {
+            // The controller continues from the resumed size; it is used once per stage.
+            self.current_fetch_size = batch_size as i32;
+            self.resume_fetch_size = None;
+        }
 
         let work_count = (end_index - start_index) as usize;
         let enumerator = self.enumerator.as_ref().unwrap();
@@ -941,14 +1005,29 @@ impl Worker {
         let publish_results = self.publish_results;
         let campaign_id_for_counter = self.campaign_id;
         let graph_vertex_count = self.graph_cache[&base_graph_id].vertex_count;
-        let engage = self.hoist_enabled && start_index >= HOIST_MIN_STAGE_INDEX;
+        let engage = should_engage_hoist(
+            self.hoist_enabled,
+            self.hoist_early,
+            start_index,
+            has_own_table,
+            derived_from_tabled_parent,
+        );
+        if engage {
+            self.stage_hoisted = true;
+        }
         let first_time = engage && !self.hoist_cache.contains_key(&base_graph_id);
         if first_time {
             log_info!(
                 "Hoist ENGAGED for graph {} at stage work index {} ({})",
                 base_graph_id,
                 start_index,
-                if start_index < 200_000 { "past singles" } else { "late claim" }
+                if start_index < HOIST_MIN_STAGE_INDEX {
+                    "early, carried"
+                } else if start_index < 200_000 {
+                    "past singles"
+                } else {
+                    "late claim"
+                }
             );
         }
 
@@ -1915,6 +1994,7 @@ impl Worker {
         // per-edge table forward. ~90% of its 39,621 entries survive a 1-2 edge advance, and
         // rebuilding all of them is the largest fixed cost of a short stage.
         self.hoist_carry = Some(prev_id);
+        self.stage_derived_from = Some(prev_id);
         self.graph_cache.insert(graph_id, graph);
         self.clique_collection_cache.insert(graph_id, cc);
         true
@@ -1987,8 +2067,12 @@ impl Worker {
 
     fn clear_stage_cache(&mut self) {
         self.stage_id = None;
-        // A new stage starts unhoisted, so shrink back to the responsive size rather than
-        // carrying the previous stage's hoisted batch into its warmup.
+        // A new stage may start unhoisted, so shrink back to the responsive size rather than
+        // carrying the previous stage's hoisted batch into its warmup. If it engages early instead
+        // (`claim_size`), it resumes the size remembered here.
+        self.resume_fetch_size = self.stage_hoisted.then_some(self.current_fetch_size);
+        self.stage_hoisted = false;
+        self.stage_derived_from = None;
         self.current_fetch_size = self.fetch_size;
         self.base_graph_clique_count = None;
         self.stage_config = None;
@@ -2007,6 +2091,8 @@ impl Worker {
         self.separable_cache.clear();
         self.last_base_graph_id = None;
         self.hoist_carry = None;
+        self.stage_derived_from = None;
+        self.resume_fetch_size = None;
     }
 
     /// Resolve the stage to work. Ok(None) means "nothing to do right now"
@@ -2290,6 +2376,46 @@ mod tests {
         assert_eq!(parse_gpu_chunk(Some("1023")), DEFAULT_GPU_CHUNK);
         assert_eq!(parse_gpu_chunk(Some("1048577")), DEFAULT_GPU_CHUNK);
         assert_eq!(parse_gpu_chunk(Some("not-a-number")), DEFAULT_GPU_CHUNK);
+    }
+
+    #[test]
+    fn early_engage_off_is_exactly_the_original_gate() {
+        for hoist in [false, true] {
+            for start in [0i64, 39_620, HOIST_MIN_STAGE_INDEX - 1, HOIST_MIN_STAGE_INDEX, 9_000_000] {
+                for own in [false, true] {
+                    for derived in [false, true] {
+                        assert_eq!(
+                            should_engage_hoist(hoist, false, start, own, derived),
+                            hoist && start >= HOIST_MIN_STAGE_INDEX,
+                            "hoist={hoist} start={start} own={own} derived={derived}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_engage_needs_a_table_it_can_carry_or_already_has() {
+        // A stage derived from a tabled parent engages at its very first unit.
+        assert!(should_engage_hoist(true, true, 0, false, true));
+        // As does a worker that already built this graph's table.
+        assert!(should_engage_hoist(true, true, 2_000, true, false));
+        // A full-rebuild stage (kick, first stage) keeps the original gate.
+        assert!(!should_engage_hoist(true, true, 0, false, false));
+        assert!(should_engage_hoist(true, true, HOIST_MIN_STAGE_INDEX, false, false));
+        // The hoist kill switch still wins over everything.
+        assert!(!should_engage_hoist(false, true, 0, true, true));
+        assert!(!should_engage_hoist(false, true, 9_000_000, true, true));
+    }
+
+    #[test]
+    fn claim_size_resumes_only_when_engaging_early() {
+        assert_eq!(claim_size(2_000, Some(4_000_000), true), 4_000_000);
+        assert_eq!(claim_size(2_000, Some(4_000_000), false), 2_000);
+        assert_eq!(claim_size(2_000, None, true), 2_000);
+        // Never shrinks a size that has already grown.
+        assert_eq!(claim_size(512_000, Some(128_000), true), 512_000);
     }
 
     #[test]
