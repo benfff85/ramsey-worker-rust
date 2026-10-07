@@ -1,6 +1,6 @@
 use crate::graph::WorkUnitEdge;
 use crate::model::StageConfig;
-use crate::{log_error, log_info};
+use crate::{log_debug, log_error, log_info};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -417,7 +417,7 @@ impl RedisClient {
         };
 
         if kept {
-            log_info!(
+            log_debug!(
                 "Added to top-{} novel results for stage {}: clique_count={}",
                 max_results,
                 stage_id,
@@ -482,7 +482,7 @@ impl RedisClient {
         };
 
         if kept {
-            log_info!(
+            log_debug!(
                 "SA: Added to top-{} results for stage {}: clique_count={}",
                 max_results,
                 stage_id,
@@ -580,7 +580,7 @@ impl RedisClient {
             };
             let json = serde_json::to_string(&new_best)?;
             self.connection.set::<_, _, ()>(&key, json).await?;
-            log_info!(
+            log_debug!(
                 "New best result for stage {}: clique_count={}",
                 stage_id,
                 clique_count

@@ -833,7 +833,7 @@ impl Worker {
                     // A full rebuild (kick, first stage, cache miss) has no carried table, so it
                     // must never inherit an earlier stage's parent and engage early.
                     self.stage_derived_from = None;
-                    log_info!(
+                    log_debug!(
                         "Building graph from stage_config (first time for graph {})",
                         config.base_graph_id
                     );
@@ -890,7 +890,7 @@ impl Worker {
                     }
                     let cc = match shared {
                         Some((counts, total)) => {
-                            log_info!(
+                            log_debug!(
                                 "Reusing shared edge counts for graph {} (total cliques {})",
                                 graph_id,
                                 total
@@ -901,7 +901,7 @@ impl Worker {
                             let graph = self.graph_cache.get_mut(&graph_id).unwrap();
                             let mut cc = CliqueCollection::new(self.vertex_count);
                             cc.build_counts_only(graph, self.clique_size);
-                            log_info!(
+                            log_debug!(
                                 "Built edge counts for graph {} (total cliques {}); sharing",
                                 graph_id,
                                 cc.total()
@@ -1017,7 +1017,7 @@ impl Worker {
         }
         let first_time = engage && !self.hoist_cache.contains_key(&base_graph_id);
         if first_time {
-            log_info!(
+            log_debug!(
                 "Hoist ENGAGED for graph {} at stage work index {} ({})",
                 base_graph_id,
                 start_index,
@@ -1059,7 +1059,7 @@ impl Worker {
                     );
                     let kept = t.filled();
                     tables = t;
-                    log_info!(
+                    log_debug!(
                         "Hoist carried graph {} -> {}: kept {} of {} entries, {} derived, {} invalidated",
                         parent_id,
                         base_graph_id,
@@ -1215,7 +1215,7 @@ impl Worker {
 
                 let edges = graph_vertex_count * (graph_vertex_count - 1) / 2;
                 let known = tables.filled();
-                log_info!(
+                log_debug!(
                     "Hoist fill for graph {}: slice {} ({} edges computed here), {} seeded before + {} after publishing, {} of {} known ({}% from peers), waited {}ms, gap slice {:?}",
                     base_graph_id,
                     slice,
@@ -1277,7 +1277,7 @@ impl Worker {
             let clique_collection = self.clique_collection_cache.get(&base_graph_id).unwrap();
             let tables = self.hoist_cache.get_mut(&base_graph_id).unwrap();
             let plan = SeparableRowPlan::build(graph, self.clique_size, clique_collection, tables);
-            log_info!(
+            log_debug!(
                 "Separable row selector ready for graph {}: {} red x {} blue pair rows",
                 base_graph_id,
                 plan.red_len(),
@@ -1983,7 +1983,7 @@ impl Worker {
             return false;
         }
 
-        log_info!(
+        log_debug!(
             "Derived edge counts for graph {} from {} via {} flip(s) (total cliques {})",
             graph_id,
             prev_id,
