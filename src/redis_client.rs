@@ -872,10 +872,16 @@ mod tests {
     // cannot win that race and the keyspace grows without bound (measured 3.90 keys/stage).
     // Expiry is what actually bounds it, so each write path is checked for a live TTL here.
 
+    /// The live server these `--ignored` tests run against: production (36002) by default, or a
+    /// restore-drill instance via RAMSEY_TEST_REDIS_PORT (e.g. a Dragonfly upgrade drill).
     async fn test_client() -> RedisClient {
-        RedisClient::new("127.0.0.1", 36002)
+        let port: u16 = std::env::var("RAMSEY_TEST_REDIS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(36002);
+        RedisClient::new("127.0.0.1", port)
             .await
-            .expect("live Redis on 127.0.0.1:36002 required for --ignored tests")
+            .unwrap_or_else(|e| panic!("live Redis on 127.0.0.1:{port} required for --ignored tests: {e}"))
     }
 
     async fn ttl_of(c: &mut RedisClient, key: &str) -> i64 {
