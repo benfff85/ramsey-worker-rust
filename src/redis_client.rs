@@ -887,13 +887,21 @@ mod tests {
     }
 
     /// A unique stage id per run so concurrent fleets on this Redis can never collide with it.
+    /// A stage id no production stage uses (negative) and no other test in this run shares.
+    /// Sub-second nanos alone collided: macOS clocks tick in whole microseconds, which left 1,000
+    /// possible ids, and the parallel tests here then clobbered each other's keys and TTLs
+    /// (~3% of runs). A per-process sequence keeps concurrent tests apart; the time component
+    /// keeps successive runs apart.
     fn scratch_stage_id() -> i32 {
+        use std::sync::atomic::{AtomicI64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
+        static NEXT: AtomicI64 = AtomicI64::new(0);
+        let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .subsec_nanos();
-        -((nanos % 1_000_000) as i32) - 1 // negative: production stage ids are positive
+            .as_micros() as i64;
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed) % 16;
+        -(((micros % 100_000_000) * 16 + seq) as i32) - 1 // stays above i32::MIN
     }
 
     #[tokio::test]
