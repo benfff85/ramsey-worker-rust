@@ -247,6 +247,35 @@ fn effective_stage_id(mw_stage_id: i32, announced: Option<i32>) -> i32 {
     }
 }
 
+/// How long a fleet-mode worker trusts its cached stage before asking the middleware again, so a
+/// pause or repoint (DB state, no announcement) still reaches every worker within this interval.
+const FLEET_RESOLVE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Whether a fleet-mode worker must ask the middleware for its stage before this cycle.
+///
+/// Asking every cycle cost an HTTP round trip (~1.3 ms) per ~8 ms batch: ~11% of every worker's
+/// wall time and ~1,300 requests/s at the middleware (17% of its CPU), measured 2026-10-08. A
+/// cached stage is only in doubt when nothing is cached, a newer stage has been announced, the
+/// last cycle found no work (exhausted, superseded or missing config: exactly the paths that asked
+/// before), or the interval has passed. In those cases the worker asks, as it always did.
+fn must_resolve_fleet_stage(
+    cached_stage: Option<i32>,
+    announced: Option<i32>,
+    since_resolve: Option<Duration>,
+    no_work_last_cycle: bool,
+) -> bool {
+    let Some(cached) = cached_stage else {
+        return true;
+    };
+    if no_work_last_cycle {
+        return true;
+    }
+    match since_resolve {
+        Some(elapsed) if elapsed < FLEET_RESOLVE_INTERVAL => matches!(announced, Some(a) if a > cached),
+        _ => true,
+    }
+}
+
 /// A selected row may be charged as its full logical width only while its stage remains current.
 /// The selector can evaluate far fewer than that width, so the ordinary every-N-evaluated-units
 /// check is not enough at this commit boundary.
@@ -307,6 +336,10 @@ pub struct Worker {
     /// Set when a cycle came back empty because of a race rather than because there is nothing to
     /// do, so the next attempt waits milliseconds instead of a full poll interval.
     retry_soon: bool,
+    /// Fleet mode: when the middleware was last asked for this worker's stage.
+    fleet_resolved_at: Option<std::time::Instant>,
+    /// Fleet mode: the last cycle found no work or failed, so ask the middleware next cycle.
+    force_fleet_resolve: bool,
     /// Rolling throughput accumulator. Logging every batch fired several times a second per worker
     /// and reported a figure nobody reads directly; one periodic line reports units/sec instead.
     stats_window_start: std::time::Instant,
@@ -447,6 +480,8 @@ impl Worker {
             hoist_enabled,
             stage_announcements: Arc::new(StageAnnouncements::default()),
             retry_soon: false,
+            fleet_resolved_at: None,
+            force_fleet_resolve: false,
             stats_window_start: std::time::Instant::now(),
             stats_units: 0,
             stats_batches: 0,
@@ -560,6 +595,7 @@ impl Worker {
             match self.cycle().await {
                 Ok(count) => {
                     if count == 0 {
+                        self.force_fleet_resolve = true;
                         // A race (stage advanced under us) means work is waiting right now; only a
                         // genuinely idle fleet should wait out the poll interval.
                         let exhausted = self.retry_soon;
@@ -597,6 +633,7 @@ impl Worker {
                     }
                 }
                 Err(e) => {
+                    self.force_fleet_resolve = true;
                     eprintln!(
                         "[{}] Error in worker cycle: {}",
                         Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
@@ -2101,6 +2138,17 @@ impl Worker {
         // ---- Fleet mode: re-resolve each cycle so repoints/pauses take effect
         // within one poll, with no redeploy. ----
         if let Some(fleet) = self.fleet.clone() {
+            let announced_for_cached = self.stage_announcements.latest_for(self.campaign_id);
+            if !must_resolve_fleet_stage(
+                self.stage_id,
+                announced_for_cached,
+                self.fleet_resolved_at.map(|t| t.elapsed()),
+                self.force_fleet_resolve,
+            ) {
+                return Ok(self.stage_id);
+            }
+            self.force_fleet_resolve = false;
+            self.fleet_resolved_at = Some(std::time::Instant::now());
             let stage = match self.mw_client.get_fleet_active_stage(&fleet).await? {
                 None => {
                     // Paused / unmapped / no active stage. Drop any cached stage
@@ -2269,6 +2317,27 @@ mod tests {
     /// The middleware's cached answer can name a stage the queue manager has already retired,
     /// whose Redis config is therefore gone. A newer announcement is authoritative — it is only
     /// published once the stage is ACTIVE and seeded — so prefer it.
+    #[test]
+    fn a_working_worker_does_not_ask_the_middleware_every_cycle() {
+        let fresh = Some(Duration::from_millis(50));
+        assert!(!must_resolve_fleet_stage(Some(100), None, fresh, false), "cached, fresh, nothing new");
+        assert!(!must_resolve_fleet_stage(Some(100), Some(100), fresh, false), "announcement agrees");
+        assert!(!must_resolve_fleet_stage(Some(100), Some(99), fresh, false), "older announcement");
+    }
+
+    #[test]
+    fn a_worker_asks_the_middleware_when_its_cached_stage_may_be_wrong() {
+        let fresh = Some(Duration::from_millis(50));
+        assert!(must_resolve_fleet_stage(None, None, fresh, false), "nothing cached");
+        assert!(must_resolve_fleet_stage(Some(100), None, None, false), "never resolved");
+        assert!(must_resolve_fleet_stage(Some(100), Some(101), fresh, false), "a newer stage was announced");
+        assert!(must_resolve_fleet_stage(Some(100), None, fresh, true), "the last cycle found no work");
+        assert!(
+            must_resolve_fleet_stage(Some(100), None, Some(FLEET_RESOLVE_INTERVAL), false),
+            "pauses and repoints must still take effect within the interval"
+        );
+    }
+
     #[test]
     fn prefers_a_newer_announced_stage_over_a_stale_cached_one() {
         assert_eq!(effective_stage_id(100, Some(103)), 103);
