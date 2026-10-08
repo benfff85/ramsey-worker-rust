@@ -5,16 +5,19 @@
 # Linux/aarch64 with no GPU device nodes. So the fleet is split — Docker runs the CPU-only workers,
 # this runs the hybrid ones, and together they fill both the cores and the GPU.
 #
-# Measured on the M4 Max (16 logical cores, 40-core GPU), fleet units/sec:
-#   16 CPU +  0 GPU  189.6      6 CPU + 10 GPU  269.1   <- deployed
-#   12 CPU +  4 GPU  221.6      4 CPU + 12 GPU  258.4
-#   10 CPU +  6 GPU  252.7      0 CPU + 16 GPU  237.3
-#    8 CPU +  8 GPU  262.7
-# Totals other than 16 are worse: 14 workers -7%, 20 workers -10%. Keep CPU + GPU = core count.
+# Re-swept 2026-10-08 on the M4 Max (16 logical cores, 40-core GPU) with 6 Docker CPU workers,
+# campaign 10 stages/s in 4-minute windows (after the row selector and worker#136/#137):
+#   6 CPU + 10 GPU  7.03 (two windows)      6 CPU + 16 GPU  7.83 (+11%)   <- deployed
+#   6 CPU + 12 GPU  7.41 (+5%)              6 CPU + 18 GPU  7.77
+#   6 CPU + 14 GPU  7.64 (+9%)              6 CPU + 20 GPU  7.94 (three windows; within noise of 16)
+# The fleet is now stage-turnover bound, not compute bound: the host stays 36-52% idle and the GPU
+# ~50% busy throughout. So the old rule ("keep CPU + GPU = core count", measured Aug 2026 when 20
+# workers were -10%) no longer holds. Extra Docker workers did NOT help (+1%): they split the same
+# work. 16 is the knee; more adds less than the ~2% noise and costs CPU headroom.
 set -u
 cd "$(dirname "$0")/.."
 
-GPU_WORKERS="${GPU_WORKERS:-10}"
+GPU_WORKERS="${GPU_WORKERS:-16}"
 export RAMSEY_API_URL="${RAMSEY_API_URL:-http://localhost:36000/api/ramsey}"
 export RAMSEY_FLEET="${RAMSEY_FLEET:-m4-max}"
 export REDIS_HOST="${REDIS_HOST:-localhost}"
