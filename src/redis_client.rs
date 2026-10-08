@@ -21,6 +21,8 @@ pub const STAGE_ADVANCED_CHANNEL: &str = "stage_advanced";
 #[derive(Debug, Default)]
 pub struct StageAnnouncements {
     packed: std::sync::atomic::AtomicI64,
+    /// Wakes a worker that is waiting out a retry the moment a stage is announced.
+    wake: tokio::sync::Notify,
 }
 
 impl StageAnnouncements {
@@ -28,6 +30,25 @@ impl StageAnnouncements {
         let packed = ((campaign_id as i64) << 32) | (stage_id as i64 & 0xFFFF_FFFF);
         self.packed
             .store(packed, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_waiters();
+    }
+
+    /// Wait up to `max`, returning as soon as a stage is announced, or at once if `already` holds.
+    ///
+    /// Interest in the wake-up is registered BEFORE `already` is checked, so an announcement that
+    /// lands between the caller's last look and the wait is never missed. A wake-up for another
+    /// campaign only costs one early retry.
+    pub async fn wait_for_stage(&self, max: std::time::Duration, already: impl Fn(&Self) -> bool) {
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if already(self) {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(max) => {}
+            _ = notified => {}
+        }
     }
 
     /// The latest announced stage for `campaign_id`, if the last announcement was for it.
@@ -827,6 +848,45 @@ impl RedisClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_announcement_wakes_a_worker_waiting_out_a_retry() {
+        use std::time::{Duration, Instant};
+        let a = std::sync::Arc::new(StageAnnouncements::default());
+        let waiter = {
+            let a = std::sync::Arc::clone(&a);
+            tokio::spawn(async move {
+                let t = Instant::now();
+                a.wait_for_stage(Duration::from_secs(5), |a| a.latest_for(10).is_some_and(|s| s > 100))
+                    .await;
+                t.elapsed()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.set(10, 101);
+        let waited = waiter.await.unwrap();
+        assert!(waited < Duration::from_millis(1000), "woke after {waited:?}, not on the announcement");
+    }
+
+    #[tokio::test]
+    async fn a_stage_announced_before_the_wait_ends_it_at_once() {
+        use std::time::{Duration, Instant};
+        let a = StageAnnouncements::default();
+        a.set(10, 101);
+        let t = Instant::now();
+        a.wait_for_stage(Duration::from_secs(5), |a| a.latest_for(10).is_some_and(|s| s > 100))
+            .await;
+        assert!(t.elapsed() < Duration::from_millis(100), "waited {:?}", t.elapsed());
+    }
+
+    #[tokio::test]
+    async fn without_an_announcement_the_wait_lasts_the_full_retry() {
+        use std::time::{Duration, Instant};
+        let a = StageAnnouncements::default();
+        let t = Instant::now();
+        a.wait_for_stage(Duration::from_millis(60), |_| false).await;
+        assert!(t.elapsed() >= Duration::from_millis(55), "returned after {:?}", t.elapsed());
+    }
 
     #[test]
     fn parses_the_queue_managers_announcement() {

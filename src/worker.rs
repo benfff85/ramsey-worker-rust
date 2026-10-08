@@ -247,6 +247,13 @@ fn effective_stage_id(mw_stage_id: i32, announced: Option<i32>) -> i32 {
     }
 }
 
+/// Whether a stage newer than `exhausted` (the stage this worker just ran out of) has been
+/// announced, so the retry need not wait at all. With the exhausted stage unknown it never skips:
+/// skipping on "anything announced" would spin against the stage that was just exhausted.
+fn newer_stage_announced(exhausted: Option<i32>, announced: Option<i32>) -> bool {
+    matches!((exhausted, announced), (Some(e), Some(a)) if a > e)
+}
+
 /// How long a fleet-mode worker trusts its cached stage before asking the middleware again, so a
 /// pause or repoint (DB state, no announcement) still reaches every worker within this interval.
 const FLEET_RESOLVE_INTERVAL: Duration = Duration::from_millis(1000);
@@ -340,6 +347,8 @@ pub struct Worker {
     fleet_resolved_at: Option<std::time::Instant>,
     /// Fleet mode: the last cycle found no work or failed, so ask the middleware next cycle.
     force_fleet_resolve: bool,
+    /// The stage the last no-work cycle found exhausted or missing, for the retry wait.
+    retry_after_stage: Option<i32>,
     /// Rolling throughput accumulator. Logging every batch fired several times a second per worker
     /// and reported a figure nobody reads directly; one periodic line reports units/sec instead.
     stats_window_start: std::time::Instant,
@@ -482,6 +491,7 @@ impl Worker {
             retry_soon: false,
             fleet_resolved_at: None,
             force_fleet_resolve: false,
+            retry_after_stage: None,
             stats_window_start: std::time::Instant::now(),
             stats_units: 0,
             stats_batches: 0,
@@ -599,13 +609,22 @@ impl Worker {
                         // A race (stage advanced under us) means work is waiting right now; only a
                         // genuinely idle fleet should wait out the poll interval.
                         let exhausted = self.retry_soon;
-                        let wait = if self.retry_soon {
+                        if self.retry_soon {
                             self.retry_soon = false;
-                            Duration::from_millis(TRANSIENT_RETRY_MILLIS)
+                            // A stage turnover: the next stage is announced the moment it is
+                            // workable, so wake on that instead of always sleeping the full retry.
+                            // The fixed 25 ms cost ~12 ms per worker per ~141 ms stage (2026-10-08).
+                            let gone = self.retry_after_stage.take();
+                            let campaign = self.campaign_id;
+                            let announcements = Arc::clone(&self.stage_announcements);
+                            announcements
+                                .wait_for_stage(Duration::from_millis(TRANSIENT_RETRY_MILLIS), |a| {
+                                    newer_stage_announced(gone, a.latest_for(campaign))
+                                })
+                                .await;
                         } else {
-                            self.poll_interval
-                        };
-                        sleep(wait).await;
+                            sleep(self.poll_interval).await;
+                        }
                         self.stats_idle_cycles += 1;
                         self.stats_idle_nanos += cycle_start.elapsed().as_nanos();
                         if exhausted {
@@ -666,6 +685,7 @@ impl Worker {
                 stage_id
             );
             self.clear_stage_cache();
+            self.retry_after_stage = Some(stage_id);
             self.retry_soon = true;
             return Ok(0);
         }
@@ -1025,6 +1045,7 @@ impl Worker {
             None => {
                 log_debug!("All work claimed for stage {}, clearing cache...", stage_id);
                 self.clear_stage_cache();
+                self.retry_after_stage = Some(stage_id);
                 self.retry_soon = true;
                 return Ok(0);
             }
@@ -2336,6 +2357,16 @@ mod tests {
             must_resolve_fleet_stage(Some(100), None, Some(FLEET_RESOLVE_INTERVAL), false),
             "pauses and repoints must still take effect within the interval"
         );
+    }
+
+    #[test]
+    fn a_retry_is_skipped_only_for_a_stage_newer_than_the_exhausted_one() {
+        assert!(newer_stage_announced(Some(100), Some(101)));
+        assert!(!newer_stage_announced(None, Some(5)), "exhausted stage unknown: wait (woken by announcements), never spin");
+        assert!(!newer_stage_announced(Some(100), Some(100)), "the stage we just exhausted");
+        assert!(!newer_stage_announced(Some(100), Some(99)), "older");
+        assert!(!newer_stage_announced(Some(100), None), "nothing announced");
+        assert!(!newer_stage_announced(None, None));
     }
 
     #[test]
